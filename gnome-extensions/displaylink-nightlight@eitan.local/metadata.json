@@ -1,0 +1,8 @@
+{
+  "uuid": "displaylink-nightlight@eitan.local",
+  "name": "DisplayLink Night Light",
+  "description": "Software warm-tint overlay that works on monitors lacking hardware gamma (DisplayLink/EVDI, USB docks). Provides a Night Light equivalent on screens that GNOME's built-in Night Light cannot reach.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "settings-schema": "org.gnome.shell.extensions.displaylink-nightlight",
+  "gettext-domain": "displaylink-nightlight"
+}

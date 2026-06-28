@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.displaylink-nightlight"
+          path="/org/gnome/shell/extensions/displaylink-nightlight/">
+    <key name="active" type="b">
+      <default>true</default>
+      <summary>Whether the warm tint is currently shown</summary>
+    </key>
+    <key name="intensity" type="d">
+      <range min="0" max="1"/>
+      <default>0.5</default>
+      <summary>Tint strength (0 = none, 1 = full warm)</summary>
+    </key>
+    <key name="tint-color" type="s">
+      <default>'#ffb27a'</default>
+      <summary>Warm target color as a #rrggbb hex string (what white becomes at full strength)</summary>
+    </key>
+    <key name="brightness" type="d">
+      <range min="0.1" max="1"/>
+      <default>1.0</default>
+      <summary>Screen brightness multiplier (1 = native, lower = dimmer)</summary>
+    </key>
+    <key name="all-monitors" type="b">
+      <default>true</default>
+      <summary>Tint every monitor; if false, leave the primary monitor untouched</summary>
+    </key>
+    <key name="toggle-shortcut" type="as">
+      <default><![CDATA[['<Super><Shift>n']]]></default>
+      <summary>Keyboard shortcut to toggle the tint</summary>
+    </key>
+  </schema>
+</schemalist>

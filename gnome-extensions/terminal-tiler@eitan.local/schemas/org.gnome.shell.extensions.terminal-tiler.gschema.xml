@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="terminal-tiler">
+  <schema id="org.gnome.shell.extensions.terminal-tiler"
+          path="/org/gnome/shell/extensions/terminal-tiler/">
+
+    <key name="tile-new-terminal" type="as">
+      <default><![CDATA[['<Super>Return']]]></default>
+      <summary>Spawn / add a terminal to the focused monitor's batch</summary>
+      <description>Opens a terminal full-screen on the focused monitor, or adds another and re-divides the monitor into equal vertical columns. If a stray terminal is focused, it is absorbed into the batch instead.</description>
+    </key>
+
+    <key name="terminal-command" type="s">
+      <default>'terminator'</default>
+      <summary>Command used to launch a new terminal</summary>
+      <description>Parsed with shell quoting rules and spawned when the keybinding needs a new terminal window.</description>
+    </key>
+
+    <key name="terminal-wm-class" type="s">
+      <default>'terminator'</default>
+      <summary>Substring matched (case-insensitive) against a window's WM_CLASS to decide whether it is a terminal</summary>
+      <description>Used both to recognise a newly spawned terminal window and to decide whether a focused window should be absorbed into the batch.</description>
+    </key>
+
+    <key name="orientation" type="s">
+      <default>'columns'</default>
+      <summary>Tiling orientation</summary>
+      <description>'columns' = side-by-side vertical splits (full height each). 'rows' = stacked horizontal splits (full width each).</description>
+    </key>
+
+  </schema>
+</schemalist>

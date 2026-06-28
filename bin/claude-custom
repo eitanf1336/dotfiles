@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Launch the Claude chats board (category manager for your Claude Code chats).
+exec env CHATS_LAUNCH_CWD="$PWD" python3 "$HOME/.claude/chats/chats.py" "$@"

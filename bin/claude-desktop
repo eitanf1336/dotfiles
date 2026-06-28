@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Launch Claude Desktop (community AppImage, extracted) fully detached from the
+# terminal: own session (survives terminal close), no stdio, returns instantly.
+APPRUN="/home/eitan/.local/share/claude-desktop/squashfs-root/AppRun"
+setsid -f "$APPRUN" "$@" </dev/null >/dev/null 2>&1

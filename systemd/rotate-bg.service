@@ -1,0 +1,6 @@
+[Unit]
+Description=Rotate desktop wallpaper + Terminator background to the next theme
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/rotate-bg.sh next

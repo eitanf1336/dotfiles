@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Control the DisplayLink Night Light overlay extension.
+# Usage: nightlight low|med|high|max|up|down|off|on|toggle|status
+
+SCHEMA="org.gnome.shell.extensions.displaylink-nightlight"
+export GSETTINGS_SCHEMA_DIR="$HOME/.local/share/gnome-shell/extensions/displaylink-nightlight@eitan.local/schemas"
+STEP=0.10
+
+usage() {
+    echo "Usage: nightlight {low|med|high|max|up|down|off|on|toggle|status}"
+    exit 1
+}
+
+cur() { gsettings get "$SCHEMA" intensity; }
+
+set_level() {
+    gsettings set "$SCHEMA" intensity "$1"
+    gsettings set "$SCHEMA" active true
+    echo "Night light: $2 (intensity $1)"
+}
+
+case "${1,,}" in
+    low)    set_level 0.25 "low" ;;
+    med|medium) set_level 0.50 "medium" ;;
+    high)   set_level 0.75 "high" ;;
+    max)    set_level 1.00 "max" ;;
+    up)     set_level "$(awk -v c="$(cur)" -v s="$STEP" 'BEGIN{v=c+s; if(v>1)v=1; printf "%.2f", v}')" "up" ;;
+    down)   set_level "$(awk -v c="$(cur)" -v s="$STEP" 'BEGIN{v=c-s; if(v<0)v=0; printf "%.2f", v}')" "down" ;;
+    off)    gsettings set "$SCHEMA" active false; echo "Night light: off" ;;
+    on)     gsettings set "$SCHEMA" active true;  echo "Night light: on" ;;
+    toggle)
+        if [ "$(gsettings get "$SCHEMA" active)" = "true" ]; then
+            gsettings set "$SCHEMA" active false; echo "Night light: off"
+        else
+            gsettings set "$SCHEMA" active true;  echo "Night light: on"
+        fi
+        ;;
+    status)
+        echo "active:    $(gsettings get "$SCHEMA" active)"
+        echo "intensity: $(cur)"
+        echo "color:     $(gsettings get "$SCHEMA" tint-color)"
+        ;;
+    *) usage ;;
+esac

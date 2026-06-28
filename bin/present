@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Clean/bright mode toggle: instantly set tint OFF + brightness 100%,
+# toggle again to restore your previous tint/brightness exactly.
+# Usage: present {toggle|on|off|status}
+
+SCHEMA="org.gnome.shell.extensions.displaylink-nightlight"
+export GSETTINGS_SCHEMA_DIR="$HOME/.local/share/gnome-shell/extensions/displaylink-nightlight@eitan.local/schemas"
+STATE="$HOME/.cache/displaylink-nightlight.present"
+
+g() { gsettings get "$SCHEMA" "$1"; }
+s() { gsettings set "$SCHEMA" "$1" "$2"; }
+
+enter() {
+    # Save current state once (so repeated 'on' doesn't clobber the original).
+    if [ ! -f "$STATE" ]; then
+        {
+            echo "active=$(g active)"
+            echo "intensity=$(g intensity)"
+            echo "brightness=$(g brightness)"
+        } > "$STATE"
+    fi
+    s active false
+    s brightness 1.0
+    echo "Clean mode ON — tint off, brightness 100%"
+}
+
+leave() {
+    if [ -f "$STATE" ]; then
+        . "$STATE"
+        s active "$active"
+        s intensity "$intensity"
+        s brightness "$brightness"
+        rm -f "$STATE"
+        echo "Restored — tint=$active intensity=$intensity brightness=$brightness"
+    else
+        echo "Already normal (nothing to restore)."
+    fi
+}
+
+case "${1,,}" in
+    on|enter)          enter ;;
+    off|leave|restore) leave ;;
+    status)            [ -f "$STATE" ] && echo "clean mode: ON" || echo "clean mode: off" ;;
+    ''|toggle)         [ -f "$STATE" ] && leave || enter ;;
+    *) echo "Usage: present {toggle|on|off|status}"; exit 1 ;;
+esac

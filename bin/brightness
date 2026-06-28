@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Software brightness (dim) control for all monitors via the
+# DisplayLink Night Light overlay extension. Works on DisplayLink/EVDI
+# screens that have no hardware brightness. Cannot go brighter than the
+# panel's own maximum — it only dims.
+#
+# Usage: brightness {low|med|high|full|up|down|<10-100>|status}
+
+SCHEMA="org.gnome.shell.extensions.displaylink-nightlight"
+export GSETTINGS_SCHEMA_DIR="$HOME/.local/share/gnome-shell/extensions/displaylink-nightlight@eitan.local/schemas"
+KEY="brightness"
+MIN=0.10
+STEP=0.10
+
+usage() {
+    echo "Usage: brightness {low|med|high|full|up|down|<10-100>|status}"
+    exit 1
+}
+
+clamp() { awk -v v="$1" -v lo="$MIN" 'BEGIN{ if(v<lo)v=lo; if(v>1)v=1; printf "%.2f", v }'; }
+
+set_val() {
+    local v pct; v=$(clamp "$1")
+    gsettings set "$SCHEMA" "$KEY" "$v"
+    pct=$(awk -v v="$v" 'BEGIN{printf "%d", v*100}')
+    echo "Brightness: ${pct}%"
+}
+
+cur() { gsettings get "$SCHEMA" "$KEY"; }
+
+case "${1,,}" in
+    low)   set_val 0.30 ;;
+    med|medium) set_val 0.55 ;;
+    high)  set_val 0.80 ;;
+    full|max) set_val 1.00 ;;
+    up)    set_val "$(awk -v c="$(cur)" -v s="$STEP" 'BEGIN{printf "%.2f", c+s}')" ;;
+    down)  set_val "$(awk -v c="$(cur)" -v s="$STEP" 'BEGIN{printf "%.2f", c-s}')" ;;
+    status)
+        echo "brightness: $(awk -v v="$(cur)" 'BEGIN{printf "%d%%", v*100}')"
+        ;;
+    ''|-h|--help) usage ;;
+    *)
+        # numeric percentage 10-100
+        if [[ "$1" =~ ^[0-9]+$ ]]; then
+            set_val "$(awk -v p="$1" 'BEGIN{printf "%.2f", p/100}')"
+        else
+            usage
+        fi
+        ;;
+esac

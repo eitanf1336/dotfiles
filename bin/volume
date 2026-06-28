@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Volume control via WirePlumber (PipeWire).
+# Usage: volume up|down|mute|<0-100>|status
+
+SINK="@DEFAULT_AUDIO_SINK@"
+STEP="5%"
+MAXVOL="1.0"   # cap at 100% to avoid soft-clipping distortion
+
+usage() { echo "Usage: volume {up|down|mute|<0-100>|status}"; exit 1; }
+
+case "${1,,}" in
+    up)          wpctl set-volume -l "$MAXVOL" "$SINK" "${STEP}+" ;;
+    down)        wpctl set-volume "$SINK" "${STEP}-" ;;
+    mute|toggle) wpctl set-mute "$SINK" toggle ;;
+    status)      ;;
+    ''|-h|--help) usage ;;
+    *)
+        if [[ "$1" =~ ^[0-9]+$ ]]; then
+            wpctl set-volume -l "$MAXVOL" "$SINK" "${1}%"
+        else
+            usage
+        fi
+        ;;
+esac
+
+# Report resulting state.
+read -r _ v rest < <(wpctl get-volume "$SINK")
+pct=$(awk -v v="$v" 'BEGIN{printf "%d", v*100}')
+if echo "$rest" | grep -qi muted; then
+    echo "Volume: ${pct}% (muted)"
+else
+    echo "Volume: ${pct}%"
+fi
