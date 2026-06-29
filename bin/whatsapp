@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Launch WhatsApp (ZapZap — a WhatsApp Web desktop client) from the terminal.
+exec flatpak run com.rtosta.zapzap "$@"

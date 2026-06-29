@@ -15,6 +15,18 @@
       <description>If any terminal in the batch on the focused window's monitor is still open, minimises the whole group at once; if they are all minimised, brings them all back to the front and focuses them. The batch also minimises and restores as a unit when any single member is minimised or restored.</description>
     </key>
 
+    <key name="move-terminal-left" type="as">
+      <default><![CDATA[['<Super>Left']]]></default>
+      <summary>Move the focused terminal one position towards the start of its group</summary>
+      <description>If the focused window belongs to a monitor's batch, swaps it with the previous member (the column to its left, or the row above it) and re-flows the group. Does nothing if it is already first or not in a batch.</description>
+    </key>
+
+    <key name="move-terminal-right" type="as">
+      <default><![CDATA[['<Super>Right']]]></default>
+      <summary>Move the focused terminal one position towards the end of its group</summary>
+      <description>If the focused window belongs to a monitor's batch, swaps it with the next member (the column to its right, or the row below it) and re-flows the group. Does nothing if it is already last or not in a batch.</description>
+    </key>
+
     <key name="terminal-command" type="s">
       <default>'terminator'</default>
       <summary>Command used to launch a new terminal</summary>

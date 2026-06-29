@@ -460,8 +460,15 @@ def setup_colors():
     curses.init_pair(9, curses.COLOR_BLUE, -1)     # In Progress / running
 
 
+# Sentinel for App(select_project=...). _KEEP_PROJECT means "this is a fresh
+# launch — use whatever active project is persisted." Any other value (including
+# None, which means the 'All projects' view) means "restore EXACTLY this project."
+# Returning from a chat passes the board's own project so Ctrl+Z never moves you.
+_KEEP_PROJECT = object()
+
+
 class App:
-    def __init__(self, stdscr, select_id=None, select_project=None):
+    def __init__(self, stdscr, select_id=None, select_project=_KEEP_PROJECT):
         self.stdscr = stdscr
         self.store = load_store()
         self.names = load_names()  # sessionId -> user's custom name
@@ -480,6 +487,7 @@ class App:
         self._live_ts = 0.0     # last status-data refresh time
         self._scan_ts = 0.0     # last chat-file rescan time
         self._reselect_id = None  # keep cursor on this chat after a rescan
+        self._resize_settle = 0.0  # >0 = a resize is in flight; clear+repaint when it lands
         self.refresh_live(force=True)
         pj = _load_json(PROJECTS_STORE)
         self.projects_added = pj.get("list", {})   # key -> custom display name
@@ -490,14 +498,13 @@ class App:
         else:                                       # "__all__" means user chose All
             a = pj["active"]
             self.active_project = None if a in (None, "__all__") else a
-        # Returning from a chat (Ctrl+Z/detach) snaps the board to THAT chat's
-        # project, not whatever was selected before — so you land back where the
-        # chat lives. Persist it so it sticks as the current project. Accept a
-        # virtual project key (e.g. 'HW') too, not just a real folder, so a moved
-        # chat snaps back to its tagged project instead of its physical cwd.
-        if select_project and (os.path.isdir(select_project)
-                               or select_project in self.projects_added
-                               or select_project in set(self.tags.values())):
+        # Returning from a chat (Ctrl+Z/detach/exit) restores the EXACT project
+        # the board was showing when the chat was opened — NEVER the chat's own
+        # project. (Snapping to the chat's project was jarring: Ctrl+Z from a
+        # chat dumped you onto a different project screen than the one you left.)
+        # _KEEP_PROJECT = a fresh launch, so use the persisted active set above;
+        # any other value (including None for "All projects") = restore it verbatim.
+        if select_project is not _KEEP_PROJECT:
             self.active_project = select_project
             self._save_projects()
         self.collapsed = set(_load_json(COLLAPSE_STORE).get("collapsed", []))
@@ -953,8 +960,23 @@ class App:
                 self.sel = max(0, len(nav) - 1)
             self.draw(rows, nav)
             ch = self.stdscr.getch()
+            if ch == curses.KEY_RESIZE:
+                self._on_resize()
+                continue
             if not self.handle_key(ch, nav):
                 return
+
+    def _on_resize(self):
+        """Terminator/VTE fires a burst of KEY_RESIZE events while the window is
+        being dragged, and leaves stale/garbled cells behind when it reflows. ncurses
+        already resized stdscr by the time we see the event, so the layout tracks the
+        drag on its own — but a plain erase()+diff won't rewrite the cells VTE
+        corrupted. So we just arm a short debounce here; once the events stop (~120ms,
+        i.e. the drag is done) the timeout tick does ONE hard clear()+full repaint that
+        wipes the garbage. Polling fast meanwhile makes us notice the gap promptly."""
+        curses.update_lines_cols()  # keep curses.LINES/COLS in sync (draw() uses getmaxyx)
+        self._resize_settle = time.time() + 0.12
+        self.stdscr.timeout(50)
 
     def _selected_row(self, nav):
         if not nav:
@@ -1039,6 +1061,12 @@ class App:
 
     def handle_key(self, ch, nav):
         if ch == -1:  # timeout tick — advance animation; refresh data ~1/sec
+            if self._resize_settle and time.time() >= self._resize_settle:
+                # The resize drag has stopped — force a full repaint to wipe the
+                # garbage VTE left, then go back to the normal animation cadence.
+                self._resize_settle = 0.0
+                self.stdscr.timeout(350)
+                self.stdscr.clear()  # clearok -> next draw()'s refresh fully repaints
             self.anim += 1
             now = time.time()
             if now - self._scan_ts > 2.0:
@@ -1486,7 +1514,11 @@ def main():
         return
 
     last_id = None
-    last_project = None  # project to snap the board back to (the chat's own)
+    # Project to restore when the board reopens after a chat. _KEEP_PROJECT on
+    # the first launch (use whatever's persisted); after a chat it becomes the
+    # project the board was showing, so Ctrl+Z always returns you to the SAME
+    # project screen you left — never the chat's own project.
+    last_project = _KEEP_PROJECT
     while True:
         holder = {}
 
@@ -1499,7 +1531,10 @@ def main():
         app = holder.get("app")
         if not app:
             return
-        last_project = None  # already consumed by the App above; recompute below
+        # Remember the project the board was showing so EVERY path below
+        # (resume/attach/fork/new/stop) returns you to that same project screen
+        # — not the chat's own project. This is the whole Ctrl+Z fix.
+        last_project = app.active_project
 
         # Ctrl+R — reload the script itself by re-executing (picks up code edits).
         if getattr(app, "reload", False):
@@ -1578,12 +1613,10 @@ def main():
             print(f"\n▶ Resuming: {title[:60]}")
             print("  (press Ctrl+Z, Ctrl-D, or /quit to come back here)\n")
 
-        # Snap the board back to this chat's own project when we return (Ctrl+Z,
-        # /quit, exit) instead of whatever project was selected before. Use the
-        # chat's EFFECTIVE project (its per-chat tag if any, else its folder) so a
-        # chat moved into a virtual project like HW snaps back to HW — not the cwd
-        # it physically lives in.
-        last_project = app.tags.get(c["id"]) or run_cwd
+        # NOTE: we intentionally do NOT change last_project here. It already
+        # holds the project the board was showing (captured above), so returning
+        # from this chat lands back on that SAME project screen — never the
+        # chat's own project, which used to throw you onto the wrong screen.
 
         try:
             runner(cmd, run_cwd)

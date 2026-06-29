@@ -7,6 +7,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const KEY = 'tile-new-terminal';
 const MIN_KEY = 'minimize-terminal-group';
+const MOVE_LEFT_KEY = 'move-terminal-left';
+const MOVE_RIGHT_KEY = 'move-terminal-right';
 
 // Grab-op flag that Mutter ORs into the op for unconstrained moves.
 const GRAB_OP_WINDOW_FLAG_UNCONSTRAINED = 1024;
@@ -37,6 +39,23 @@ export default class TerminalTilerExtension extends Extension {
             Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
             Shell.ActionMode.NORMAL,
             this._onMinimizeGroup.bind(this)
+        );
+
+        // Reorder the focused terminal within its group (swap with the
+        // neighbour to its left/right) and re-flow.
+        Main.wm.addKeybinding(
+            MOVE_LEFT_KEY,
+            this._settings,
+            Meta.KeyBindingFlags.NONE,
+            Shell.ActionMode.NORMAL,
+            () => this._onMove(-1)
+        );
+        Main.wm.addKeybinding(
+            MOVE_RIGHT_KEY,
+            this._settings,
+            Meta.KeyBindingFlags.NONE,
+            Shell.ActionMode.NORMAL,
+            () => this._onMove(1)
         );
 
         // A new window appeared — claim it if we asked for a terminal.
@@ -87,6 +106,8 @@ export default class TerminalTilerExtension extends Extension {
     disable() {
         Main.wm.removeKeybinding(KEY);
         Main.wm.removeKeybinding(MIN_KEY);
+        Main.wm.removeKeybinding(MOVE_LEFT_KEY);
+        Main.wm.removeKeybinding(MOVE_RIGHT_KEY);
         global.display.disconnectObject(this);
         global.window_manager.disconnectObject(this);
         Main.layoutManager.disconnectObject(this);
@@ -209,6 +230,26 @@ export default class TerminalTilerExtension extends Extension {
             if (this._isAlive(win) && !win.minimized)
                 win.minimize();
         this._syncing = false;
+    }
+
+    // Move the focused terminal one slot within its group: delta -1 swaps it
+    // with the previous member (left column / row above), +1 with the next
+    // (right column / row below), then re-flows so positions update. No-op if
+    // the focused window isn't in a batch or is already at the relevant edge.
+    _onMove(delta) {
+        const focus = global.display.focus_window;
+        const monitor = this._monitorOf(focus);
+        if (monitor === null)
+            return;
+        const arr = this._batches.get(monitor);
+        if (!arr)
+            return;
+        const i = arr.indexOf(focus);
+        const j = i + delta;
+        if (i < 0 || j < 0 || j >= arr.length)
+            return;
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+        this._tile(monitor);
     }
 
     // A window was minimised (minimized=true) or restored (false) via the WM.
