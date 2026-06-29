@@ -41,9 +41,53 @@ import sys
 import termios
 import time
 import tty
+import unicodedata
 from pathlib import Path
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# --- bidi / display-width helpers ------------------------------------------
+# Chat names can mix Hebrew (RTL) with English (LTR). A row whose first strong
+# character is Hebrew makes the terminal flip the WHOLE line to RTL base
+# direction, so the trailing "[project]" tag jumps to the left and the layout
+# looks scrambled. Wrapping the name in directional isolates renders it
+# correctly on its own while leaving the surrounding LTR layout untouched.
+_FSI = "⁨"  # First Strong Isolate (auto-detects the run's direction)
+_PDI = "⁩"  # Pop Directional Isolate
+
+
+def _has_rtl(s):
+    return any(unicodedata.bidirectional(c) in ("R", "AL") for c in s)
+
+
+def _bidi(s):
+    """Isolate a possibly-RTL string so it can't flip the surrounding layout."""
+    return _FSI + s + _PDI if _has_rtl(s) else s
+
+
+def _cwidth(ch):
+    """Terminal columns a single character occupies (0 for zero-width marks)."""
+    if unicodedata.combining(ch) or unicodedata.category(ch) == "Cf":
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _dwidth(s):
+    return sum(_cwidth(c) for c in s)
+
+
+def _clamp(s, cols):
+    """Truncate s to at most `cols` display columns (counting zero-width as 0)."""
+    if cols <= 0:
+        return ""
+    out, used = [], 0
+    for ch in s:
+        w = _cwidth(ch)
+        if used + w > cols:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out)
 
 locale.setlocale(locale.LC_ALL, "")
 
@@ -912,8 +956,8 @@ class App:
     def confirm_stop(self, chat):
         h, w = self.stdscr.getmaxyx()
         prompt = (f"Stop this live agent? It stops running (conversation kept).  "
-                  f"(y/N)  {chat['title'][:35]}")
-        self.stdscr.addstr(h - 1, 0, prompt[: w - 1], curses.color_pair(4) | curses.A_BOLD)
+                  f"(y/N)  {_bidi(chat['title'][:35])}")
+        self.stdscr.addstr(h - 1, 0, _clamp(prompt, w - 1), curses.color_pair(4) | curses.A_BOLD)
         self.stdscr.clrtoeol()
         self.stdscr.refresh()
         if self._blocking_getch() in (ord("y"), ord("Y")):
@@ -924,8 +968,8 @@ class App:
     def confirm_delete(self, chat):
         h, w = self.stdscr.getmaxyx()
         live = "  (NOTE: this chat is running live)" if chat["id"] in self.live_ids else ""
-        prompt = f"Delete this chat permanently? (y/N)  {chat['title'][:40]}{live}"
-        self.stdscr.addstr(h - 1, 0, prompt[: w - 1], curses.color_pair(4))
+        prompt = f"Delete this chat permanently? (y/N)  {_bidi(chat['title'][:40])}{live}"
+        self.stdscr.addstr(h - 1, 0, _clamp(prompt, w - 1), curses.color_pair(4))
         self.stdscr.clrtoeol()
         self.stdscr.refresh()
         if self._blocking_getch() in (ord("y"), ord("Y")):
@@ -990,18 +1034,23 @@ class App:
                 gcolor = STATUS_ICON.get(status, STATUS_ICON["unknown"])[1]
                 prefix = "     "  # 5 cols reserved for the status indicator
                 tail = f"  [{proj}]"
-                avail = w - 1 - len(tail) - len(prefix)
+                avail = w - 1 - _dwidth(tail) - len(prefix)
                 t = self.display_title(c)
-                if len(t) > avail:
-                    t = t[: avail - 1] + "…"
-                body = t + " " * max(0, avail - len(t)) + tail
+                if _dwidth(t) > avail:
+                    t = _clamp(t, max(0, avail - 1)) + "…"
+                # _bidi() keeps a Hebrew/RTL name from flipping the whole row;
+                # pad/clamp by display width since it (and the name) may differ
+                # from code-point count.
+                pad = " " * max(0, avail - _dwidth(t))
+                body = _bidi(t) + pad + tail
                 if is_sel:
-                    self.stdscr.addstr(line_y, 0, (prefix + body)[: w - 1],
+                    self.stdscr.addstr(line_y, 0, _clamp(prefix + body, w - 1),
                                        curses.color_pair(7))
                     self._draw_indicator(line_y, status, sel=True)
                 else:
                     self.stdscr.addstr(line_y, len(prefix),
-                                       body[: w - 1 - len(prefix)], curses.A_NORMAL)
+                                       _clamp(body, w - 1 - len(prefix)),
+                                       curses.A_NORMAL)
                     self._draw_indicator(line_y, status, sel=False)
 
         if self.message:
