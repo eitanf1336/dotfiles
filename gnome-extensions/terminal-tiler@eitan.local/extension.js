@@ -56,6 +56,16 @@ export default class TerminalTilerExtension extends Extension {
             this
         );
 
+        // A batch member gained focus → bring the rest of its group along
+        // (restore any minimised peers, raise them all). Activating a window
+        // always fires this, so it reliably covers "restore one → restore all"
+        // even on restore paths that skip the WM unminimize signal.
+        global.display.connectObject(
+            'notify::focus-window',
+            () => this._onFocusChanged(),
+            this
+        );
+
         // A batch member was minimised/restored → do the same to the rest, so
         // the group hides and returns as a unit. The window-manager emits these
         // for every animation; Meta.Window's read-only `minimized` property does
@@ -140,6 +150,34 @@ export default class TerminalTilerExtension extends Extension {
         const first = arr.find(w => this._isAlive(w));
         if (first)
             first.activate(time);
+    }
+
+    // A window just gained focus. If it belongs to a batch, bring its peers
+    // along: restore any that are minimised and raise them all to the front, so
+    // the group travels together (clicking/activating one terminal — including
+    // restoring it from minimised — lifts the whole column set). Raising does
+    // not steal focus back, and tiled members don't overlap, so their relative
+    // z-order among themselves doesn't matter. Guarded so our own
+    // unminimize()/raise() calls here don't re-enter.
+    _onFocusChanged() {
+        if (this._syncing)
+            return;
+        const win = global.display.focus_window;
+        const monitor = this._monitorOf(win);
+        if (monitor === null)
+            return;
+        const arr = this._batches.get(monitor);
+        if (!arr)
+            return;
+        this._syncing = true;
+        for (const w of arr) {
+            if (w === win || !this._isAlive(w))
+                continue;
+            if (w.minimized)
+                w.unminimize();
+            w.raise();
+        }
+        this._syncing = false;
     }
 
     // Toggle the batch on the focused window's monitor (or, if a non-batch
