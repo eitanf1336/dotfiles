@@ -43,6 +43,7 @@ In `bin/` (installed to `~/.local/bin`):
 | `rotate-bg.sh` | Rotates desktop wallpaper + matching Terminator terminal background through 7 themes; updates live in running terminals via remotinator. |
 | `claude-custom` | Launcher for the `claude-c` chats board. |
 | `claude-desktop` | Launches the community Claude Desktop AppImage fully detached from the terminal. |
+| `setup-rclone-gdrive` | One-shot: installs rclone and configures full read/write Google Drive access (remote `gdrive`). Run once, authorize in browser. No secrets stored in the repo — the token lives only in `~/.config/rclone/rclone.conf`. |
 
 > Note: `rotate-bg.sh` expects wallpapers under `~/Pictures/Wallpapers/{desktop,terminal}/`, which are not included here.
 

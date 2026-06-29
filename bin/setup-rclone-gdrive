@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Set up full read/write Google Drive access from the shell via rclone.
+# Idempotent — re-run anytime. NO secrets live in this repo: the OAuth token
+# is created locally by `rclone config create` and stored only in
+# ~/.config/rclone/rclone.conf (chmod 600), which is never committed.
+#
+# Why this exists: the claude.ai Google Drive MCP connector is read-only
+# (scope-limited, rejects writes with "insufficient authentication scopes").
+# This rclone remote gives the real thing — create/edit/delete anywhere in Drive.
+set -euo pipefail
+
+REMOTE="gdrive"
+BIN="$HOME/.local/bin"
+mkdir -p "$BIN"
+
+# 1. Ensure rclone is available (prefer one already on PATH).
+if command -v rclone >/dev/null 2>&1; then
+    RCLONE="$(command -v rclone)"
+elif [ -x "$HOME/bin/rclone" ]; then
+    RCLONE="$HOME/bin/rclone"
+else
+    echo "==> Installing rclone (user-local) -> $BIN/rclone"
+    tmp="$(mktemp -d)"
+    curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o "$tmp/rclone.zip"
+    unzip -oq "$tmp/rclone.zip" -d "$tmp"
+    cp "$tmp"/rclone-*-linux-amd64/rclone "$BIN/rclone"
+    chmod +x "$BIN/rclone"
+    rm -rf "$tmp"
+    RCLONE="$BIN/rclone"
+fi
+echo "==> rclone: $("$RCLONE" version | head -1)"
+
+# 2. Create the remote if missing (opens a browser for FULL-scope Drive auth).
+if "$RCLONE" listremotes | grep -qx "${REMOTE}:"; then
+    echo "==> remote '${REMOTE}:' already configured"
+else
+    echo "==> Authorizing Google Drive (a browser window will open)..."
+    "$RCLONE" config create "$REMOTE" drive scope drive
+fi
+
+# 3. Lock down the token file and verify access.
+conf="${RCLONE_CONFIG:-$HOME/.config/rclone/rclone.conf}"
+[ -f "$conf" ] && chmod 600 "$conf"
+echo "==> Verifying access (top-level Drive folders):"
+"$RCLONE" lsd "${REMOTE}:" | head -20
+echo "==> Done. Use e.g.: $RCLONE copyto file.ipynb \"${REMOTE}:Colab Notebooks/file.ipynb\""
