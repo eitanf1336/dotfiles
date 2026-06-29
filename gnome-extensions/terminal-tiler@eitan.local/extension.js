@@ -6,6 +6,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const KEY = 'tile-new-terminal';
+const MIN_KEY = 'minimize-terminal-group';
 
 // Grab-op flag that Mutter ORs into the op for unconstrained moves.
 const GRAB_OP_WINDOW_FLAG_UNCONSTRAINED = 1024;
@@ -18,6 +19,8 @@ export default class TerminalTilerExtension extends Extension {
         this._batches = new Map();
         // monitors waiting for a freshly-spawned terminal window to appear.
         this._pending = [];
+        // Re-entrancy guard while we propagate minimize/restore across a batch.
+        this._syncing = false;
 
         Main.wm.addKeybinding(
             KEY,
@@ -25,6 +28,15 @@ export default class TerminalTilerExtension extends Extension {
             Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
             Shell.ActionMode.NORMAL,
             this._onActivate.bind(this)
+        );
+
+        // Minimise the focused monitor's whole batch at once.
+        Main.wm.addKeybinding(
+            MIN_KEY,
+            this._settings,
+            Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
+            Shell.ActionMode.NORMAL,
+            this._onMinimizeGroup.bind(this)
         );
 
         // A new window appeared — claim it if we asked for a terminal.
@@ -44,6 +56,16 @@ export default class TerminalTilerExtension extends Extension {
             this
         );
 
+        // A batch member was minimised/restored → do the same to the rest, so
+        // the group hides and returns as a unit. The window-manager emits these
+        // for every animation; Meta.Window's read-only `minimized` property does
+        // NOT fire `notify::`, so we must listen here rather than on the window.
+        global.window_manager.connectObject(
+            'minimize', (_wm, actor) => this._onWmMinimize(actor, true),
+            'unminimize', (_wm, actor) => this._onWmMinimize(actor, false),
+            this
+        );
+
         // Re-flow when monitors are added/removed so stale geometry is fixed.
         Main.layoutManager.connectObject(
             'monitors-changed',
@@ -54,7 +76,9 @@ export default class TerminalTilerExtension extends Extension {
 
     disable() {
         Main.wm.removeKeybinding(KEY);
+        Main.wm.removeKeybinding(MIN_KEY);
         global.display.disconnectObject(this);
+        global.window_manager.disconnectObject(this);
         Main.layoutManager.disconnectObject(this);
 
         // Drop our handlers from every tracked window.
@@ -71,20 +95,110 @@ export default class TerminalTilerExtension extends Extension {
 
     _onActivate() {
         const focus = global.display.focus_window;
+        const monitor = focus
+            ? focus.get_monitor()
+            : global.display.get_current_monitor();
 
         // A stray terminal is focused and not yet managed → absorb it.
+        // (Explicit "add this terminal" gesture wins over summoning.)
         if (this._isTerminal(focus) && this._monitorOf(focus) === null) {
-            const monitor = focus.get_monitor();
             this._add(monitor, focus);
             this._tile(monitor);
             return;
         }
 
-        // Otherwise spawn a fresh terminal onto the focused monitor.
-        const monitor = focus
-            ? focus.get_monitor()
-            : global.display.get_current_monitor();
+        // A batch lives on this monitor but isn't the focused window → summon
+        // the whole group to the front and focus it (over everything else).
+        const arr = this._batches.get(monitor);
+        const groupFocused = this._monitorOf(focus) === monitor;
+        if (arr && arr.length && !groupFocused) {
+            this._raiseGroup(monitor);
+            return;
+        }
+
+        // Otherwise spawn a fresh terminal onto the focused monitor. When a
+        // group window is already focused this adds another column and re-tiles.
         this._spawnInto(monitor);
+    }
+
+    // Bring every window in a monitor's batch to the front, restoring any that
+    // are minimised, and give keyboard focus to the first column.
+    _raiseGroup(monitor) {
+        const arr = this._batches.get(monitor);
+        if (!arr || !arr.length)
+            return;
+        const time = global.get_current_time();
+        this._syncing = true; // restoring here; don't let the cascade fight us.
+        for (const win of arr) {
+            if (!this._isAlive(win))
+                continue;
+            if (win.minimized)
+                win.unminimize();
+            win.raise();
+        }
+        this._syncing = false;
+        const first = arr.find(w => this._isAlive(w));
+        if (first)
+            first.activate(time);
+    }
+
+    // Toggle the batch on the focused window's monitor (or, if a non-batch
+    // window is focused, whichever monitor it sits on): if any member is still
+    // open, minimise the whole group; if they are all minimised, bring them back.
+    _onMinimizeGroup() {
+        const focus = global.display.focus_window;
+        let monitor = this._monitorOf(focus);
+        if (monitor === null) {
+            const m = focus
+                ? focus.get_monitor()
+                : global.display.get_current_monitor();
+            if (this._batches.has(m))
+                monitor = m;
+        }
+        if (monitor === null)
+            return;
+        const arr = this._batches.get(monitor);
+        if (!arr || !arr.length)
+            return;
+
+        const anyOpen = arr.some(w => this._isAlive(w) && !w.minimized);
+        if (!anyOpen) {
+            this._raiseGroup(monitor);
+            return;
+        }
+        this._syncing = true;
+        for (const win of arr)
+            if (this._isAlive(win) && !win.minimized)
+                win.minimize();
+        this._syncing = false;
+    }
+
+    // A window was minimised (minimized=true) or restored (false) via the WM.
+    // If it belongs to a batch, mirror the change across the rest so the group
+    // minimises and restores as a unit. Our own minimize()/unminimize() calls
+    // re-enter through this signal, hence the `_syncing` guard.
+    _onWmMinimize(actor, minimized) {
+        if (this._syncing)
+            return;
+        const win = actor?.meta_window;
+        const monitor = this._monitorOf(win);
+        if (monitor === null)
+            return;
+        const arr = this._batches.get(monitor);
+        if (!arr)
+            return;
+        this._syncing = true;
+        for (const w of arr) {
+            if (w === win || !this._isAlive(w))
+                continue;
+            if (minimized) {
+                if (!w.minimized)
+                    w.minimize();
+            } else if (w.minimized) {
+                w.unminimize();
+            }
+        }
+        this._syncing = false;
     }
 
     _spawnInto(monitor) {

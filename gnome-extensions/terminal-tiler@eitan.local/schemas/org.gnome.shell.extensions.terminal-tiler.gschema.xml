@@ -5,8 +5,14 @@
 
     <key name="tile-new-terminal" type="as">
       <default><![CDATA[['<Super>Return']]]></default>
-      <summary>Spawn / add a terminal to the focused monitor's batch</summary>
-      <description>Opens a terminal full-screen on the focused monitor, or adds another and re-divides the monitor into equal vertical columns. If a stray terminal is focused, it is absorbed into the batch instead.</description>
+      <summary>Spawn / add a terminal to the focused monitor's batch, or summon it</summary>
+      <description>Opens a terminal full-screen on the focused monitor, or adds another and re-divides the monitor into equal vertical columns. If a stray terminal is focused, it is absorbed into the batch instead. If the monitor already has a batch but it is not the focused window, the whole group is raised to the front and focused instead.</description>
+    </key>
+
+    <key name="minimize-terminal-group" type="as">
+      <default><![CDATA[['<Super><Primary>Return']]]></default>
+      <summary>Toggle (minimise / restore) the focused monitor's terminal batch</summary>
+      <description>If any terminal in the batch on the focused window's monitor is still open, minimises the whole group at once; if they are all minimised, brings them all back to the front and focuses them. The batch also minimises and restores as a unit when any single member is minimised or restored.</description>
     </key>
 
     <key name="terminal-command" type="s">

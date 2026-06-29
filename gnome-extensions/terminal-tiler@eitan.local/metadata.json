@@ -1,7 +1,7 @@
 {
   "uuid": "terminal-tiler@eitan.local",
   "name": "Terminal Tiler",
-  "description": "On-demand vertical tiling for terminals. A keybinding (default Super+Return) spawns a terminal full-screen on the focused monitor; pressing again adds another and divides that monitor into equal vertical columns. Focusing a stray terminal and pressing the key absorbs it into the batch. Manually moving or resizing a tiled window ejects it and re-flows the rest. Works per-monitor on Wayland.",
+  "description": "On-demand vertical tiling for terminals. A keybinding (default Super+Return) spawns a terminal full-screen on the focused monitor; pressing again adds another and divides that monitor into equal vertical columns. Focusing a stray terminal and pressing the key absorbs it into the batch. If the monitor's batch is not focused, Super+Return instead raises the whole group to the front and focuses it. Super+Ctrl+Return toggles the batch (minimise the group, or restore it if already minimised), and the group minimises/restores as a unit. Manually moving or resizing a tiled window ejects it and re-flows the rest. Works per-monitor on Wayland.",
   "shell-version": ["45", "46", "47", "48", "49", "50"],
   "settings-schema": "org.gnome.shell.extensions.terminal-tiler",
   "gettext-domain": "terminal-tiler"
