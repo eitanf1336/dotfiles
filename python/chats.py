@@ -16,9 +16,16 @@ Keys:
   n            start a new chat as a background agent — leave with Ctrl+Z and
                it keeps running (just like attaching to an existing agent)
   r            rename the selected chat
+  m            move the selected chat to a project (independent of its folder)
   f            fork a copy of the selected chat
   x            stop the selected live agent
-  1..5         file the selected chat into a category
+  1..5         file the selected chat into a category. A freshly-filed chat
+               sorts to the TOP of its category, so an accidental move stays in
+               plain sight instead of sinking into a big pile.
+  u            undo the last category move (revert the chat to where it was)
+  /            find a chat by name and jump to it, anywhere on the board — press
+               / again to cycle to the next match. Reaches chats in collapsed
+               sections (it expands the section it lands in).
   P            projects panel — switch active project, add a folder, rename,
                remove. The active project filters the board and is where new
                chats start.
@@ -175,8 +182,34 @@ def load_store():
     return _load_json(STORE)
 
 
+# When each chat was last (re)filed into a category, as unix timestamps keyed by
+# session id. Used to float a freshly-moved chat to the top of its category, so an
+# accidental move lands somewhere visible instead of sinking into a big pile.
+MOVED_STORE = HOME / ".claude" / "chats" / "moved.json"
+
+
+def load_moved():
+    return _load_json(MOVED_STORE)
+
+
 PROJECTS_STORE = HOME / ".claude" / "chats" / "projects.json"
 COLLAPSE_STORE = HOME / ".claude" / "chats" / "collapsed.json"
+PROJECT_TAGS_STORE = HOME / ".claude" / "chats" / "chat_projects.json"
+
+
+def load_project_tags():
+    """sessionId -> project key override. Lets a chat live in a project other
+    than the one implied by its folder (e.g. grouping homework chats from several
+    folders under one 'HW' project). Empty file = every chat just uses its
+    folder, exactly like before this feature existed."""
+    return _load_json(PROJECT_TAGS_STORE)
+
+
+def project_key_for(chat, tags):
+    """Effective project key for a chat: an explicit per-chat tag wins, else the
+    chat's own working directory. The key is a real folder path for folder-based
+    projects, or a free virtual name (like 'HW') for tagged ones."""
+    return tags.get(chat["id"]) or chat.get("cwd") or "(unknown)"
 
 
 def _text_from_content(content):
@@ -428,10 +461,13 @@ def setup_colors():
 
 
 class App:
-    def __init__(self, stdscr, select_id=None):
+    def __init__(self, stdscr, select_id=None, select_project=None):
         self.stdscr = stdscr
         self.store = load_store()
         self.names = load_names()  # sessionId -> user's custom name
+        self.moved = load_moved()  # sessionId -> ts it was last (re)filed
+        self._last_move = None     # (id, prev_cat, prev_ts) — for `u` undo
+        self._search = ""          # last `/` query, so / repeats find the next hit
         self._chat_cache = {}   # path -> parsed chat dict (title/cwd are stable)
         self.all_chats = []
         self.rescan()           # populate self.all_chats from disk
@@ -446,12 +482,24 @@ class App:
         self._reselect_id = None  # keep cursor on this chat after a rescan
         self.refresh_live(force=True)
         pj = _load_json(PROJECTS_STORE)
-        self.projects_added = pj.get("list", {})   # path -> custom display name
+        self.projects_added = pj.get("list", {})   # key -> custom display name
+        self.project_cwds = pj.get("cwds", {})     # virtual project key -> default cwd
+        self.tags = load_project_tags()            # sessionId -> project key override
         if "active" not in pj:                      # first run -> default to home
             self.active_project = str(HOME)
         else:                                       # "__all__" means user chose All
             a = pj["active"]
             self.active_project = None if a in (None, "__all__") else a
+        # Returning from a chat (Ctrl+Z/detach) snaps the board to THAT chat's
+        # project, not whatever was selected before — so you land back where the
+        # chat lives. Persist it so it sticks as the current project. Accept a
+        # virtual project key (e.g. 'HW') too, not just a real folder, so a moved
+        # chat snaps back to its tagged project instead of its physical cwd.
+        if select_project and (os.path.isdir(select_project)
+                               or select_project in self.projects_added
+                               or select_project in set(self.tags.values())):
+            self.active_project = select_project
+            self._save_projects()
         self.collapsed = set(_load_json(COLLAPSE_STORE).get("collapsed", []))
         self.start_cwd = os.environ.get("CHATS_LAUNCH_CWD") or os.getcwd()
         self.sel = 0           # index into self.flat (chat rows only)
@@ -635,28 +683,44 @@ class App:
     def category_of(self, chat_id):
         return self.store.get(chat_id, UNCATEGORIZED)
 
-    def project_name(self, path):
-        if not path:
+    def project_name(self, key):
+        if not key:
             return "all projects"
-        return (self.projects_added.get(path)
-                or os.path.basename(path.rstrip("/")) or path)
+        name = self.projects_added.get(key)
+        if name:
+            return name
+        if os.path.isabs(key):                       # a real folder -> basename
+            return os.path.basename(key.rstrip("/")) or key
+        return key                                   # virtual project: name is the key
+
+    def project_cwd(self, key):
+        """Default working directory for new chats started in a project. For a
+        folder-based project that's the folder itself; for a virtual project
+        it's an explicitly-stored cwd (if any)."""
+        if not key:
+            return None
+        if os.path.isdir(key):
+            return key
+        return self.project_cwds.get(key)
 
     def project_list(self):
-        """[(None, 'All'), (path, name), ...] — union of added projects and any
-        directory that already has chats."""
-        paths = set(p for p in self.projects_added)
+        """[(None, 'All'), (key, name), ...] — union of explicitly-added projects
+        and the effective project of every chat (its tag override, or else its
+        folder)."""
+        keys = set(self.projects_added)
         for c in self.all_chats:
-            cw = c.get("cwd")
-            if cw and cw != "(unknown)":
-                paths.add(cw)
-        ordered = sorted(paths, key=lambda p: self.project_name(p).lower())
-        return [(None, "All projects (no filter)")] + [(p, self.project_name(p))
-                                                       for p in ordered]
+            k = project_key_for(c, self.tags)
+            if k and k != "(unknown)":
+                keys.add(k)
+        ordered = sorted(keys, key=lambda k: self.project_name(k).lower())
+        return [(None, "All projects (no filter)")] + [(k, self.project_name(k))
+                                                       for k in ordered]
 
     def _save_projects(self):
         def fn(d):
             d["active"] = self.active_project or "__all__"  # None = explicit "All"
             d["list"] = self.projects_added
+            d["cwds"] = self.project_cwds
         _json_update(PROJECTS_STORE, fn)
 
     def _add_project(self):
@@ -682,7 +746,7 @@ class App:
         h, w = self.stdscr.getmaxyx()
         self.stdscr.addstr(0, 0, " Projects "[: w - 1], curses.A_BOLD)
         help_ = ("↑/↓ move   Enter switch-to   n new folder   r rename   "
-                 "d remove   Esc/q back")
+                 "d remove   Esc/q/p back")
         self.stdscr.addstr(1, 0, help_[: w - 1], curses.color_pair(8) | curses.A_DIM)
         top = 3
         view_h = max(1, h - top - 1)
@@ -696,8 +760,13 @@ class App:
             if path is None:
                 detail = "show every chat"
             else:
-                cnt = sum(1 for c in self.all_chats if c["cwd"] == path)
-                detail = f"{path}   ({cnt})"
+                cnt = sum(1 for c in self.all_chats
+                          if project_key_for(c, self.tags) == path)
+                if os.path.isabs(path):
+                    detail = f"{path}   ({cnt})"
+                else:
+                    cw = self.project_cwds.get(path)
+                    detail = (f"{cw}   " if cw else "") + f"(tagged · {cnt})"
             line = f"{mark}{name:<26.26}  {detail}"
             if is_sel:
                 attr = curses.color_pair(7)
@@ -722,7 +791,9 @@ class App:
                 sel = max(0, min(sel, len(items) - 1))
                 self._draw_projects(items, sel)
                 k = self.stdscr.getch()
-                if k in (ord("q"),):
+                if k in (ord("q"), ord("p"), ord("P")):
+                    # 'p' toggles the panel shut again — back to the project you
+                    # had before opening it (selection here only commits on Enter).
                     return
                 if k == 27:  # Esc alone -> back; or an arrow escape sequence
                     self.stdscr.nodelay(True)
@@ -766,29 +837,74 @@ class App:
                             self.message = "Project renamed"
                 elif k in (ord("d"), ord("D")):
                     path = items[sel][0]
-                    if path and path in self.projects_added:
-                        del self.projects_added[path]
+                    if path is None:
+                        self.message = "Can't remove 'All projects'"
+                    else:
+                        tagged = [sid for sid, kk in self.tags.items() if kk == path]
+                        if tagged:  # un-tag its chats -> they fall back to folders
+                            self.tags = _json_update(
+                                PROJECT_TAGS_STORE,
+                                lambda d: [d.pop(sid, None) for sid in tagged])
+                        removed = False
+                        if path in self.projects_added:
+                            del self.projects_added[path]
+                            self.project_cwds.pop(path, None)
+                            self._save_projects()
+                            removed = True
                         if self.active_project == path:
                             self.active_project = None
-                        self._save_projects()
-                        self.message = "Removed from project list"
-                    elif path:
-                        self.message = "Has chats (auto-listed) — can't remove"
-                    else:
-                        self.message = "Can't remove 'All projects'"
+                        if removed or tagged:
+                            self.message = "Project removed (chats back to folders)"
+                        else:
+                            self.message = "Has chats (auto-listed by folder) — can't remove"
         finally:
             self.stdscr.timeout(350)
+
+    def move_chat(self, chat):
+        """Assign a chat to a project, independent of its folder. Typing an
+        existing project name files it there; a new name creates that project;
+        a blank entry clears the tag so the chat goes back to its folder's
+        project. Category (status) is untouched — it's stored separately."""
+        new = self._read_line(
+            "Move to project (name; blank = back to its folder): ", "")
+        if new is None:
+            return
+        if new == "":
+            self.tags = _json_set(PROJECT_TAGS_STORE, chat["id"], None)
+            self.message = "Project tag cleared — back to its folder"
+            return
+        key = None
+        for k, nm in self.project_list()[1:]:  # match an existing project by name
+            if nm.lower() == new.lower():
+                key = k
+                break
+        if key is None:                        # brand-new virtual project
+            key = new
+            self.projects_added.setdefault(key, new)
+            self._save_projects()
+        self.tags = _json_set(PROJECT_TAGS_STORE, chat["id"], key)
+        self.message = f"Moved to project “{self.project_name(key)}”"
 
     def visible_chats(self):
         cs = self.all_chats
         if self.active_project:
-            cs = [c for c in cs if c["cwd"] == self.active_project]
+            cs = [c for c in cs
+                  if project_key_for(c, self.tags) == self.active_project]
         return cs
 
     def grouped(self):
         groups = {cat: [] for cat in DISPLAY_ORDER}
         for c in self.visible_chats():
             groups[self.category_of(c["id"])].append(c)
+        # Order each category by recency = the MORE recent of the chat's own last
+        # activity (file mtime) and when you last filed it here. So a chat you just
+        # moved jumps to the top of its new category (an accidental move stays in
+        # plain sight), while a chat you filed long ago but kept working in still
+        # rises on real activity. Untouched-by-the-board chats fall back to mtime.
+        for members in groups.values():
+            members.sort(
+                key=lambda c: max(c["mtime"], self.moved.get(c["id"], 0)),
+                reverse=True)
         return groups
 
     def build_rows(self):
@@ -862,6 +978,65 @@ class App:
         _json_update(COLLAPSE_STORE,
                      lambda d: d.__setitem__("collapsed", sorted(self.collapsed)))
 
+    def _record_move(self, chat_id, prev_cat):
+        """Stamp a category move's time (drives the recency sort) and remember the
+        prior state so `u` can revert the last move."""
+        self._last_move = (chat_id, prev_cat, self.moved.get(chat_id))
+        self.moved = _json_set(MOVED_STORE, chat_id, time.time())
+
+    def _undo_move(self):
+        """Revert the most recent category move — both the category and the
+        recency stamp — so a stray 1-5 keypress is a one-key fix."""
+        if not self._last_move:
+            self.message = "Nothing to undo"
+            return
+        cid, prev_cat, prev_ts = self._last_move
+        self._last_move = None
+        # prev_cat == Uncategorized means it had no tag -> delete the key.
+        self.store = _json_set(
+            STORE, cid, None if prev_cat == UNCATEGORIZED else prev_cat)
+        # prev_ts None -> it had never been filed before; delete the stamp.
+        self.moved = _json_set(MOVED_STORE, cid, prev_ts)
+        self._reselect_id = cid  # snap the cursor back to it
+        self.message = f"Undone — back to “{prev_cat}”"
+
+    def _search_jump(self, nav):
+        """Find a chat by name anywhere on the board and jump the cursor to it, so
+        even one buried deep in a big category is reachable. Pressing / again with
+        the same query cycles to the next match (wrapping at the end)."""
+        q = self._read_line("Find (name): ", self._search)
+        if q is None:
+            return
+        q = q.strip().lower()
+        self._search = q
+        if not q:
+            return
+        groups = self.grouped()
+        ordered = [c for cat in DISPLAY_ORDER for c in groups[cat]]  # board order
+        matches = [c for c in ordered if q in self.display_title(c).lower()]
+        if not matches:
+            self.message = f"No match for “{q}”"
+            return
+        cur = self.selected_chat(nav)
+        target = None
+        if cur is not None:  # first match strictly after the cursor (cycle)
+            ids = [c["id"] for c in ordered]
+            try:
+                start = ids.index(cur["id"]) + 1
+            except ValueError:
+                start = 0
+            target = next((c for c in ordered[start:]
+                           if q in self.display_title(c).lower()), None)
+        if target is None:
+            target = matches[0]
+        cat = self.category_of(target["id"])
+        if cat in self.collapsed:  # expand so the cursor can land on it
+            self.toggle_collapse(cat)
+        self._reselect_id = target["id"]
+        n = len(matches)
+        self.message = (f"Found: {self.display_title(target)}"
+                        + (f"  ({n} matches — / for next)" if n > 1 else ""))
+
     def handle_key(self, ch, nav):
         if ch == -1:  # timeout tick — advance animation; refresh data ~1/sec
             self.anim += 1
@@ -873,6 +1048,8 @@ class App:
                 sel_chat = self.selected_chat(nav)
                 self.store = load_store()
                 self.names = load_names()
+                self.moved = load_moved()
+                self.tags = load_project_tags()
                 new_ids = self.rescan()
                 if sel_chat:  # keep the cursor on the same chat as rows shift
                     self._reselect_id = sel_chat["id"]
@@ -899,8 +1076,22 @@ class App:
             c = self.selected_chat(nav)
             if c:
                 cat = CATEGORIES[ch - ord("1")]
-                self.store = _json_set(STORE, c["id"], cat)
-                self.message = f"Moved to “{cat}”"
+                cur = self.category_of(c["id"])
+                # Going In Progress -> Done straight skips “Done — Not
+                # Committed”, i.e. the work probably isn't committed yet. Ask.
+                if (cat == "Done" and cur == "In Progress"
+                        and not self.confirm_skip_commit(c)):
+                    self.message = "Kept in “In Progress” — commit it first"
+                elif cat == cur:
+                    self.message = f"Already in “{cat}”"
+                else:
+                    self._record_move(c["id"], cur)
+                    self.store = _json_set(STORE, c["id"], cat)
+                    self.message = f"Moved to “{cat}”  —  u to undo"
+        elif ch in (ord("u"), ord("U")):
+            self._undo_move()
+        elif ch in (ord("/"),):
+            self._search_jump(nav)
         elif ch in (ord("p"), ord("P")):
             self.projects_panel()
             self.message = (f"Project: {self.project_name(self.active_project)}"
@@ -920,6 +1111,10 @@ class App:
                     else:
                         self.names = _json_set(NAMES_STORE, c["id"], new)
                         self.message = "Renamed"
+        elif ch in (ord("m"), ord("M")):
+            c = self.selected_chat(nav)
+            if c:
+                self.move_chat(c)
         elif ch in (ord("d"),):
             c = self.selected_chat(nav)
             if c:
@@ -952,6 +1147,19 @@ class App:
             if cat:  # Enter on a section header -> collapse/expand it
                 self.toggle_collapse(cat)
         return True
+
+    def confirm_skip_commit(self, chat):
+        """Warn when filing an In-Progress chat straight to Done — that skips
+        the “Done — Not Committed” step, which usually means the work hasn't
+        been committed yet. Returns True if the user wants to mark it Done anyway."""
+        h, w = self.stdscr.getmaxyx()
+        prompt = ("Mark Done without committing first? Skips “Done — Not "
+                  f"Committed”.  (y/N)  {_bidi(chat['title'][:35])}")
+        self.stdscr.addstr(h - 1, 0, _clamp(prompt, w - 1),
+                           curses.color_pair(4) | curses.A_BOLD)
+        self.stdscr.clrtoeol()
+        self.stdscr.refresh()
+        return self._blocking_getch() in (ord("y"), ord("Y"))
 
     def confirm_stop(self, chat):
         h, w = self.stdscr.getmaxyx()
@@ -988,10 +1196,21 @@ class App:
         h, w = self.stdscr.getmaxyx()
         title = " Claude Chats "
         scope = self.project_name(self.active_project) if self.active_project else "all projects"
-        header = f"{title}— {len(self.visible_chats())} chats ({scope})"
-        self.stdscr.addstr(0, 0, header[: w - 1], curses.A_BOLD)
-        help1 = ("Enter open   Space fold   n new   r rename   f fork   x stop   "
-                 "1-5 file   d delete   P projects   ^R reload   q quit")
+        # Header: plain "Claude Chats — N chats  " then the active project drawn
+        # in a reverse-video chip so the current project is unmistakable.
+        prefix = f"{title}— {len(self.visible_chats())} chats   "
+        self.stdscr.addstr(0, 0, prefix[: w - 1], curses.A_BOLD)
+        x = _dwidth(prefix)
+        if x < w - 1:
+            chip = _clamp(f" ▶ {_bidi(scope)} ", w - 1 - x)
+            chip_attr = curses.color_pair(7) | curses.A_BOLD  # black-on-white bar
+            try:
+                self.stdscr.addstr(0, x, chip, chip_attr)
+            except curses.error:
+                pass
+        help1 = ("Enter open   / find   Space fold   n new   r rename   m move   "
+                 "f fork   x stop   1-5 file   u undo   d delete   P projects   "
+                 "^R reload   q quit")
         self.stdscr.addstr(1, 0, help1[: w - 1], curses.color_pair(8) | curses.A_DIM)
         legend = "  ".join(f"{i+1}:{CATEGORIES[i]}" for i in range(5))
         self.stdscr.addstr(2, 0, legend[: w - 1], curses.A_DIM)
@@ -1029,7 +1248,10 @@ class App:
             elif kind == "chat":
                 c = payload
                 is_sel = nav and idx == nav[self.sel]
-                proj = os.path.basename(c["cwd"].rstrip("/")) or c["cwd"]
+                # The [tag] reflects the chat's EFFECTIVE project (its per-chat
+                # override if any, else its folder) — not the raw cwd basename —
+                # so a chat moved into HW shows [HW], not its old folder.
+                proj = self.project_name(project_key_for(c, self.tags))
                 status = self.live.get(c["id"], "unknown")
                 gcolor = STATUS_ICON.get(status, STATUS_ICON["unknown"])[1]
                 prefix = "     "  # 5 cols reserved for the status indicator
@@ -1058,12 +1280,41 @@ class App:
         self.stdscr.refresh()
 
 
-def create_bg_agent(cwd=None):
+EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max", "ultracode"]
+
+
+def prompt_effort(default="high"):
+    """Ask which thinking (reasoning effort) level the new chat should use.
+    Returns one of EFFORT_LEVELS. Pressing Enter (or typing anything invalid)
+    picks the default, which is 'high'. Runs after curses has ended, so plain
+    print/input is fine here."""
+    print("\n  Thinking level for this chat:")
+    for i, lv in enumerate(EFFORT_LEVELS, 1):
+        mark = "   ← default" if lv == default else ""
+        print(f"    {i}) {lv}{mark}")
+    try:
+        raw = input(f"  Choose 1-{len(EFFORT_LEVELS)} [Enter = {default}]: ").strip().lower()
+    except EOFError:
+        return default
+    if not raw:
+        return default
+    if raw.isdigit() and 1 <= int(raw) <= len(EFFORT_LEVELS):
+        return EFFORT_LEVELS[int(raw) - 1]
+    if raw in EFFORT_LEVELS:
+        return raw
+    return default
+
+
+def create_bg_agent(cwd=None, effort=None):
     """Create a new idle background agent and return its short id (or None).
     The agent keeps running in Claude's daemon; we then attach to it so the
-    user can leave with Ctrl+Z and it stays alive."""
+    user can leave with Ctrl+Z and it stays alive. `effort`, if given, sets the
+    session's thinking level via `claude --effort <level>`."""
+    cmd = ["claude", "--bg"]
+    if effort:
+        cmd += ["--effort", effort]
     try:
-        out = subprocess.run(["claude", "--bg"], cwd=cwd,
+        out = subprocess.run(cmd, cwd=cwd,
                              capture_output=True, text=True, timeout=30)
     except Exception:
         return None
@@ -1235,11 +1486,12 @@ def main():
         return
 
     last_id = None
+    last_project = None  # project to snap the board back to (the chat's own)
     while True:
         holder = {}
 
         def _run(stdscr):
-            app = App(stdscr, select_id=last_id)
+            app = App(stdscr, select_id=last_id, select_project=last_project)
             app.run()
             holder["app"] = app
 
@@ -1247,6 +1499,7 @@ def main():
         app = holder.get("app")
         if not app:
             return
+        last_project = None  # already consumed by the App above; recompute below
 
         # Ctrl+R — reload the script itself by re-executing (picks up code edits).
         if getattr(app, "reload", False):
@@ -1256,12 +1509,14 @@ def main():
         # user can leave with Ctrl+Z and the agent keeps running (just like the
         # existing live agents), instead of Ctrl-D stopping the work.
         if getattr(app, "new_chat", False):
-            new_cwd = app.active_project or app.start_cwd
+            new_cwd = app.project_cwd(app.active_project) or app.start_cwd
             run_cwd = new_cwd if (new_cwd and os.path.isdir(new_cwd)) else None
             ensure_trusted(run_cwd)
+            effort = prompt_effort()
             print(f"\n▶ Creating a new background chat"
-                  f"{f' in {run_cwd}' if run_cwd else ''} …")
-            short = create_bg_agent(run_cwd)
+                  f"{f' in {run_cwd}' if run_cwd else ''}"
+                  f" (thinking: {effort}) …")
+            short = create_bg_agent(run_cwd, effort)
             if not short:
                 print("  Couldn't create the chat (is `claude` on PATH?).")
                 input("  Press Enter to return to the menu …")
@@ -1270,6 +1525,8 @@ def main():
                          if r.get("id") == short), None)
             if full:
                 _json_set(STORE, full, "In Progress")
+                if app.active_project:  # keep new chats inside the active project
+                    _json_set(PROJECT_TAGS_STORE, full, app.active_project)
             print("  Attaching — press Ctrl+Z to leave it running and come back.\n")
             try:
                 run_child(["claude", "attach", short], run_cwd)
@@ -1320,6 +1577,13 @@ def main():
             runner = run_child_relay
             print(f"\n▶ Resuming: {title[:60]}")
             print("  (press Ctrl+Z, Ctrl-D, or /quit to come back here)\n")
+
+        # Snap the board back to this chat's own project when we return (Ctrl+Z,
+        # /quit, exit) instead of whatever project was selected before. Use the
+        # chat's EFFECTIVE project (its per-chat tag if any, else its folder) so a
+        # chat moved into a virtual project like HW snaps back to HW — not the cwd
+        # it physically lives in.
+        last_project = app.tags.get(c["id"]) or run_cwd
 
         try:
             runner(cmd, run_cwd)
