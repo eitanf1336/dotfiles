@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Google Chrome (restore session)
+Comment=Relaunch Chrome on login and reopen the previous windows/tabs
+Exec=/usr/bin/google-chrome-stable --restore-last-session
+Icon=google-chrome
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=3

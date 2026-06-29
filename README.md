@@ -52,6 +52,13 @@ In `bin/` (installed to `~/.local/bin`):
 
 `systemd/` — `rotate-bg.timer` + `rotate-bg.service` advance the wallpaper/terminal theme automatically every day at midnight.
 
+## 🚀 Autostart
+
+`autostart/` — XDG autostart entries dropped into `~/.config/autostart/` (honored by GNOME on Wayland, where the session manager no longer relaunches apps after logout).
+
+### `google-chrome.desktop`
+Relaunches Chrome on login with `--restore-last-session`, so the previous windows/tabs come back after a logout or reboot and the "didn't shut down correctly" bubble is suppressed. (Chrome must also have *On startup → Continue where you left off* set.)
+
 ## ⌨️ Keybindings
 
 `keybindings/custom-keybindings.md` documents all custom GNOME shortcuts (theme rotation, Ask Claude popup, brightness/night-light, clean mode). `keybindings/restore-keybindings.sh` recreates them via `gsettings`.
@@ -64,4 +71,4 @@ In `bin/` (installed to `~/.local/bin`):
 ./install.sh
 ```
 
-This symlinks `bin/` scripts into `~/.local/bin`, the `python/` tools, the GNOME extensions into `~/.local/share/gnome-shell/extensions`, compiles their GSettings schemas, installs the systemd timer, and restores the keybindings. Re-run anytime; it's idempotent. Log out / back in (or restart GNOME Shell) to load the extensions.
+This symlinks `bin/` scripts into `~/.local/bin`, the `python/` tools, the GNOME extensions into `~/.local/share/gnome-shell/extensions`, compiles their GSettings schemas, installs the systemd timer, links the autostart entries, and restores the keybindings. Re-run anytime; it's idempotent. Log out / back in (or restart GNOME Shell) to load the extensions.

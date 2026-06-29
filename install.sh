@@ -6,7 +6,8 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$HOME/.local/bin"
 EXT="$HOME/.local/share/gnome-shell/extensions"
 SYSD="$HOME/.config/systemd/user"
-mkdir -p "$BIN" "$EXT" "$SYSD"
+AUTOSTART="$HOME/.config/autostart"
+mkdir -p "$BIN" "$EXT" "$SYSD" "$AUTOSTART"
 
 echo "==> bin/ scripts -> $BIN"
 for f in "$REPO"/bin/*; do
@@ -36,6 +37,11 @@ echo "==> systemd user timer"
 cp "$REPO"/systemd/rotate-bg.{service,timer} "$SYSD/"
 systemctl --user daemon-reload 2>/dev/null || true
 systemctl --user enable --now rotate-bg.timer 2>/dev/null || true
+
+echo "==> autostart entries -> $AUTOSTART"
+for f in "$REPO"/autostart/*.desktop; do
+    ln -sf "$f" "$AUTOSTART/$(basename "$f")"
+done
 
 echo "==> keybindings"
 bash "$REPO/keybindings/restore-keybindings.sh" || true
