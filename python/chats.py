@@ -19,7 +19,7 @@ Keys:
   m            move the selected chat to a project (independent of its folder)
   f            fork a copy of the selected chat
   x            stop the selected live agent
-  1..5         file the selected chat into a category. A freshly-filed chat
+  1..6         file the selected chat into a category. A freshly-filed chat
                sorts to the TOP of its category, so an accidental move stays in
                plain sight instead of sinking into a big pile.
   u            undo the last category move (revert the chat to where it was)
@@ -96,6 +96,33 @@ def _clamp(s, cols):
         used += w
     return "".join(out)
 
+
+def _wrap(s, cols):
+    """Split s into segments each <= `cols` display columns, breaking at spaces
+    when possible so the full string can be shown across several lines."""
+    if cols <= 0:
+        return [s]
+    out, cur = [], ""
+    for word in s.split(" "):
+        cand = (cur + " " + word) if cur else word
+        if _dwidth(cand) <= cols:
+            cur = cand
+            continue
+        if cur:
+            out.append(cur)
+            cur = ""
+        # A single word wider than the line is hard-split by display width.
+        while _dwidth(word) > cols:
+            head = _clamp(word, cols)
+            if not head:
+                break
+            out.append(head)
+            word = word[len(head):]
+        cur = word
+    if cur or not out:
+        out.append(cur)
+    return out
+
 locale.setlocale(locale.LC_ALL, "")
 
 HOME = Path.home()
@@ -103,10 +130,11 @@ PROJECTS_DIR = HOME / ".claude" / "projects"
 STORE = HOME / ".claude" / "chats" / "categories.json"
 
 # Category order shown on the board. "Uncategorized" is the landing bucket for
-# any chat you haven't filed yet; the 5 real categories map to number keys 1-5.
+# any chat you haven't filed yet; the 6 real categories map to number keys 1-6.
 UNCATEGORIZED = "Uncategorized"
 CATEGORIES = [
     "In Progress",
+    "To Test",
     "Later",
     "Failed",
     "Done — Not Committed",
@@ -118,6 +146,7 @@ DISPLAY_ORDER = [UNCATEGORIZED] + CATEGORIES
 CAT_COLOR = {
     UNCATEGORIZED: 1,
     "In Progress": 9,  # blue
+    "To Test": 2,      # yellow
     "Later": 3,
     "Failed": 4,
     "Done — Not Committed": 5,
@@ -1008,7 +1037,7 @@ class App:
 
     def _undo_move(self):
         """Revert the most recent category move — both the category and the
-        recency stamp — so a stray 1-5 keypress is a one-key fix."""
+        recency stamp — so a stray 1-6 keypress is a one-key fix."""
         if not self._last_move:
             self.message = "Nothing to undo"
             return
@@ -1100,7 +1129,7 @@ class App:
             cat = self.selected_header(nav)
             if cat:
                 self.toggle_collapse(cat)
-        elif ch in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5")):
+        elif ch in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5"), ord("6")):
             c = self.selected_chat(nav)
             if c:
                 cat = CATEGORIES[ch - ord("1")]
@@ -1237,16 +1266,31 @@ class App:
             except curses.error:
                 pass
         help1 = ("Enter open   / find   Space fold   n new   r rename   m move   "
-                 "f fork   x stop   1-5 file   u undo   d delete   P projects   "
+                 "f fork   x stop   1-6 file   u undo   d delete   P projects   "
                  "^R reload   q quit")
         self.stdscr.addstr(1, 0, help1[: w - 1], curses.color_pair(8) | curses.A_DIM)
-        legend = "  ".join(f"{i+1}:{CATEGORIES[i]}" for i in range(5))
+        legend = "  ".join(f"{i+1}:{CATEGORIES[i]}" for i in range(6))
         self.stdscr.addstr(2, 0, legend[: w - 1], curses.A_DIM)
         status_legend = "status:  ● running   ◆ needs input   ✓ done   ✗ failed"
         self.stdscr.addstr(3, 0, status_legend[: w - 1], curses.A_DIM)
 
         top = 5
-        view_h = h - top - 1
+        # Footer block: the FULL title of the chat under the cursor, wrapped over
+        # as many lines as it needs (capped) so even a name longer than the
+        # terminal width is fully readable. The list view shrinks to make room,
+        # so the footer never overlaps a chat row. A status message overrides it.
+        FOOTER_MAX = 5
+        footer = []
+        if self.message:
+            footer = [_clamp(self.message, w - 2)]
+        elif nav:
+            kind, payload = rows[nav[self.sel]]
+            if kind == "chat":
+                segs = _wrap(self.display_title(payload), w - 2) or [""]
+                footer = [_bidi(s) for s in segs[:FOOTER_MAX]]
+        footer_h = max(1, len(footer))
+        # +1 for a faint separator rule between the list and the footer.
+        view_h = h - top - footer_h - 1
         sel_row = nav[self.sel] if nav else 0
         if sel_row < self.scroll:
             self.scroll = sel_row
@@ -1303,8 +1347,19 @@ class App:
                                        curses.A_NORMAL)
                     self._draw_indicator(line_y, status, sel=False)
 
-        if self.message:
-            self.stdscr.addstr(h - 1, 0, self.message[: w - 1], curses.A_BOLD)
+        sep_y = h - footer_h - 1
+        try:
+            self.stdscr.addstr(sep_y, 0, "─" * (w - 1), curses.A_DIM)
+        except curses.error:
+            pass
+        attr = curses.A_BOLD if self.message else (curses.color_pair(8)
+                                                   | curses.A_BOLD)
+        base = h - len(footer)
+        for i, fline in enumerate(footer):
+            try:
+                self.stdscr.addstr(base + i, 0, fline, attr)
+            except curses.error:
+                pass
         self.stdscr.refresh()
 
 
