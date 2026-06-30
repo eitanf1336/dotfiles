@@ -6,6 +6,8 @@ These are GNOME `media-keys` custom shortcuts. Restore them with `keybindings/re
 |------|----------|---------|
 | Rotate wallpaper + terminal | `<Control><Shift>s` | `/home/eitan/.local/bin/rotate-bg.sh next` |
 | Ask Claude (popup) | `<Control><Shift>a` | `/home/eitan/.local/bin/claude-ask` |
+| Run one command (red border) | `<Control><Alt>r` | `/home/eitan/bin/run-once-term` |
+| Prompts library (popup) | `<Control><Shift>l` | `/home/eitan/.local/bin/prompts gui` |
 | DLNL Brightness Up | `<Super>equal` | `/home/eitan/.local/bin/brightness up` |
 | DLNL Brightness Up | `<Super>KP_Add` | `/home/eitan/.local/bin/brightness up` |
 | DLNL Brightness Down | `<Super>minus` | `/home/eitan/.local/bin/brightness down` |

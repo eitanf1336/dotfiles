@@ -17,6 +17,12 @@ gsettings set "$k" name 'Ask Claude (popup)'
 gsettings set "$k" binding '<Control><Shift>a'
 gsettings set "$k" command '/home/eitan/.local/bin/claude-ask'
 
+paths+=("/prompts/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/prompts/"
+gsettings set "$k" name 'Prompts library (popup)'
+gsettings set "$k" binding '<Control><Shift>l'
+gsettings set "$k" command '/home/eitan/.local/bin/prompts gui'
+
 paths+=("/dlnl-bright-up/")
 k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/dlnl-bright-up/"
 gsettings set "$k" name 'DLNL Brightness Up'
@@ -70,6 +76,12 @@ k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/set
 gsettings set "$k" name 'DLNL Clean/Capture Mode'
 gsettings set "$k" binding '<Super><Shift>0'
 gsettings set "$k" command '/home/eitan/.local/bin/present toggle'
+
+paths+=("/run-once/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/run-once/"
+gsettings set "$k" name 'Run one command'
+gsettings set "$k" binding '<Control><Alt>r'
+gsettings set "$k" command '/home/eitan/bin/run-once-term'
 
 # register the list of paths
 arr="["

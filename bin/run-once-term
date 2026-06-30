@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# run-once-term — pop a terminal, read ONE command, run it, close when it ends.
+# Bound to Ctrl+Alt+R (GNOME custom keybinding). See ~/.claude memory: launchers-must-detach.
+# Looks like the normal Ptyxis terminal but with a red border (private GTK css).
+
+if [ "$1" = "__inner" ]; then
+    # Running inside the freshly-opened terminal.
+    # Restore the real config dir so the user's command/apps read normal config,
+    # not our border-only override (the red border is already painted by now).
+    export XDG_CONFIG_HOME="$REAL_XDG_CONFIG_HOME"
+    IFS= read -e -r -p $'\033[1;31mRun \342\226\270 \033[0m' cmd || exit 0
+    [ -z "$cmd" ] && exit 0
+    # -i so aliases/functions from ~/.bashrc work (e.g. the `gemini` function),
+    # exactly like a normal interactive terminal. exec ties the window's life to
+    # the command: it closes the instant the command stops running.
+    exec bash -ic "$cmd"
+fi
+
+# --- launch path -----------------------------------------------------------
+real_cfg="${XDG_CONFIG_HOME:-$HOME/.config}"
+override_cfg="$HOME/.config/run-once-term/gtk"
+
+# Open a standalone Ptyxis window, fully detached. XDG_CONFIG_HOME is pointed at
+# our override (red-border gtk.css) only for the Ptyxis process; Ptyxis reads its
+# theme/palette from dconf so it still looks normal. REAL_XDG_CONFIG_HOME is
+# forwarded so the inner shell can restore it before running the user's command.
+setsid -f env \
+    XDG_CONFIG_HOME="$override_cfg" \
+    REAL_XDG_CONFIG_HOME="$real_cfg" \
+    ptyxis --standalone --title "Run a command" -x "$0 __inner" \
+    >/dev/null 2>&1

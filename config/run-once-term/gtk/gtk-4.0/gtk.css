@@ -1,0 +1,13 @@
+/* Red frame for the run-once terminal. Loaded only via this window's
+   private XDG_CONFIG_HOME, so normal Ptyxis windows are unaffected. */
+window,
+window.background {
+  background-color: #e01b24;
+}
+vte-terminal,
+.terminal-screen vte-terminal {
+  margin: 3px;
+}
+headerbar {
+  box-shadow: inset 0 -3px 0 0 #e01b24;
+}
