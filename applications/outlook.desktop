@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Outlook
+Comment=Technion / Office 365 mail
+Exec=/home/eitan/.local/bin/outlook
+Icon=/home/eitan/.local/share/icons/outlook.png
+Terminal=false
+Categories=Network;Email;Office;
+StartupWMClass=Outlook
+StartupNotify=true

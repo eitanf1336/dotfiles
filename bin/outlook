@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Outlook on the Web as a standalone desktop app (Chrome --app mode).
+# Dedicated profile keeps it isolated from your normal Chrome browsing.
+URL="https://outlook.office.com/mail/"
+PROFILE="$HOME/.local/share/outlook-app"
+setsid -f /usr/bin/google-chrome \
+  --app="$URL" \
+  --user-data-dir="$PROFILE" \
+  --class=Outlook \
+  --name=Outlook \
+  >/dev/null 2>&1
