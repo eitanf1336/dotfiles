@@ -1,6 +1,7 @@
 ---
 description: Read my previous reply aloud via the Read-Aloud TTS server (like selecting it + Ctrl+Shift+L)
 allowed-tools: Bash(speak-text:*), Bash(/home/eitan/.local/bin/speak-text:*)
+model: haiku
 ---
 Read your **previous** assistant message aloud through the local Read-Aloud
 text-to-speech server — exactly what selecting that message and pressing
