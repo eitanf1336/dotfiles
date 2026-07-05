@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Speak text aloud via the Read-Aloud TTS server (the same one bound to Ctrl+Shift+L),
+# but take the text from stdin / an argument instead of the on-screen selection.
+#
+#   speak-text "some text"          # speak the argument
+#   echo "some text" | speak-text   # speak stdin
+#   speak-text --no-popup < file    # queue without opening the player window
+#
+# Used by the Claude Code /speak slash command to read the last reply aloud.
+set -uo pipefail
+
+APP="/home/eitan/code/Technion/Research/read-aloud"
+
+NO_POPUP=0
+if [ "${1:-}" = "--no-popup" ]; then NO_POPUP=1; shift; fi
+
+# --- environment (a hotkey/agent launch may hand us a stripped env) ---------
+UID_N="$(id -u)"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${UID_N}}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+export DISPLAY="${DISPLAY:-:0}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+
+PORT="${READ_ALOUD_PORT:-8765}"
+BASE="http://127.0.0.1:${PORT}"
+PY="$(command -v python3)"
+CHROME="${READ_ALOUD_BROWSER:-$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || true)}"
+
+note(){ command -v notify-send >/dev/null 2>&1 && notify-send -t 2500 "Read Aloud" "$1"; }
+nonblank(){ [ -n "${1//[[:space:]]/}" ]; }
+
+# --- gather the text: argument wins, else stdin ----------------------------
+if [ "$#" -gt 0 ]; then
+  TEXT="$*"
+else
+  TEXT="$(cat)"
+fi
+
+if ! nonblank "$TEXT"; then
+  note "Nothing to read (no text given)."
+  echo "speak-text: no text on argument or stdin" >&2
+  exit 1
+fi
+
+# --- ensure the TTS server is up -------------------------------------------
+if ! curl -sf "${BASE}/health" >/dev/null 2>&1; then
+  nohup "$PY" "${APP}/server.py" >"${APP}/server.log" 2>&1 &
+  for _ in $(seq 1 60); do curl -sf "${BASE}/health" >/dev/null 2>&1 && break; sleep 0.1; done
+fi
+
+# --- send it to the server -------------------------------------------------
+RESP="$(printf '%s' "$TEXT" | curl -sf -X POST --data-binary @- \
+        -H 'Content-Type: text/plain; charset=utf-8' "${BASE}/speak" || true)"
+if printf '%s' "$RESP" | grep -q '"error"'; then
+  note "Nothing speakable in that text."
+  echo "speak-text: server said: $RESP" >&2
+  exit 1
+fi
+
+SNIP="$(printf '%s' "$TEXT" | tr '\n' ' ' | cut -c1-60)"
+note "▶ ${SNIP}…"
+
+# --- open the player popup only if nothing is already connected ------------
+if [ "$NO_POPUP" = 0 ]; then
+  ACTIVE="$(curl -sf "${BASE}/client-active" 2>/dev/null || echo '{}')"
+  if ! printf '%s' "$ACTIVE" | grep -q '"active":[[:space:]]*true'; then
+    if [ -n "$CHROME" ]; then
+      nohup "$CHROME" --app="${BASE}/" --user-data-dir="${APP}/.chrome" --class=ReadAloud \
+        --no-first-run --no-default-browser-check --disable-gpu \
+        --autoplay-policy=no-user-gesture-required --window-size=560,700 >/dev/null 2>&1 &
+    else
+      nohup xdg-open "${BASE}/" >/dev/null 2>&1 &
+    fi
+  fi
+fi
+
+echo "speak-text: queued (${#TEXT} chars): $RESP"
