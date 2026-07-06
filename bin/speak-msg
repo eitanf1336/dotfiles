@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Speak one of Claude's recent replies aloud via the Read-Aloud TTS server.
+
+Picks which reply from the current Claude Code session transcript:
+
+    speak-msg            # 0 -> most recent substantive reply (same as /speak)
+    speak-msg 0          # same as above
+    speak-msg -1         # one reply further back
+    speak-msg -2         # two replies back ... and so on
+    speak-msg -1 --print # print the chosen reply instead of speaking it
+
+It locates the transcript via $CLAUDE_CODE_SESSION_ID, extracts assistant
+messages (text only -- no thinking, tool calls, or /speak confirmations),
+selects the Nth from the end, and pipes it to `speak-text`.
+"""
+import os, re, sys, glob, json, subprocess
+
+PROJECTS = os.path.expanduser("~/.claude/projects")
+CONFIRM = re.compile(r"reading .*aloud", re.IGNORECASE)
+
+
+def die(msg, code=1):
+    sys.stderr.write("speak-msg: " + msg + "\n")
+    try:
+        subprocess.run(["notify-send", "-t", "2500", "Read Aloud", msg],
+                       check=False)
+    except Exception:
+        pass
+    sys.exit(code)
+
+
+def find_transcript():
+    # 1) explicit override
+    tp = os.environ.get("CLAUDE_TRANSCRIPT_PATH")
+    if tp and os.path.isfile(tp):
+        return tp
+    # 2) by session id (robust against cwd drift)
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if sid:
+        hits = glob.glob(os.path.join(PROJECTS, "*", sid + ".jsonl"))
+        if hits:
+            return hits[0]
+    # 3) newest transcript under the munged cwd
+    munged = re.sub(r"[^A-Za-z0-9]", "-", os.getcwd())
+    cands = glob.glob(os.path.join(PROJECTS, munged, "*.jsonl"))
+    # 4) newest transcript anywhere
+    if not cands:
+        cands = glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
+    if not cands:
+        die("could not find a session transcript")
+    return max(cands, key=os.path.getmtime)
+
+
+def assistant_texts(path):
+    out = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if o.get("type") != "assistant":
+                continue
+            parts = [c.get("text", "") for c in o.get("message", {}).get("content", [])
+                     if isinstance(c, dict) and c.get("type") == "text"]
+            text = "\n".join(p for p in parts if p).strip()
+            if not text:
+                continue                       # tool-only / thinking-only turn
+            if text.startswith("\U0001F50A"):  # 🔊 confirmation line
+                continue
+            if len(text) < 80 and CONFIRM.search(text):
+                continue                       # "Reading ... aloud." confirmation
+            out.append(text)
+    return out
+
+
+def main():
+    arg = "0"
+    do_print = False
+    for a in sys.argv[1:]:
+        if a in ("-p", "--print"):
+            do_print = True
+        else:
+            arg = a
+    arg = arg.strip() or "0"
+    try:
+        n = abs(int(arg))
+    except ValueError:
+        die("bad message index %r (use 0, -1, -2, ...)" % arg)
+
+    msgs = assistant_texts(find_transcript())
+    if not msgs:
+        die("no speakable assistant messages found in the transcript")
+    if n >= len(msgs):
+        die("only %d repl%s available; can't go %d back"
+            % (len(msgs), "y" if len(msgs) == 1 else "ies", n))
+    text = msgs[-1 - n]
+
+    if do_print:
+        sys.stdout.write(text + "\n")
+        return
+    speaker = "speak-text"
+    if not any(os.access(os.path.join(p, "speak-text"), os.X_OK)
+               for p in os.environ.get("PATH", "").split(":") if p):
+        speaker = os.path.expanduser("~/.local/bin/speak-text")
+    subprocess.run([speaker], input=text.encode("utf-8"), check=False)
+
+
+if __name__ == "__main__":
+    main()

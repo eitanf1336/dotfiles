@@ -1,27 +1,23 @@
 ---
-description: Read my previous reply aloud via the Read-Aloud TTS server (like selecting it + Ctrl+Shift+L)
-allowed-tools: Bash(speak-text:*), Bash(/home/eitan/.local/bin/speak-text:*)
+description: Read a past reply aloud via Read-Aloud TTS. /speak (or /speak 0) = last reply; /speak -1 = one back; /speak -2 = two back; etc.
+argument-hint: "[-N]  (0 = last reply, -1 = one back, -2 = two back, ...)"
+allowed-tools: Bash(speak-msg:*), Bash(/home/eitan/.local/bin/speak-msg:*)
 model: haiku
 ---
-Read your **previous** assistant message aloud through the local Read-Aloud
-text-to-speech server — exactly what selecting that message and pressing
-Ctrl+Shift+L would do.
+Read one of my recent replies aloud through the local Read-Aloud text-to-speech
+server — the same one bound to Ctrl+Shift+L — choosing which reply by argument:
 
-Do this now, in one step, with no preamble:
+- no argument or `0` → my most recent substantive reply
+- `-1` → one reply further back, `-2` → two back, and so on
 
-1. Take the full, verbatim prose of your previous reply to me (the last
-   message you showed before this `/speak` command). Include only the visible
-   text you actually displayed — **exclude** any thinking, tool calls, tool
-   output, and this command itself. Do not summarize, translate, or shorten it;
-   send it exactly as written.
-2. Pipe that exact text into the helper via stdin using a heredoc:
+Do this in one step: run exactly the following via the Bash tool, substituting
+the user's argument (use `0` if none was given):
 
-   ```
-   speak-text <<'SPEAK_EOF'
-   <the exact text of your previous reply>
-   SPEAK_EOF
-   ```
+    speak-msg $ARGUMENTS
 
-The helper starts the TTS server if needed and opens the player popup, so the
-text is spoken aloud. After it runs, reply with just a one-line confirmation
-(e.g. "🔊 Reading last reply aloud.") — nothing else.
+`speak-msg` reads the session transcript, picks the right reply (skipping
+thinking, tool output, and speak confirmations), starts the TTS server if
+needed, and opens the player popup so it is spoken aloud. It handles
+everything — do NOT reproduce, retype, or summarize the message yourself.
+After it runs, reply with only a one-line confirmation (e.g. "🔊 Reading last
+reply aloud." / "🔊 Reading 2 replies back aloud.") — nothing else.
