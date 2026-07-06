@@ -51,8 +51,38 @@ def find_transcript():
     return max(cands, key=os.path.getmtime)
 
 
-def assistant_texts(path):
-    out = []
+def is_real_user(o):
+    """True for an actual user message, not a tool_result delivery."""
+    content = o.get("message", {}).get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(isinstance(c, dict) and c.get("type") == "text"
+                   and c.get("text", "").strip() for c in content)
+    return False
+
+
+def assistant_turns(path):
+    """One entry per assistant *turn* (reply), oldest first.
+
+    A turn is all the assistant text between two real user messages, joined --
+    so a reply split into several text blocks by interleaved tool calls counts
+    as ONE message, not several. Tool calls, thinking, and 🔊 speak
+    confirmations are dropped.
+    """
+    turns, cur = [], []
+
+    def flush():
+        text = "\n\n".join(cur).strip()
+        cur.clear()
+        if not text:
+            return
+        if text.startswith("\U0001F50A"):         # 🔊 confirmation-only turn
+            return
+        if len(text) < 80 and CONFIRM.search(text):
+            return
+        turns.append(text)
+
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -62,19 +92,18 @@ def assistant_texts(path):
                 o = json.loads(line)
             except ValueError:
                 continue
-            if o.get("type") != "assistant":
-                continue
-            parts = [c.get("text", "") for c in o.get("message", {}).get("content", [])
-                     if isinstance(c, dict) and c.get("type") == "text"]
-            text = "\n".join(p for p in parts if p).strip()
-            if not text:
-                continue                       # tool-only / thinking-only turn
-            if text.startswith("\U0001F50A"):  # 🔊 confirmation line
-                continue
-            if len(text) < 80 and CONFIRM.search(text):
-                continue                       # "Reading ... aloud." confirmation
-            out.append(text)
-    return out
+            t = o.get("type")
+            if t == "user":
+                if is_real_user(o):               # real user msg closes a turn
+                    flush()
+            elif t == "assistant":
+                for c in o.get("message", {}).get("content", []):
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        tx = c.get("text", "").strip()
+                        if tx:
+                            cur.append(tx)
+    flush()
+    return turns
 
 
 def main():
@@ -91,7 +120,7 @@ def main():
     except ValueError:
         die("bad message index %r (use 0, -1, -2, ...)" % arg)
 
-    msgs = assistant_texts(find_transcript())
+    msgs = assistant_turns(find_transcript())
     if not msgs:
         die("no speakable assistant messages found in the transcript")
     if n >= len(msgs):
