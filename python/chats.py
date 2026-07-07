@@ -739,6 +739,79 @@ class App:
             return key
         return self.project_cwds.get(key)
 
+    # --- per-project default permission mode -------------------------------
+    # Claude Code reads the starting permission mode of a new chat from
+    # <project>/.claude/settings.local.json -> permissions.defaultMode. These
+    # helpers let the projects panel show and change it per project.
+    def project_settings_path(self, key):
+        """Path to the project's .claude/settings.local.json, or None when the
+        project has no known folder on disk (a virtual project without a cwd)."""
+        d = self.project_cwd(key)
+        if not d or not os.path.isdir(d):
+            return None
+        return Path(d) / ".claude" / "settings.local.json"
+
+    def read_default_mode(self, key):
+        p = self.project_settings_path(key)
+        if not p:
+            return None
+        perms = _load_json(p).get("permissions")
+        return perms.get("defaultMode") if isinstance(perms, dict) else None
+
+    def set_default_mode(self, key, mode):
+        """Set (or, when mode is None, clear) permissions.defaultMode in the
+        project's settings.local.json, preserving every other key. Returns
+        False if the project has no folder to write into."""
+        p = self.project_settings_path(key)
+        if not p:
+            return False
+
+        def fn(d):
+            perms = d.get("permissions")
+            if not isinstance(perms, dict):
+                perms = {}
+                d["permissions"] = perms
+            if mode is None:
+                perms.pop("defaultMode", None)
+            else:
+                perms["defaultMode"] = mode
+        _json_update(p, fn)
+        return True
+
+    def choose_default_mode(self, key):
+        """Bottom-line picker to set a project's starting permission mode.
+        Enter defaults to acceptEdits — the sane everyday choice."""
+        if self.project_settings_path(key) is None:
+            self.message = "No folder on disk for this project — can't set a mode"
+            return
+        cur = self.read_default_mode(key) or "unset"
+        h, w = self.stdscr.getmaxyx()
+        prompt = (f"Mode for “{self.project_name(key)}” (now: {cur}):  "
+                  "1 default  2 acceptEdits  3 plan  4 bypass  0 clear   "
+                  "[Enter=acceptEdits, Esc cancel]")
+        self.stdscr.addstr(h - 1, 0, _clamp(prompt, w - 1),
+                           curses.color_pair(4) | curses.A_BOLD)
+        self.stdscr.clrtoeol()
+        self.stdscr.refresh()
+        k = self._blocking_getch()
+        if k in (27, ord("q")):
+            self.message = "Mode unchanged"
+            return
+        if k in (ord("0"), ord("c"), ord("C")):
+            self.set_default_mode(key, None)
+            self.message = f"Cleared default mode for “{self.project_name(key)}”"
+            return
+        modes = {ord("1"): "default", ord("2"): "acceptEdits",
+                 ord("3"): "plan", ord("4"): "bypassPermissions",
+                 10: "acceptEdits", 13: "acceptEdits",
+                 curses.KEY_ENTER: "acceptEdits"}
+        mode = modes.get(k)
+        if not mode:
+            self.message = "Mode unchanged"
+            return
+        self.set_default_mode(key, mode)
+        self.message = f"Default mode → {mode} for “{self.project_name(key)}”"
+
     def project_list(self):
         """[(None, 'All'), (key, name), ...] — union of explicitly-added projects
         and the effective project of every chat (its tag override, or else its
@@ -782,7 +855,7 @@ class App:
         h, w = self.stdscr.getmaxyx()
         self.stdscr.addstr(0, 0, " Projects "[: w - 1], curses.A_BOLD)
         help_ = ("↑/↓ move   Enter switch-to   n new folder   r rename   "
-                 "d remove   Esc/q/p back")
+                 "m mode   d remove   Esc/q/p back")
         self.stdscr.addstr(1, 0, help_[: w - 1], curses.color_pair(8) | curses.A_DIM)
         top = 3
         view_h = max(1, h - top - 1)
@@ -803,6 +876,9 @@ class App:
                 else:
                     cw = self.project_cwds.get(path)
                     detail = (f"{cw}   " if cw else "") + f"(tagged · {cnt})"
+                md = self.read_default_mode(path)
+                if md:
+                    detail += f"   ⚙ {md}"
             line = f"{mark}{name:<26.26}  {detail}"
             if is_sel:
                 attr = curses.color_pair(7)
@@ -860,6 +936,12 @@ class App:
                     return
                 elif k in (ord("n"), ord("N")):
                     self._add_project()
+                elif k in (ord("m"), ord("M")):
+                    path = items[sel][0]
+                    if not path:
+                        self.message = "Pick a project first to set its mode"
+                    else:
+                        self.choose_default_mode(path)
                 elif k in (ord("r"), ord("R")):
                     path = items[sel][0]
                     if not path:
@@ -1435,6 +1517,23 @@ def run_child(cmd, cwd=None):
         return  # exited or killed
 
 
+def reset_tty_modes():
+    """Turn off DEC private modes a child (`claude attach` / `--resume`) can
+    leave enabled — focus reporting (?1004) and mouse tracking (?1000/2/3/6)
+    especially, plus bracketed paste (?2004). A chat that bugs out, is killed,
+    or is detached uncleanly exits WITHOUT restoring them; the curses board we
+    draw next then inherits a terminal that spews ^[[I / ^[[O (and mouse codes)
+    on every focus change — the 'random characters typing themselves' bug, which
+    the terminal-tiler's focus flips make constant. Reset them before each board
+    so leaving any chat always lands on a clean terminal."""
+    try:
+        os.write(sys.stdout.fileno(),
+                 b"\033[?1004l\033[?1000l\033[?1002l\033[?1003l"
+                 b"\033[?1006l\033[?2004l\033[?25h")
+    except Exception:
+        pass
+
+
 def run_child_relay(cmd, cwd=None):
     """Like run_child, but for `claude --resume`/`--fork-session` (CLOSED chats).
 
@@ -1575,6 +1674,10 @@ def main():
     # project screen you left — never the chat's own project.
     last_project = _KEEP_PROJECT
     while True:
+        # Every child (attach/resume/fork) can leave the terminal in focus-
+        # reporting / mouse mode; scrub those before drawing the board so we
+        # never inherit a terminal that spews escape codes on focus changes.
+        reset_tty_modes()
         holder = {}
 
         def _run(stdscr):
@@ -1635,6 +1738,23 @@ def main():
         cwd = c["cwd"]
         run_cwd = cwd if (cwd and cwd != "(unknown)" and os.path.isdir(cwd)) else None
         short = short_id(c["id"], app._agents)
+
+        # A live background agent must ALWAYS be attached, never resumed. The
+        # board's live-agent set (self.live_ids) is refreshed on a throttle, so
+        # by the time you hit Enter it can be a couple of seconds stale and miss
+        # an agent that only just came alive. Such an agent would then take the
+        # `claude --resume` path, which runs through the pty relay whose Ctrl+Z
+        # teardown SIGTERMs the child's process group — and THAT is what stops a
+        # running agent (the attach path only ever SIGCONTs, so it can never kill
+        # one). Re-check the authoritative live set here — falling back to the
+        # board's last snapshot if the query fails — and force attach, so a stale
+        # mis-classification can never let Ctrl+Z kill a live agent. (Explicit
+        # fork/stop actions are the user's choice and left untouched.)
+        if action == "resume":
+            live_now = agents_active()
+            if c["id"] in live_now or c["id"] in app.live_ids:
+                action = "attach"
+                short = short_id(c["id"], live_now or app._agents)
 
         # 'stop' just ends a live agent, then returns to the board.
         if action == "stop":
