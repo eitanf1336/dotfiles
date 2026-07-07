@@ -225,6 +225,41 @@ PROJECTS_STORE = HOME / ".claude" / "chats" / "projects.json"
 COLLAPSE_STORE = HOME / ".claude" / "chats" / "collapsed.json"
 PROJECT_TAGS_STORE = HOME / ".claude" / "chats" / "chat_projects.json"
 
+# Diagnostic tracing for the "Ctrl+Z sometimes stops a live agent" report.
+# OFF by default (zero overhead); `touch ~/.claude/chats/ctrlz-debug.on` to
+# enable, then reproduce and read ~/.claude/chats/ctrlz-debug.log. Each chat
+# open/return records the action taken, the child's exit, and — crucially —
+# whether Claude still considers the agent LIVE right before vs right after, so
+# we can tell a real Ctrl+Z stop apart from the daemon's ~5-min idle settle.
+CTRLZ_DEBUG_FLAG = HOME / ".claude" / "chats" / "ctrlz-debug.on"
+CTRLZ_DEBUG_LOG = HOME / ".claude" / "chats" / "ctrlz-debug.log"
+
+
+def _dbg(msg):
+    """Append a timestamped diagnostic line, but only while the debug flag file
+    exists. Best-effort: never let logging disturb the board."""
+    try:
+        if not CTRLZ_DEBUG_FLAG.exists():
+            return
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(CTRLZ_DEBUG_LOG, "a") as f:
+            f.write(f"[{stamp}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _agent_snapshot(full):
+    """(live, status, state) for a session id, from one authoritative query.
+    Used to tell apart a KILL (live -> gone) from an INTERRUPT (still live but
+    busy -> idle, i.e. the running turn was cancelled 'like Ctrl+C')."""
+    try:
+        rec = agents_active().get(full)
+    except Exception:
+        rec = None
+    if rec is None:
+        return (False, None, None)
+    return (True, rec.get("status"), rec.get("state"))
+
 
 def load_project_tags():
     """sessionId -> project key override. Lets a chat live in a project other
@@ -786,12 +821,25 @@ class App:
             return
         cur = self.read_default_mode(key) or "unset"
         h, w = self.stdscr.getmaxyx()
-        prompt = (f"Mode for “{self.project_name(key)}” (now: {cur}):  "
-                  "1 default  2 acceptEdits  3 plan  4 bypass  0 clear   "
-                  "[Enter=acceptEdits, Esc cancel]")
-        self.stdscr.addstr(h - 1, 0, _clamp(prompt, w - 1),
-                           curses.color_pair(4) | curses.A_BOLD)
-        self.stdscr.clrtoeol()
+        # Header (context) + option legend. On a narrow terminal a single
+        # clamped line would drop the legend — the part that says what each key
+        # does — so wrap the whole thing over as many bottom rows as it needs.
+        # Number and label are joined by a non-breaking space (shown as a space)
+        # so a wrap can never split "2" from "acceptEdits".
+        header = f"Set start mode for “{_bidi(self.project_name(key))}” (now: {cur})"
+        legend = "   ".join([
+            "1 default", "2 acceptEdits", "3 plan",
+            "4 bypass", "0 clear", "Enter=acceptEdits", "Esc=cancel",
+        ])
+        block = (_wrap(header, w - 1) + _wrap(legend, w - 1))[-(h - 1):] or [legend]
+        start = max(0, h - len(block))
+        for i, ln in enumerate(block):
+            try:
+                self.stdscr.addstr(start + i, 0, ln[: w - 1],
+                                   curses.color_pair(4) | curses.A_BOLD)
+                self.stdscr.clrtoeol()
+            except curses.error:
+                pass
         self.stdscr.refresh()
         k = self._blocking_getch()
         if k in (27, ord("q")):
@@ -1793,12 +1841,42 @@ def main():
         # from this chat lands back on that SAME project screen — never the
         # chat's own project, which used to throw you onto the wrong screen.
 
+        # Diagnostic trace (no-op unless ctrlz-debug.on exists). Records what we
+        # ran and whether Claude still counts the agent as LIVE right before vs
+        # right after the child returns — the smoking gun for "Ctrl+Z stopped my
+        # agent" (live_before=True, live_after=False) versus the daemon's later
+        # idle settle (both True; it drops to done minutes afterwards instead).
+        dbg_on = CTRLZ_DEBUG_FLAG.exists()
+        t_open = time.time()
+        before = (None, None, None)
+        if dbg_on:
+            try:
+                tty = os.ttyname(sys.stdin.fileno())
+            except Exception:
+                tty = "?"
+            before = _agent_snapshot(c["id"])
+            _dbg(f"OPEN   action={action} short={short} full={c['id'][:8]} "
+                 f"title={title[:40]!r} before(live,status,state)={before} "
+                 f"tty={tty} term={os.environ.get('TERM', '?')} "
+                 f"board_pid={os.getpid()}")
+
         try:
             runner(cmd, run_cwd)
         except FileNotFoundError:
             print("Could not find the `claude` command on PATH.")
             print(f"Run manually:  cd {cwd} && {' '.join(cmd)}")
             input("Press Enter to return to the menu …")
+
+        if dbg_on:
+            after = _agent_snapshot(c["id"])
+            note = ""
+            if before[0] and not after[0]:
+                note = "   <<< AGENT KILLED ON RETURN (live -> gone)"
+            elif before[0] and after[0] and before[1] == "busy" and after[1] != "busy":
+                note = ("   <<< AGENT INTERRUPTED ON RETURN "
+                        "(busy -> idle — the running turn was cancelled, like Ctrl+C)")
+            _dbg(f"RETURN action={action} short={short} full={c['id'][:8]} "
+                 f"after(live,status,state)={after} secs={time.time() - t_open:.0f}{note}")
         # loop returns to the board automatically; flushinp() in run() drops
         # any keys buffered while the sub-process was up so we never auto-loop.
 
