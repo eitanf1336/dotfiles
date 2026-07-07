@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""
+screenshot-claude — take a screenshot via GNOME's native overlay (area/window/
+screen), save it to ~/Pictures/Screenshots, and copy its absolute path to the
+Wayland clipboard (no trailing newline) so it can be pasted straight into the
+Claude Code terminal.
+
+Uses the XDG desktop portal Screenshot API, the only supported path on modern
+GNOME Wayland (the org.gnome.Shell.Screenshot D-Bus API is access-denied to
+external callers since GNOME 42).
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import time
+from urllib.parse import unquote, urlparse
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+DEST = "org.freedesktop.portal.Desktop"
+PATH = "/org/freedesktop/portal/desktop"
+IFACE = "org.freedesktop.portal.Screenshot"
+
+SAVE_DIR = os.path.expanduser("~/Pictures/Screenshots")
+
+
+def notify(summary, body="", icon="camera-photo", urgent=False):
+    args = ["notify-send", "-a", "screenshot-claude", "-i", icon]
+    if urgent:
+        args += ["-u", "critical"]
+    args += [summary, body]
+    try:
+        subprocess.run(args, check=False)
+    except FileNotFoundError:
+        pass
+
+
+def uri_to_path(uri):
+    return unquote(urlparse(uri).path)
+
+
+def main():
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    loop = GLib.MainLoop()
+    result = {"uri": None, "response": None}
+
+    token = "screenshotclaude" + str(int(time.time() * 1000))
+    sender = bus.get_unique_name().lstrip(":").replace(".", "_")
+    request_path = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+
+    def on_response(conn, s, obj, iface, signal, params):
+        response, results = params.unpack()
+        result["response"] = response
+        if response == 0:
+            result["uri"] = results.get("uri")
+        loop.quit()
+
+    bus.signal_subscribe(
+        DEST,
+        "org.freedesktop.portal.Request",
+        "Response",
+        request_path,
+        None,
+        Gio.DBusSignalFlags.NONE,
+        on_response,
+        None,
+    )
+
+    options = {
+        "interactive": GLib.Variant("b", True),
+        "handle_token": GLib.Variant("s", token),
+    }
+    try:
+        bus.call_sync(
+            DEST,
+            PATH,
+            IFACE,
+            "Screenshot",
+            GLib.Variant("(sa{sv})", ("", options)),
+            GLib.VariantType("(o)"),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
+        )
+    except GLib.Error as e:
+        notify("Screenshot failed", str(e), icon="dialog-error", urgent=True)
+        sys.exit(1)
+
+    # Safety timeout so the process can't hang forever.
+    GLib.timeout_add_seconds(120, loop.quit)
+    loop.run()
+
+    if result["response"] == 1:
+        # user cancelled — stay quiet
+        sys.exit(0)
+    if not result["uri"]:
+        notify("Screenshot failed", "No image returned", icon="dialog-error", urgent=True)
+        sys.exit(1)
+
+    src = uri_to_path(result["uri"])
+    if not os.path.isfile(src):
+        notify("Screenshot failed", f"Missing file: {src}", icon="dialog-error", urgent=True)
+        sys.exit(1)
+
+    # Copy into a stable, English-named location so the path never gets swept
+    # out from under Claude by a temp-dir cleanup.
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(SAVE_DIR, f"claude-{stamp}.png")
+    try:
+        shutil.copyfile(src, dest)
+    except OSError:
+        dest = src  # fall back to the portal's own file
+
+    # Copy the absolute path (no trailing newline) to the clipboard.
+    try:
+        subprocess.run(["wl-copy", "--trim-newline", "--", dest], check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        notify("Path not copied", "wl-copy failed", icon="dialog-error", urgent=True)
+        print(dest)
+        sys.exit(1)
+
+    notify("Path copied — paste into Claude", dest, icon=dest)
+    print(dest)
+
+
+if __name__ == "__main__":
+    main()

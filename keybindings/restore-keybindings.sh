@@ -14,7 +14,7 @@ gsettings set "$k" command '/home/eitan/.local/bin/rotate-bg.sh next'
 paths+=("/claude-ask/")
 k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/claude-ask/"
 gsettings set "$k" name 'Ask Claude (popup)'
-gsettings set "$k" binding '<Control><Shift>a'
+gsettings set "$k" binding '<Control><Alt>a'
 gsettings set "$k" command '/home/eitan/.local/bin/claude-ask'
 
 paths+=("/prompts/")
@@ -83,9 +83,42 @@ gsettings set "$k" name 'Run one command'
 gsettings set "$k" binding '<Control><Alt>r'
 gsettings set "$k" command '/home/eitan/bin/run-once-term'
 
+paths+=("/screenshot-claude/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/screenshot-claude/"
+gsettings set "$k" name 'Screenshot → copy path for Claude'
+gsettings set "$k" binding '<Control><Alt>s'
+gsettings set "$k" command '/home/eitan/bin/screenshot-claude'
+
+# Repurpose plain PrtScr: free it from GNOME's built-in screenshot UI and
+# point it at screenshot-claude so Print copies the saved path to the clipboard.
+gsettings set org.gnome.shell.keybindings show-screenshot-ui "[]"
+paths+=("/screenshot-claude-print/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/screenshot-claude-print/"
+gsettings set "$k" name 'Screenshot → copy path for Claude (PrtScr)'
+gsettings set "$k" binding 'Print'
+gsettings set "$k" command '/home/eitan/bin/screenshot-claude'
+
 # register the list of paths
 arr="["
 for p in "${paths[@]}"; do arr="$arr'$p', "; done
 arr="${arr%, }]"
 gsettings set $BASE custom-keybindings "$arr"
 echo "Restored ${#paths[@]} keybindings."
+
+# --- De-conflict the terminal-tiler from Ubuntu's Tiling Assistant ----------
+# The terminal-tiler extension owns <Super>Left / <Super>Right to reorder the
+# focused terminal within its column group. Tiling Assistant ships with the
+# SAME accelerators bound to tile-left-half / tile-right-half, and two grabbers
+# on one key make Mutter fire them nondeterministically — so Super+Left/Right
+# "sometimes" half-tiled the window instead of moving the terminal. Drop the
+# arrows from Tiling Assistant (its keypad variants <Super>KP_4 / <Super>KP_6
+# still half-tile any window), leaving the arrows solely to the tiler. This is
+# the same treatment already applied to tile-maximize / restore-window, which
+# were moved off <Super>Up/Down onto the keypad. Guarded so it is a no-op if
+# Tiling Assistant is not installed.
+TA=org.gnome.shell.extensions.tiling-assistant
+if gsettings list-schemas 2>/dev/null | grep -qx "$TA"; then
+    gsettings set "$TA" tile-left-half  "['<Super>KP_4']"
+    gsettings set "$TA" tile-right-half "['<Super>KP_6']"
+    echo "De-conflicted Tiling Assistant (freed <Super>Left/Right for terminal-tiler)."
+fi

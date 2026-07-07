@@ -5,8 +5,10 @@ These are GNOME `media-keys` custom shortcuts. Restore them with `keybindings/re
 | Name | Shortcut | Command |
 |------|----------|---------|
 | Rotate wallpaper + terminal | `<Control><Shift>s` | `/home/eitan/.local/bin/rotate-bg.sh next` |
-| Ask Claude (popup) | `<Control><Shift>a` | `/home/eitan/.local/bin/claude-ask` |
+| Ask Claude (popup) | `<Control><Alt>a` | `/home/eitan/.local/bin/claude-ask` |
 | Run one command (red border) | `<Control><Alt>r` | `/home/eitan/bin/run-once-term` |
+| Screenshot → copy path for Claude | `<Control><Alt>s` | `/home/eitan/bin/screenshot-claude` |
+| Screenshot → copy path for Claude | `Print` (PrtScr; built-in `show-screenshot-ui` freed) | `/home/eitan/bin/screenshot-claude` |
 | Prompts library (popup) | `<Control><Shift>l` | `/home/eitan/.local/bin/prompts gui` |
 | DLNL Brightness Up | `<Super>equal` | `/home/eitan/.local/bin/brightness up` |
 | DLNL Brightness Up | `<Super>KP_Add` | `/home/eitan/.local/bin/brightness up` |
