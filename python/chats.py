@@ -225,6 +225,17 @@ PROJECTS_STORE = HOME / ".claude" / "chats" / "projects.json"
 COLLAPSE_STORE = HOME / ".claude" / "chats" / "collapsed.json"
 PROJECT_TAGS_STORE = HOME / ".claude" / "chats" / "chat_projects.json"
 
+# old sessionId -> new sessionId for chats that were reopened by resuming them
+# into a fresh BACKGROUND agent (so Ctrl+Z detaches instead of killing the work).
+# Backgrounding always mints a new session id, so the old (pre-resume) entry is
+# hidden from the board to avoid showing the continuation as a duplicate.
+SUPERSEDED_STORE = HOME / ".claude" / "chats" / "superseded.json"
+
+
+def load_superseded():
+    return _load_json(SUPERSEDED_STORE)
+
+
 # Diagnostic tracing for the "Ctrl+Z sometimes stops a live agent" report.
 # OFF by default (zero overhead); `touch ~/.claude/chats/ctrlz-debug.on` to
 # enable, then reproduce and read ~/.claude/chats/ctrlz-debug.log. Each chat
@@ -537,6 +548,7 @@ class App:
         self.store = load_store()
         self.names = load_names()  # sessionId -> user's custom name
         self.moved = load_moved()  # sessionId -> ts it was last (re)filed
+        self.superseded = set(load_superseded())  # old ids hidden after bg-resume
         self._last_move = None     # (id, prev_cat, prev_ts) — for `u` undo
         self._search = ""          # last `/` query, so / repeats find the next hit
         self._chat_cache = {}   # path -> parsed chat dict (title/cwd are stable)
@@ -747,8 +759,13 @@ class App:
         for p in list(cache):  # drop files that were deleted on disk
             if p not in seen:
                 del cache[p]
-        self.all_chats = sorted(cache.values(),
-                                key=lambda c: c["mtime"], reverse=True)
+        # Hide chats that were resumed into a fresh background session (their
+        # continuation carries the same name/category), so the old pre-resume
+        # entry doesn't linger next to it as a duplicate.
+        hidden = getattr(self, "superseded", set())
+        self.all_chats = sorted(
+            (c for c in cache.values() if c["id"] not in hidden),
+            key=lambda c: c["mtime"], reverse=True)
         return new_ids
 
     def category_of(self, chat_id):
@@ -1237,6 +1254,7 @@ class App:
                 self.names = load_names()
                 self.moved = load_moved()
                 self.tags = load_project_tags()
+                self.superseded = set(load_superseded())
                 new_ids = self.rescan()
                 if sel_chat:  # keep the cursor on the same chat as rows shift
                     self._reselect_id = sel_chat["id"]
@@ -1536,6 +1554,30 @@ def create_bg_agent(cwd=None, effort=None):
     return mt.group(1) if mt else None
 
 
+def create_bg_resume(full_id, fork=False, cwd=None):
+    """Resume an existing (closed / settled-'done') session AS a background
+    agent and return the new short id (or None). This is what makes Ctrl+Z safe
+    for reopened chats: a foreground `claude --resume` hosts the work in its own
+    process, so the board's Ctrl+Z teardown SIGTERMs it and kills the work — but
+    a background agent runs in Claude's daemon, so attaching + Ctrl+Z merely
+    detaches and it keeps running. NOTE: `claude --bg --resume` always mints a
+    NEW session id (there is no 'background this same id' command), so the
+    continuation is a fresh session seeded with the old conversation; the caller
+    hides the old entry so it doesn't show up twice. `--fork-session` is passed
+    for an explicit fork."""
+    cmd = ["claude", "--bg", "--resume", full_id]
+    if fork:
+        cmd.append("--fork-session")
+    try:
+        out = subprocess.run(cmd, cwd=cwd,
+                             capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+    txt = _ANSI_RE.sub("", out.stdout + out.stderr)
+    mt = re.search(r"backgrounded\W+([0-9a-f]{8})", txt)
+    return mt.group(1) if mt else None
+
+
 def run_child(cmd, cwd=None):
     """Run an interactive child (claude) and wait for it to truly exit. If a
     stray Ctrl+Z ever suspends it (some claude modes re-enable job control), we
@@ -1816,6 +1858,7 @@ def main():
         ensure_trusted(run_cwd)
 
         title = app.display_title(c)
+        run_id = c["id"]  # the session actually run below (bg-resume mints a new one)
         if action == "attach":
             # Direct attach to the LIVE agent. It keeps running; detach with
             # Ctrl+Z (claude attach handles the keystroke itself) to come back.
@@ -1823,18 +1866,55 @@ def main():
             runner = run_child
             print(f"\n▶ Attaching to live agent: {title[:60]}")
             print("  (press Ctrl+Z to detach and come back — the agent KEEPS RUNNING)\n")
-        elif action == "fork":
-            # Closed-chat path: claude runs the terminal in raw mode and ignores
-            # Ctrl+Z, so we relay through a pty and catch it ourselves.
-            cmd = ["claude", "--resume", c["id"], "--fork-session"]
-            runner = run_child_relay
-            print(f"\n▶ Forking a copy of: {title[:60]}")
-            print("  (press Ctrl+Z, Ctrl-D, or /quit to come back here)\n")
-        else:  # resume a closed/finished chat
-            cmd = ["claude", "--resume", c["id"]]
-            runner = run_child_relay
-            print(f"\n▶ Resuming: {title[:60]}")
-            print("  (press Ctrl+Z, Ctrl-D, or /quit to come back here)\n")
+        else:
+            # resume (continue a closed/settled chat) or fork (explicit copy).
+            # A foreground `claude --resume` hosts the work in its own process, so
+            # the board's Ctrl+Z teardown SIGTERMs it and the running turn dies
+            # ("stops like Ctrl+C"). Instead, resume the session AS A BACKGROUND
+            # agent and attach to it — then Ctrl+Z just detaches and it keeps
+            # running, exactly like a live agent or a new (`n`) chat. Downside:
+            # Claude can only background a session under a NEW id, so we copy the
+            # old chat's name/category/project onto the continuation and hide the
+            # old entry (resume) so it doesn't show up twice.
+            fork = (action == "fork")
+            print(f"\n▶ {'Forking' if fork else 'Resuming'} in the background: {title[:55]}")
+            new_short = create_bg_resume(c["id"], fork=fork, cwd=run_cwd)
+            new_full = None
+            if new_short:
+                new_full = next((s for s, r in agents_active().items()
+                                 if r.get("id") == new_short), None)
+            if new_short and new_full:
+                # Carry the old chat's identity onto the continuation: category
+                # and project for both, but the custom NAME only for a resume —
+                # a fork is a deliberate second copy and shouldn't clone the
+                # original's name (that would show two identically-named chats).
+                _json_set(STORE, new_full,
+                          app.store.get(c["id"]) or "In Progress")
+                old_tag = app.tags.get(c["id"])
+                if old_tag:
+                    _json_set(PROJECT_TAGS_STORE, new_full, old_tag)
+                if not fork:
+                    old_name = app.names.get(c["id"])
+                    if old_name:
+                        _json_set(NAMES_STORE, new_full, old_name)
+                    # Continuation replaces the old chat; hide the stale entry.
+                    _json_set(SUPERSEDED_STORE, c["id"], new_full)
+                run_id = new_full
+                last_id = new_full
+                short = new_short
+                cmd = ["claude", "attach", new_short]
+                runner = run_child
+                print("  (press Ctrl+Z to leave it running and come back — "
+                      "the agent KEEPS RUNNING)\n")
+            else:
+                # Couldn't background it — fall back to the old foreground path so
+                # the chat still opens. Here Ctrl+Z ends the current step (there's
+                # no daemon behind a foreground session to keep it running).
+                cmd = ["claude", "--resume", c["id"]] + (
+                    ["--fork-session"] if fork else [])
+                runner = run_child_relay
+                print("  (couldn't background it; opening in the foreground — "
+                      "Ctrl+Z / Ctrl-D / quit to come back)\n")
 
         # NOTE: we intentionally do NOT change last_project here. It already
         # holds the project the board was showing (captured above), so returning
@@ -1854,9 +1934,10 @@ def main():
                 tty = os.ttyname(sys.stdin.fileno())
             except Exception:
                 tty = "?"
-            before = _agent_snapshot(c["id"])
-            _dbg(f"OPEN   action={action} short={short} full={c['id'][:8]} "
-                 f"title={title[:40]!r} before(live,status,state)={before} "
+            before = _agent_snapshot(run_id)
+            _dbg(f"OPEN   action={action} short={short} run_id={run_id[:8]} "
+                 f"orig={c['id'][:8]} title={title[:40]!r} "
+                 f"before(live,status,state)={before} "
                  f"tty={tty} term={os.environ.get('TERM', '?')} "
                  f"board_pid={os.getpid()}")
 
@@ -1868,14 +1949,14 @@ def main():
             input("Press Enter to return to the menu …")
 
         if dbg_on:
-            after = _agent_snapshot(c["id"])
+            after = _agent_snapshot(run_id)
             note = ""
             if before[0] and not after[0]:
                 note = "   <<< AGENT KILLED ON RETURN (live -> gone)"
             elif before[0] and after[0] and before[1] == "busy" and after[1] != "busy":
                 note = ("   <<< AGENT INTERRUPTED ON RETURN "
                         "(busy -> idle — the running turn was cancelled, like Ctrl+C)")
-            _dbg(f"RETURN action={action} short={short} full={c['id'][:8]} "
+            _dbg(f"RETURN action={action} short={short} run_id={run_id[:8]} "
                  f"after(live,status,state)={after} secs={time.time() - t_open:.0f}{note}")
         # loop returns to the board automatically; flushinp() in run() drops
         # any keys buffered while the sub-process was up so we never auto-loop.

@@ -9,9 +9,17 @@ const KEY = 'tile-new-terminal';
 const MIN_KEY = 'minimize-terminal-group';
 const MOVE_LEFT_KEY = 'move-terminal-left';
 const MOVE_RIGHT_KEY = 'move-terminal-right';
+const MAX_KEY = 'maximize-terminal';
+const UNMAX_KEY = 'unmaximize-terminal';
 
 // Grab-op flag that Mutter ORs into the op for unconstrained moves.
 const GRAB_OP_WINDOW_FLAG_UNCONSTRAINED = 1024;
+
+// Frames within this many px of their target slot are treated as already
+// placed, so _tile skips a redundant resize (see _tile). Comfortably above a
+// terminal snapping its frame to whole character cells, well below any real
+// column-width change.
+const SLOT_EPS = 8;
 
 export default class TerminalTilerExtension extends Extension {
     enable() {
@@ -19,10 +27,18 @@ export default class TerminalTilerExtension extends Extension {
 
         // monitorIndex -> ordered array of Meta.Window (one batch per monitor).
         this._batches = new Map();
+        // monitorIndex -> the one Meta.Window currently maximised over its
+        // batch (fills the work area, peers hidden behind it). Absent unless
+        // that monitor's group is in the temporary maximised state.
+        this._maxed = new Map();
         // monitors waiting for a freshly-spawned terminal window to appear.
         this._pending = [];
         // Re-entrancy guard while we propagate minimize/restore across a batch.
         this._syncing = false;
+        // Window currently being moved/resized by the user (between grab-op
+        // begin and end) — its size changes are a deliberate drag, not an
+        // external tiler we should fight, so the size-changed watcher skips it.
+        this._grabWin = null;
 
         Main.wm.addKeybinding(
             KEY,
@@ -58,6 +74,22 @@ export default class TerminalTilerExtension extends Extension {
             () => this._onMove(1)
         );
 
+        // Maximise the focused terminal over its group / restore the division.
+        Main.wm.addKeybinding(
+            MAX_KEY,
+            this._settings,
+            Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
+            Shell.ActionMode.NORMAL,
+            this._onMaximize.bind(this)
+        );
+        Main.wm.addKeybinding(
+            UNMAX_KEY,
+            this._settings,
+            Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
+            Shell.ActionMode.NORMAL,
+            this._onUnmaximize.bind(this)
+        );
+
         // A new window appeared — claim it if we asked for a terminal.
         global.display.connectObject(
             'window-created',
@@ -68,8 +100,12 @@ export default class TerminalTilerExtension extends Extension {
         // The user finished dragging/resizing a window with the mouse or
         // keyboard. If it was one of ours, eject it and re-flow the rest.
         // (Our own programmatic move_resize_frame calls never start a grab op,
-        // so this only ever fires for genuine user actions.)
+        // so this only ever fires for genuine user actions.) We also track the
+        // window under an active grab so the size-changed watcher below leaves
+        // a deliberate drag-resize alone (grab-op-end handles those by ejecting).
         global.display.connectObject(
+            'grab-op-begin',
+            (_disp, win) => { this._grabWin = win; },
             'grab-op-end',
             (_disp, win) => this._onGrabOpEnd(win),
             this
@@ -108,6 +144,8 @@ export default class TerminalTilerExtension extends Extension {
         Main.wm.removeKeybinding(MIN_KEY);
         Main.wm.removeKeybinding(MOVE_LEFT_KEY);
         Main.wm.removeKeybinding(MOVE_RIGHT_KEY);
+        Main.wm.removeKeybinding(MAX_KEY);
+        Main.wm.removeKeybinding(UNMAX_KEY);
         global.display.disconnectObject(this);
         global.window_manager.disconnectObject(this);
         Main.layoutManager.disconnectObject(this);
@@ -120,6 +158,8 @@ export default class TerminalTilerExtension extends Extension {
         this._batches = null;
         this._pending = null;
         this._settings = null;
+        this._grabWin = null;
+        this._maxed = null;
     }
 
     // ----- core action -------------------------------------------------------
@@ -133,6 +173,7 @@ export default class TerminalTilerExtension extends Extension {
         // A stray terminal is focused and not yet managed → absorb it.
         // (Explicit "add this terminal" gesture wins over summoning.)
         if (this._isTerminal(focus) && this._monitorOf(focus) === null) {
+            this._maxed.delete(monitor);
             this._add(monitor, focus);
             this._tile(monitor);
             return;
@@ -168,9 +209,16 @@ export default class TerminalTilerExtension extends Extension {
             win.raise();
         }
         this._syncing = false;
-        const first = arr.find(w => this._isAlive(w));
-        if (first)
-            first.activate(time);
+        // Re-flow so the group returns in its proper shape: full-screen if it
+        // is still maximised, equal columns/rows otherwise. Then raise the
+        // right window to the top (the maximised one, else the first column).
+        this._tile(monitor);
+        const maxed = this._maxed.get(monitor);
+        const front = (maxed && this._isAlive(maxed))
+            ? maxed
+            : arr.find(w => this._isAlive(w));
+        if (front)
+            front.activate(time);
     }
 
     // A window just gained focus. If it belongs to a batch, bring its peers
@@ -190,6 +238,20 @@ export default class TerminalTilerExtension extends Extension {
         const arr = this._batches.get(monitor);
         if (!arr)
             return;
+        // Maximised: keep the one full-screen terminal on top and leave the
+        // covered peers hidden, rather than raising the whole group (which
+        // would pop the peers out from behind it).
+        const maxed = this._maxed.get(monitor);
+        if (maxed) {
+            if (this._isAlive(maxed)) {
+                this._syncing = true;
+                if (maxed.minimized)
+                    maxed.unminimize();
+                maxed.raise();
+                this._syncing = false;
+            }
+            return;
+        }
         this._syncing = true;
         for (const w of arr) {
             if (w === win || !this._isAlive(w))
@@ -225,6 +287,8 @@ export default class TerminalTilerExtension extends Extension {
             this._raiseGroup(monitor);
             return;
         }
+        // Minimising ends any maximise: the group returns divided next time.
+        this._maxed.delete(monitor);
         this._syncing = true;
         for (const win of arr)
             if (this._isAlive(win) && !win.minimized)
@@ -238,9 +302,31 @@ export default class TerminalTilerExtension extends Extension {
     // the focused window isn't in a batch or is already at the relevant edge.
     _onMove(delta) {
         const focus = global.display.focus_window;
-        const monitor = this._monitorOf(focus);
-        if (monitor === null)
+        let monitor = this._monitorOf(focus);
+        // A managed terminal can fall out of its batch: a stray title-bar drag
+        // ejects it (by design), and Tiling Assistant — kept enabled for every
+        // other app — can snatch a dragged terminal into a half-tile. Once it's
+        // out, reordering silently no-ops, so the key feels like it "stopped
+        // working". Re-absorb a focused terminal back into its monitor's
+        // existing batch so Super+Left/Right springs back to life on the next
+        // press instead of going dead.
+        if (monitor === null && this._isTerminal(focus)) {
+            const m = focus.get_monitor();
+            if (this._batches.has(m)) {
+                this._add(m, focus);
+                this._tile(m);
+                monitor = m;
+            }
+        }
+        if (monitor === null) {
+            // Focus isn't a managed terminal in a batch. Fall back to a plain
+            // left/right half-tile so Super+Left/Right keeps working for every
+            // other window now that the tiler — not Tiling Assistant — owns
+            // these keys (mirrors the maximize/unmaximize fallbacks so no app
+            // loses the shortcut). No batch is touched, so there's no re-flow.
+            this._halfTile(focus, delta);
             return;
+        }
         const arr = this._batches.get(monitor);
         if (!arr)
             return;
@@ -249,6 +335,79 @@ export default class TerminalTilerExtension extends Extension {
         if (i < 0 || j < 0 || j >= arr.length)
             return;
         [arr[i], arr[j]] = [arr[j], arr[i]];
+        // Reordering means the user wants the columns, so drop any maximise.
+        this._maxed.delete(monitor);
+        this._tile(monitor);
+    }
+
+    // Snap a non-managed window to the left (delta<0) or right (delta>0) half
+    // of its monitor's work area — the plain edge-tile Tiling Assistant used to
+    // do on Super+Left/Right, reimplemented here so those keys keep tiling
+    // ordinary windows now that the terminal tiler owns them. The window isn't
+    // in a batch (no size-changed watcher), so this can't start a re-flow loop.
+    _halfTile(win, delta) {
+        if (!win || win.get_window_type() !== Meta.WindowType.NORMAL)
+            return;
+        const ws = global.workspace_manager.get_active_workspace();
+        const wa = ws.get_work_area_for_monitor(win.get_monitor());
+        if (win.maximizedHorizontally || win.maximizedVertically)
+            win.unmaximize(Meta.MaximizeFlags.BOTH);
+        const half = Math.round(wa.width / 2);
+        const x = delta < 0 ? wa.x : wa.x + (wa.width - half);
+        win.move_resize_frame(false, x, wa.y, half, wa.height);
+    }
+
+    // Maximise the focused terminal over the rest of its group: it grows to
+    // fill the monitor's whole work area and covers its peers, so one terminal
+    // is temporarily full-screen without leaving the batch. The peers stay
+    // alive (never minimised) behind it; _unmaximize (or minimising the group)
+    // brings the column division back. Re-absorbs a focused terminal that fell
+    // out of its batch first, mirroring _onMove, so the key keeps working.
+    _onMaximize() {
+        const focus = global.display.focus_window;
+        let monitor = this._monitorOf(focus);
+        if (monitor === null && this._isTerminal(focus)) {
+            const m = focus.get_monitor();
+            if (this._batches.has(m)) {
+                this._add(m, focus);
+                this._tile(m);
+                monitor = m;
+            }
+        }
+        const arr = monitor === null ? null : this._batches.get(monitor);
+        if (!arr || !arr.includes(focus)) {
+            // Not one of our tiled terminals — behave like a plain maximize so
+            // Super+Up still works for every other window (Tiling Assistant no
+            // longer owns it).
+            if (focus && !focus.maximizedHorizontally && !focus.maximizedVertically)
+                focus.maximize(Meta.MaximizeFlags.BOTH);
+            return;
+        }
+        this._maxed.set(monitor, focus);
+        this._tile(monitor);
+    }
+
+    // Undo _onMaximize: forget the maximised window on the focused window's
+    // monitor (or, if a non-batch window is focused, whichever monitor is
+    // currently maximised) and re-flow that batch back into columns/rows.
+    _onUnmaximize() {
+        const focus = global.display.focus_window;
+        let monitor = this._monitorOf(focus);
+        if (monitor === null) {
+            const m = focus
+                ? focus.get_monitor()
+                : global.display.get_current_monitor();
+            if (this._maxed.has(m))
+                monitor = m;
+        }
+        if (monitor === null || !this._maxed.has(monitor)) {
+            // Not a maximised batch — behave like a plain unmaximize so
+            // Super+Down still restores every other window.
+            if (focus && (focus.maximizedHorizontally || focus.maximizedVertically))
+                focus.unmaximize(Meta.MaximizeFlags.BOTH);
+            return;
+        }
+        this._maxed.delete(monitor);
         this._tile(monitor);
     }
 
@@ -266,6 +425,9 @@ export default class TerminalTilerExtension extends Extension {
         const arr = this._batches.get(monitor);
         if (!arr)
             return;
+        // Minimising the group ends any maximise, so it comes back divided.
+        if (minimized)
+            this._maxed.delete(monitor);
         this._syncing = true;
         for (const w of arr) {
             if (w === win || !this._isAlive(w))
@@ -278,9 +440,15 @@ export default class TerminalTilerExtension extends Extension {
             }
         }
         this._syncing = false;
+        // On restore, re-flow so a group that was maximised before it went
+        // away returns to its column division rather than staying full-screen.
+        if (!minimized)
+            this._tile(monitor);
     }
 
     _spawnInto(monitor) {
+        // A new column means we are back to a division, not a maximise.
+        this._maxed.delete(monitor);
         this._pending.push(monitor);
 
         const cmd = this._settings.get_string('terminal-command');
@@ -330,6 +498,7 @@ export default class TerminalTilerExtension extends Extension {
     }
 
     _onGrabOpEnd(win) {
+        this._grabWin = null;
         const monitor = this._monitorOf(win);
         if (monitor === null)
             return;
@@ -350,11 +519,17 @@ export default class TerminalTilerExtension extends Extension {
         if (arr.includes(win))
             return;
         arr.push(win);
-        // Forget the window when it closes, then re-flow its monitor.
-        win.connectObject('unmanaging', () => {
-            this._remove(win, monitor);
-            this._tile(monitor);
-        }, this);
+        // Forget the window when it closes, then re-flow its monitor. Also
+        // watch its size: if another tiler (e.g. the Tiling Assistant
+        // extension's Super+Up / Super+Left bindings) maximises or tiles it out
+        // of its column, snap it straight back.
+        win.connectObject(
+            'unmanaging', () => {
+                this._remove(win, monitor);
+                this._tile(monitor);
+            },
+            'size-changed', () => this._onSizeChanged(win),
+            this);
     }
 
     _remove(win, monitor) {
@@ -365,6 +540,10 @@ export default class TerminalTilerExtension extends Extension {
         if (i >= 0)
             arr.splice(i, 1);
         win.disconnectObject(this);
+        // If the maximised terminal is the one leaving (ejected or closed),
+        // forget the maximise so the rest re-flow into columns.
+        if (this._maxed.get(monitor) === win)
+            this._maxed.delete(monitor);
         if (arr.length === 0)
             this._batches.delete(monitor);
     }
@@ -404,24 +583,119 @@ export default class TerminalTilerExtension extends Extension {
         const n = arr.length;
         const cols = this._settings.get_string('orientation') !== 'rows';
 
+        // Maximised: one terminal fills the whole work area and its peers stay
+        // parked in their old column slots behind it. We only size the
+        // maximised window and raise it over the rest; _slotRect / the per-slot
+        // loop below are skipped entirely until the maximise is cleared.
+        const maxed = this._maxed.get(monitor);
+        if (maxed && this._isAlive(maxed) && arr.includes(maxed)) {
+            const r = maxed.get_frame_rect();
+            const onFull =
+                !maxed.maximizedHorizontally && !maxed.maximizedVertically &&
+                Math.abs(r.x - wa.x) <= SLOT_EPS &&
+                Math.abs(r.y - wa.y) <= SLOT_EPS &&
+                Math.abs(r.width - wa.width) <= SLOT_EPS &&
+                Math.abs(r.height - wa.height) <= SLOT_EPS;
+            if (!onFull) {
+                if (maxed.maximizedHorizontally || maxed.maximizedVertically)
+                    maxed.unmaximize();
+                maxed.move_resize_frame(false, wa.x, wa.y, wa.width, wa.height);
+            }
+            maxed.raise();
+            return;
+        }
+        // Stale/cleared maximise: fall through to the normal column division.
+        if (maxed)
+            this._maxed.delete(monitor);
+
         for (let i = 0; i < n; i++) {
             const win = arr[i];
-            if (win.maximizedHorizontally || win.maximizedVertically)
-                win.unmaximize(Meta.MaximizeFlags.BOTH);
+            const s = this._slotRect(wa, i, n, cols);
 
-            let x, y, w, h;
-            if (cols) {
-                const a = wa.x + Math.round((wa.width * i) / n);
-                const b = wa.x + Math.round((wa.width * (i + 1)) / n);
-                x = a; y = wa.y; w = b - a; h = wa.height;
-            } else {
-                const a = wa.y + Math.round((wa.height * i) / n);
-                const b = wa.y + Math.round((wa.height * (i + 1)) / n);
-                x = wa.x; y = a; w = wa.width; h = b - a;
-            }
+            // Skip windows already on their slot. A redundant move_resize_frame
+            // still emits size-changed, and with Tiling Assistant also poking
+            // these windows (kept on for every other app) plus terminals running
+            // focus-reporting TUIs, those needless events churn the group and
+            // make a terminal spew escape sequences. Only touch a frame that
+            // genuinely needs to move; SLOT_EPS absorbs char-cell rounding.
+            const r = win.get_frame_rect();
+            const onSlot =
+                !win.maximizedHorizontally && !win.maximizedVertically &&
+                Math.abs(r.x - s.x) <= SLOT_EPS &&
+                Math.abs(r.y - s.y) <= SLOT_EPS &&
+                Math.abs(r.width - s.w) <= SLOT_EPS &&
+                Math.abs(r.height - s.h) <= SLOT_EPS;
+            if (onSlot)
+                continue;
+
+            if (win.maximizedHorizontally || win.maximizedVertically)
+                win.unmaximize();
+
             // userOp = false: programmatic, must not be read as a user grab.
-            win.move_resize_frame(false, x, y, w, h);
+            win.move_resize_frame(false, s.x, s.y, s.w, s.h);
         }
+    }
+
+    // Geometry of the i-th of n equal slices of work area `wa` (vertical
+    // columns when `cols`, horizontal rows otherwise). Shared by _tile (to
+    // place windows) and _onSizeChanged (to tell when one has wandered off).
+    _slotRect(wa, i, n, cols) {
+        if (cols) {
+            const a = wa.x + Math.round((wa.width * i) / n);
+            const b = wa.x + Math.round((wa.width * (i + 1)) / n);
+            return {x: a, y: wa.y, w: b - a, h: wa.height};
+        }
+        const a = wa.y + Math.round((wa.height * i) / n);
+        const b = wa.y + Math.round((wa.height * (i + 1)) / n);
+        return {x: wa.x, y: a, w: wa.width, h: b - a};
+    }
+
+    // A managed terminal's size changed. If something other than us maximised
+    // or tiled it off its column slot — typically another extension grabbing
+    // Super+Up / Super+Left while the terminal is focused — pull it back in.
+    // Ignored cases that must NOT trigger a re-flow:
+    //   * a user drag-resize (handled by grab-op-end, which ejects instead);
+    //   * our own move_resize_frame, which lands on-slot and un-maximised, so
+    //     the deviation check below is false and this is a no-op (no loop).
+    // The tolerance absorbs a terminal snapping its frame to whole character
+    // cells; real tiles/maximises deviate by hundreds of pixels.
+    _onSizeChanged(win) {
+        if (this._syncing || win === this._grabWin || !this._isAlive(win))
+            return;
+        const monitor = this._monitorOf(win);
+        if (monitor === null)
+            return;
+        // The maximised terminal is meant to fill the work area — its size
+        // deviating from a column slot is intentional, not a stray tile.
+        if (this._maxed.get(monitor) === win)
+            return;
+        const arr = this._batches.get(monitor);
+        if (!arr)
+            return;
+        const live = arr.filter(w => this._isAlive(w));
+        const i = live.indexOf(win);
+        if (i < 0)
+            return;
+
+        const ws = global.workspace_manager.get_active_workspace();
+        const wa = ws.get_work_area_for_monitor(monitor);
+        const cols = this._settings.get_string('orientation') !== 'rows';
+        const s = this._slotRect(wa, i, live.length, cols);
+        const r = win.get_frame_rect();
+        const TOL = 80;
+        const offSlot =
+            Math.abs(r.x - s.x) > TOL || Math.abs(r.y - s.y) > TOL ||
+            Math.abs(r.width - s.w) > TOL || Math.abs(r.height - s.h) > TOL;
+
+        if (!offSlot && !win.maximizedHorizontally && !win.maximizedVertically)
+            return;
+
+        // Drop any Tiling-Assistant bookkeeping so it stops treating this
+        // terminal as one of its tiles, then re-flow the column.
+        delete win.isTiled;
+        delete win.tiledRect;
+        delete win.untiledRect;
+        this._tile(monitor);
     }
 
     _retileAll() {

@@ -27,6 +27,18 @@
       <description>If the focused window belongs to a monitor's batch, swaps it with the next member (the column to its right, or the row below it) and re-flows the group. Does nothing if it is already last or not in a batch.</description>
     </key>
 
+    <key name="maximize-terminal" type="as">
+      <default><![CDATA[['<Super>Up']]]></default>
+      <summary>Maximise the focused terminal over its group (hide the column division)</summary>
+      <description>Grows the focused terminal to fill the whole monitor work area, covering its column peers, so one terminal is temporarily full-screen without leaving the batch. The peers stay alive behind it; the division comes back via unmaximize-terminal, or whenever the group is minimised.</description>
+    </key>
+
+    <key name="unmaximize-terminal" type="as">
+      <default><![CDATA[['<Super>Down']]]></default>
+      <summary>Restore the focused monitor's terminal batch to its column division</summary>
+      <description>Undoes maximize-terminal: re-flows the batch on the focused window's monitor back into equal columns/rows. Does nothing if the monitor's batch is not currently maximised.</description>
+    </key>
+
     <key name="terminal-command" type="s">
       <default>'terminator'</default>
       <summary>Command used to launch a new terminal</summary>
