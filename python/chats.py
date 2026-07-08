@@ -17,6 +17,10 @@ Keys:
                it keeps running (just like attaching to an existing agent)
   r            rename the selected chat
   m            move the selected chat to a project (independent of its folder)
+  o            set the start permission mode (auto / acceptEdits / plan / …) for
+               the project you're viewing — same picker as 'm' in the P panel,
+               but without opening it. In "All projects" it targets the selected
+               chat's project.
   f            fork a copy of the selected chat
   x            stop the selected live agent
   1..6         file the selected chat into a category. A freshly-filed chat
@@ -846,7 +850,7 @@ class App:
         header = f"Set start mode for “{_bidi(self.project_name(key))}” (now: {cur})"
         legend = "   ".join([
             "1 default", "2 acceptEdits", "3 plan",
-            "4 bypass", "0 clear", "Enter=acceptEdits", "Esc=cancel",
+            "4 bypass", "5 auto", "0 clear", "Enter=acceptEdits", "Esc=cancel",
         ])
         block = (_wrap(header, w - 1) + _wrap(legend, w - 1))[-(h - 1):] or [legend]
         start = max(0, h - len(block))
@@ -868,6 +872,7 @@ class App:
             return
         modes = {ord("1"): "default", ord("2"): "acceptEdits",
                  ord("3"): "plan", ord("4"): "bypassPermissions",
+                 ord("5"): "auto",
                  10: "acceptEdits", 13: "acceptEdits",
                  curses.KEY_ENTER: "acceptEdits"}
         mode = modes.get(k)
@@ -920,7 +925,7 @@ class App:
         h, w = self.stdscr.getmaxyx()
         self.stdscr.addstr(0, 0, " Projects "[: w - 1], curses.A_BOLD)
         help_ = ("↑/↓ move   Enter switch-to   n new folder   r rename   "
-                 "m mode   d remove   Esc/q/p back")
+                 "o mode   d remove   Esc/q/p back")
         self.stdscr.addstr(1, 0, help_[: w - 1], curses.color_pair(8) | curses.A_DIM)
         top = 3
         view_h = max(1, h - top - 1)
@@ -1001,7 +1006,7 @@ class App:
                     return
                 elif k in (ord("n"), ord("N")):
                     self._add_project()
-                elif k in (ord("m"), ord("M")):
+                elif k in (ord("o"), ord("O")):
                     path = items[sel][0]
                     if not path:
                         self.message = "Pick a project first to set its mode"
@@ -1320,6 +1325,19 @@ class App:
             c = self.selected_chat(nav)
             if c:
                 self.move_chat(c)
+        elif ch in (ord("o"), ord("O")):
+            # Set the start permission mode for the project you're viewing —
+            # same picker as 'm' in the P panel, but without opening it. When
+            # showing "All projects", fall back to the selected chat's project.
+            key = self.active_project
+            if key is None:
+                c = self.selected_chat(nav)
+                key = project_key_for(c, self.tags) if c else None
+            if not key or key == "(unknown)":
+                self.message = ("No project here to set a mode for — "
+                                "open one (P) or select a chat")
+            else:
+                self.choose_default_mode(key)
         elif ch in (ord("d"),):
             c = self.selected_chat(nav)
             if c:
@@ -1414,8 +1432,8 @@ class App:
             except curses.error:
                 pass
         help1 = ("Enter open   / find   Space fold   n new   r rename   m move   "
-                 "f fork   x stop   1-6 file   u undo   d delete   P projects   "
-                 "^R reload   q quit")
+                 "o mode   f fork   x stop   1-6 file   u undo   d delete   "
+                 "P projects   ^R reload   q quit")
         self.stdscr.addstr(1, 0, help1[: w - 1], curses.color_pair(8) | curses.A_DIM)
         legend = "  ".join(f"{i+1}:{CATEGORIES[i]}" for i in range(6))
         self.stdscr.addstr(2, 0, legend[: w - 1], curses.A_DIM)
