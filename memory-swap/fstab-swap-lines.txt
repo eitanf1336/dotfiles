@@ -1,0 +1,6 @@
+# /etc/fstab swap entries used by this setup.
+# The first is Ubuntu's default installer swapfile; the second is the 8 GB
+# overflow file added by setup.sh. zram is NOT listed here (it is created by
+# systemd-zram-generator, not fstab).
+/swap.img	none	swap	sw	0	0
+/swap2.img none swap sw,pri=10 0 0

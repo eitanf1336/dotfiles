@@ -1,0 +1,3 @@
+# Act when BOTH available RAM and free swap fall below the threshold.
+# SIGTERM at 5%, SIGKILL at 2%. Prefer to kill memory hogs; never the desktop.
+EARLYOOM_ARGS="-r 3600 -m 5,2 -s 5,2 --avoid ^(gnome-shell|gnome-session.*|Xwayland|Xorg|gdm.*|systemd.*|dbus-daemon|pipewire.*|wireplumber|sshd|pkexec|claude)$ --prefer ^(chrome|chromium|ffmpeg|java|codium|code|spotify|QtWebEngineProc)$"
