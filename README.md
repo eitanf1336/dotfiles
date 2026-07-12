@@ -44,6 +44,8 @@ In `bin/` (installed to `~/.local/bin`):
 | `claude-custom` | Launcher for the `claude-c` chats board. |
 | `claude-desktop` | Launches the community Claude Desktop AppImage fully detached from the terminal. |
 | `setup-rclone-gdrive` | One-shot: installs rclone and configures full read/write Google Drive access (remote `gdrive`). Run once, authorize in browser. No secrets stored in the repo — the token lives only in `~/.config/rclone/rclone.conf`. |
+| `git-morning-check` | Scans all git repos under `$HOME` and, via the `git-morning-check` systemd timer, pops a daily 08:00 desktop notification listing repos with uncommitted/unpushed work. Click it (or run `checkgit`) to open a GTK review window with per-repo commit message + Commit&Push / Ignore. |
+| `checkgit` | Opens the `git-morning-check` review window on demand. |
 
 > Note: `rotate-bg.sh` expects wallpapers under `~/Pictures/Wallpapers/{desktop,terminal}/`, which are not included here.
 
@@ -51,7 +53,9 @@ In `bin/` (installed to `~/.local/bin`):
 
 ## ⏱️ systemd (user)
 
-`systemd/` — `rotate-bg.timer` + `rotate-bg.service` advance the wallpaper/terminal theme automatically every day at midnight.
+`systemd/`:
+- `rotate-bg.timer` + `rotate-bg.service` advance the wallpaper/terminal theme automatically every day at midnight.
+- `git-morning-check.timer` + `git-morning-check.service` run the git pending-work check every day at 08:00.
 
 ## 🚀 Autostart
 
