@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# sunrise-alarm: open the Sunrise Alarm config panel (gradual light + music wake-up).
+# Also reachable from the GNOME app grid and via Ctrl+Shift+A.
+# Detaches so the terminal is freed immediately.
+setsid -f python3 /home/eitan/.local/share/sunrise-alarm/app.py "$@" >/dev/null 2>&1

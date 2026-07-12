@@ -98,6 +98,12 @@ gsettings set "$k" name 'Screenshot → copy path for Claude (PrtScr)'
 gsettings set "$k" binding 'Print'
 gsettings set "$k" command '/home/eitan/bin/screenshot-claude'
 
+paths+=("/sunrise-alarm/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/sunrise-alarm/"
+gsettings set "$k" name 'Sunrise Alarm'
+gsettings set "$k" binding '<Control><Shift>a'
+gsettings set "$k" command '/home/eitan/.local/bin/sunrise-alarm'
+
 # register the list of paths
 arr="["
 for p in "${paths[@]}"; do arr="$arr'$p', "; done

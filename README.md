@@ -8,13 +8,16 @@ Everything here is hand-written. The repo doubles as a backup and a one-shot rei
 
 ## 🧩 GNOME Shell extensions
 
-Two extensions written from scratch (`gnome-extensions/`):
+Extensions written from scratch (`gnome-extensions/`):
 
 ### DisplayLink Night Light — `displaylink-nightlight@eitan.local`
 A software warm-tint **and** brightness/dimming overlay for monitors that lack hardware gamma or brightness control (DisplayLink/EVDI, USB docks) — the screens GNOME's built-in Night Light can't reach. Ships its own GSettings schema (`intensity`, `brightness`, `active`) plus a preferences panel. The `brightness`, `nightlight`, and `present` scripts below drive it.
 
 ### Terminal Tiler — `terminal-tiler@eitan.local`
 On-demand vertical tiling for terminals. **Super+Return** spawns a fullscreen terminal on the focused monitor; pressing again adds another and divides that monitor into equal vertical columns. Focusing a stray terminal and pressing the key absorbs it. Manually moving/resizing a tiled window ejects it and re-flows the rest. Per-monitor, Wayland-native.
+
+### Claude Idle Shutdown (`claude-idle-shutdown@eitan.local`)
+Adds two items to the top-right **Power Off** menu: **"Off when Claude's done"** and **"Suspend when Claude's done"**. Each one runs `bin/await-claude-shut` in a terminal, which polls `claude-status` and then powers off (or suspends) once no Claude agent or chat is actively working, after a cancellable countdown that aborts if work starts up again. The two items are driven by one `ACTIONS` array in `extension.js`, so they share the exact same waiter logic.
 
 ---
 
@@ -26,7 +29,7 @@ In `python/`:
 A board/TUI for organizing Claude Code chats into categories (In Progress / Later / Done) with live status. State persists to JSON next to the script. Launched via `bin/claude-custom`.
 
 ### `claude-ask` (GTK3)
-A quick-prompt bar that slides up from the bottom of the screen on **Ctrl+Shift+A**. Streams Claude's answer live; multiple bars re-tile side-by-side. From an answer you can follow up, start fresh, file the chat to the `claude-c` board, or hand the conversation off to a terminal. Accent color tracks the current wallpaper theme. Bound to a global shortcut (see keybindings).
+A quick-prompt bar that slides up from the bottom of the screen on **Ctrl+Alt+A**. Streams Claude's answer live; multiple bars re-tile side-by-side. From an answer you can follow up, start fresh, file the chat to the `claude-c` board, or hand the conversation off to a terminal. Accent color tracks the current wallpaper theme. Bound to a global shortcut (see keybindings).
 
 ---
 
@@ -43,6 +46,8 @@ In `bin/` (installed to `~/.local/bin`):
 | `rotate-bg.sh` | Rotates desktop wallpaper + matching Terminator terminal background through 7 themes; updates live in running terminals via remotinator. |
 | `claude-custom` | Launcher for the `claude-c` chats board. |
 | `claude-desktop` | Launches the community Claude Desktop AppImage fully detached from the terminal. |
+| `await-claude-shut` | Waits until no Claude agent/chat is actively running, then `systemctl <poweroff\|suspend\|reboot\|halt>` after a cancellable grace countdown that re-checks and aborts if Claude starts working again. Backs the "…when Claude's done" power-menu items. |
+| `sunrise-alarm` | Opens the Sunrise Alarm config panel (also on the app grid and **Ctrl+Shift+A**). Detaches via `setsid -f`. |
 | `setup-rclone-gdrive` | One-shot: installs rclone and configures full read/write Google Drive access (remote `gdrive`). Run once, authorize in browser. No secrets stored in the repo — the token lives only in `~/.config/rclone/rclone.conf`. |
 
 > Note: `rotate-bg.sh` expects wallpapers under `~/Pictures/Wallpapers/{desktop,terminal}/`, which are not included here.

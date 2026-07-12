@@ -1,0 +1,7 @@
+{
+  "uuid": "claude-idle-shutdown@eitan.local",
+  "name": "Claude Idle Shutdown",
+  "description": "Adds \"Off when Claude's done\" and \"Suspend when Claude's done\" items to the system Power Off menu (top-right quick settings). Each runs await-claude-shut in a terminal: waits until no Claude agent or chat is actively running, then powers off or suspends, with a cancellable countdown.",
+  "shell-version": ["47", "48", "49", "50"],
+  "session-modes": ["user"]
+}
