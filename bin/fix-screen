@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# fix-screen: clear Wayland display corruption/jitter without a reboot.
+#
+# Momentarily switches to a spare virtual terminal and back, which makes
+# GNOME/mutter drop and re-acquire the GPU and re-initialise every monitor
+# (the same effect as pressing Ctrl+Alt+F3 then Ctrl+Alt+F2 by hand).
+# No root required: it uses logind's Seat.SwitchTo, the same path the
+# Ctrl+Alt+Fn keys use. Bound to a hotkey via GNOME custom keybindings.
+
+seat=seat0
+
+# Find the graphical VT: the seat0 "user"-class session that owns a real tty.
+gvt=""
+for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+  [ "$(loginctl show-session "$s" -p Seat  --value 2>/dev/null)" = "$seat" ] || continue
+  [ "$(loginctl show-session "$s" -p Class --value 2>/dev/null)" = "user" ] || continue
+  vt="$(loginctl show-session "$s" -p VTNr --value 2>/dev/null)"
+  [ -n "$vt" ] && [ "$vt" != "0" ] && { gvt="$vt"; break; }
+done
+gvt="${gvt:-2}"                       # sane fallback if detection fails
+spare=6; [ "$gvt" = "6" ] && spare=5  # bounce through a spare VT
+
+switch() {
+  busctl call org.freedesktop.login1 "/org/freedesktop/login1/seat/$seat" \
+    org.freedesktop.login1.Seat SwitchTo u "$1" >/dev/null 2>&1
+}
+
+switch "$spare"   # leave the desktop briefly
+sleep 1
+switch "$gvt"     # come back -> forces a full modeset, clearing corruption
