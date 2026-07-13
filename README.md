@@ -33,6 +33,14 @@ A quick-prompt bar that slides up from the bottom of the screen on **Ctrl+Alt+A*
 
 ---
 
+## 🌅 Sunrise Alarm
+
+`sunrise-alarm/` is a GTK wake-up alarm (installed to `~/.local/share/sunrise-alarm`, config in `~/.config/sunrise-alarm`). At the set time it ramps the DisplayLink screens from warm to white while a calm Spotify playlist fades up, then at the wake mark switches to a **random song from a chosen playlist** (shuffle + random skip) and holds bright until a key or click dismisses it. `engine.py` runs the sequence, `app.py` is the config UI (also on the app grid and via `bin/sunrise-alarm` / Ctrl+Shift+A), and `schedule.sh` arms/disarms the timers. To keep the panels lit through the whole ramp it sets GNOME's `idle-delay` to 0 for the duration and restores it on dismiss.
+
+> Depends on the DisplayLink Night Light `brightness`/`nightlight` scripts below, a running Spotify with MPRIS, and PipeWire audio. The RTC-wake helper needs `pkexec` (root) and is best-effort on this hardware (see notes in `schedule.sh`).
+
+---
+
 ## 🛠️ Scripts
 
 In `bin/` (installed to `~/.local/bin`):

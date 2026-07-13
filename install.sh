@@ -33,6 +33,13 @@ for d in "$REPO"/gnome-extensions/*/; do
     echo "    installed $name"
 done
 
+echo "==> Sunrise Alarm app -> ~/.local/share/sunrise-alarm"
+APPDIR="$HOME/.local/share/sunrise-alarm"
+mkdir -p "$APPDIR"
+cp "$REPO"/sunrise-alarm/* "$APPDIR"/
+chmod +x "$APPDIR"/*.py "$APPDIR"/*.sh
+echo "    installed sunrise-alarm (config lives in ~/.config/sunrise-alarm)"
+
 echo "==> systemd user timer"
 cp "$REPO"/systemd/rotate-bg.{service,timer} "$SYSD/"
 systemctl --user daemon-reload 2>/dev/null || true
@@ -41,6 +48,13 @@ systemctl --user enable --now rotate-bg.timer 2>/dev/null || true
 echo "==> autostart entries -> $AUTOSTART"
 for f in "$REPO"/autostart/*.desktop; do
     ln -sf "$f" "$AUTOSTART/$(basename "$f")"
+done
+
+echo "==> desktop launchers -> ~/.local/share/applications"
+APPS="$HOME/.local/share/applications"
+mkdir -p "$APPS"
+for f in "$REPO"/applications/*.desktop; do
+    ln -sf "$f" "$APPS/$(basename "$f")"
 done
 
 echo "==> keybindings"
