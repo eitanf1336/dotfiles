@@ -29,6 +29,12 @@ gsettings set "$k" name 'Fix screen (reset displays)'
 gsettings set "$k" binding '<Super>F5'
 gsettings set "$k" command '/home/eitan/bin/fix-screen'
 
+paths+=("/keys-cheatsheet/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/keys-cheatsheet/"
+gsettings set "$k" name 'Keyboard shortcuts overlay'
+gsettings set "$k" binding '<Super>k'
+gsettings set "$k" command '/home/eitan/bin/keys-cheatsheet'
+
 paths+=("/dlnl-bright-up/")
 k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/dlnl-bright-up/"
 gsettings set "$k" name 'DLNL Brightness Up'

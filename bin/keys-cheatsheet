@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+# keys-cheatsheet: a dark, centered overlay that lists all your keyboard
+# shortcuts. It reads your LIVE GNOME custom media-key bindings from gsettings
+# (so it stays in sync automatically) plus a small curated list of shortcuts
+# that come from extensions / the window manager.
+#
+# Dismiss with Esc (or q), or by clicking anywhere on the panel.
+# Run with --selftest to validate parsing without opening a window.
+
+import sys, subprocess, ast
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk
+
+BASE = 'org.gnome.settings-daemon.plugins.media-keys'
+
+# Shortcuts that are NOT GNOME custom media-keys (provided by extensions / WM).
+# Kept short and accurate on purpose.
+EXTRAS = [
+    ('Blackout the screen under the pointer', 'Super+B'),
+    ('Tile terminals into columns',           'Super+Enter'),
+    ('Show this shortcuts overlay',           'Super+K'),
+]
+
+
+def sh(args):
+    return subprocess.check_output(args, text=True).strip()
+
+
+def pretty(binding):
+    b = binding.strip().strip("'").strip('"')
+    if not b:
+        return ''
+    for a, c in [('<Super>', 'Super+'), ('<Control>', 'Ctrl+'), ('<Primary>', 'Ctrl+'),
+                 ('<Shift>', 'Shift+'), ('<Alt>', 'Alt+'),
+                 ('KP_Add', 'Num +'), ('KP_Subtract', 'Num -'),
+                 ('KP_4', 'Num 4'), ('KP_6', 'Num 6'),
+                 ('equal', '='), ('minus', '-'), ('slash', '/'),
+                 ('question', '?'), ('Return', 'Enter'), ('Print', 'PrtScr')]:
+        b = b.replace(a, c)
+    # uppercase a trailing single letter key: "Ctrl+Shift+s" -> "Ctrl+Shift+S"
+    if b and b[-1].islower() and b[-1].isalpha() and (len(b) == 1 or not b[-2].isalnum()):
+        b = b[:-1] + b[-1].upper()
+    return b
+
+
+def load_custom():
+    out = []
+    try:
+        raw = sh(['gsettings', 'get', BASE, 'custom-keybindings']).replace('@as ', '')
+        paths = ast.literal_eval(raw) if raw not in ('[]', '') else []
+    except Exception:
+        paths = []
+    for p in paths:
+        sch = f'{BASE}.custom-keybinding:{p}'
+        try:
+            name = sh(['gsettings', 'get', sch, 'name']).strip().strip("'")
+            key = pretty(sh(['gsettings', 'get', sch, 'binding']))
+        except Exception:
+            continue
+        if name and key:
+            out.append((name, key))
+    # de-dupe identical (name,key) rows (e.g. keypad duplicates)
+    seen, uniq = set(), []
+    for name, key in out:
+        base_name = name
+        if base_name in seen:
+            continue
+        seen.add(base_name)
+        uniq.append((name, key))
+    return uniq
+
+
+CSS = b"""
+window { background-color: rgba(18,20,26,0.97); border-radius: 16px; }
+.title   { font-size: 22px; font-weight: 800; color: #eceff4; }
+.section { font-size: 12px; font-weight: 800; color: #81a1c1; letter-spacing: 1px; }
+.name    { color: #d8dee9; font-size: 14px; }
+.key     { color: #a3be8c; font-family: monospace; font-size: 13px; font-weight: 700; }
+.hint    { color: #6b7280; font-size: 12px; }
+"""
+
+
+class Cheat(Gtk.Window):
+    def __init__(self):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
+        self.set_default_size(760, 580)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        try:
+            self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        except Exception:
+            pass
+
+        screen = self.get_screen()
+        vis = screen.get_rgba_visual()
+        if vis is not None:
+            self.set_visual(vis)
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        for m in ('top', 'bottom'):
+            getattr(outer, f'set_margin_{m}')(24)
+        for m in ('start', 'end'):
+            getattr(outer, f'set_margin_{m}')(30)
+        self.add(outer)
+
+        title = Gtk.Label(label='Keyboard Shortcuts')
+        title.get_style_context().add_class('title')
+        title.set_halign(Gtk.Align.START)
+        outer.pack_start(title, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        outer.pack_start(scroll, True, True, 0)
+
+        cols = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=48)
+        scroll.add(cols)
+        left, right = Gtk.Grid(), Gtk.Grid()
+        for g in (left, right):
+            g.set_row_spacing(9)
+            g.set_column_spacing(24)
+            cols.pack_start(g, True, True, 0)
+
+        def section(grid, r, text):
+            l = Gtk.Label(label=text.upper())
+            l.get_style_context().add_class('section')
+            l.set_halign(Gtk.Align.START)
+            l.set_margin_top(14 if r else 0)
+            grid.attach(l, 0, r, 2, 1)
+            return r + 1
+
+        def row(grid, r, name, key):
+            n = Gtk.Label(label=name)
+            n.get_style_context().add_class('name')
+            n.set_halign(Gtk.Align.START)
+            n.set_xalign(0.0)
+            k = Gtk.Label(label=key)
+            k.get_style_context().add_class('key')
+            k.set_halign(Gtk.Align.END)
+            k.set_xalign(1.0)
+            grid.attach(n, 0, r, 1, 1)
+            grid.attach(k, 1, r, 1, 1)
+            return r + 1
+
+        custom = load_custom()
+        half = (len(custom) + 1) // 2
+        r = section(left, 0, 'My shortcuts')
+        for name, key in custom[:half]:
+            r = row(left, r, name, key)
+        r2 = section(right, 0, 'My shortcuts (more)')
+        for name, key in custom[half:]:
+            r2 = row(right, r2, name, key)
+        r2 = section(right, r2, 'Windows & display')
+        for name, key in EXTRAS:
+            r2 = row(right, r2, name, key)
+
+        hint = Gtk.Label(label='Esc or click to close')
+        hint.get_style_context().add_class('hint')
+        hint.set_halign(Gtk.Align.END)
+        outer.pack_start(hint, False, False, 0)
+
+        self.connect('key-press-event', self._on_key)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.connect('button-press-event', lambda *_: (self.close(), False)[1])
+
+    def _on_key(self, _w, ev):
+        if ev.keyval in (Gdk.KEY_Escape, Gdk.KEY_q):
+            self.close()
+        return False
+
+
+def main():
+    if '--selftest' in sys.argv:
+        data = load_custom()
+        print(f"selftest OK: parsed {len(data)} custom shortcuts + {len(EXTRAS)} extras")
+        return
+    win = Cheat()
+    win.connect('destroy', Gtk.main_quit)
+    win.show_all()
+    win.present()
+    Gtk.main()
+
+
+if __name__ == '__main__':
+    main()
