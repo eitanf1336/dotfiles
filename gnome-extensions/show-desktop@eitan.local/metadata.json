@@ -1,0 +1,7 @@
+{
+  "uuid": "show-desktop@eitan.local",
+  "name": "Show Desktop",
+  "description": "Expose the desktop on demand over D-Bus: minimise every ordinary window on the active workspace (native Wayland windows included) and put them back afterwards. Mutter still advertises _NET_SHOWING_DESKTOP but ignores it, and an XWayland client cannot minimise Wayland windows, so desktop widgets that sit on the wallpaper (the money + surf panels) have no way to be revealed from outside the shell. Used by the `panels` launcher on Ctrl+Shift+M.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "gettext-domain": "show-desktop"
+}

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# panels — show/hide ALL desktop widgets together (money + surf).
+#
+# The widgets live on the wallpaper BELOW every other window, so revealing them
+# means clearing the desktop first. Nothing outside the shell can do that any
+# more: Mutter still advertises _NET_SHOWING_DESKTOP but ignores it, and an
+# XWayland client cannot minimise native Wayland windows. So the Show Desktop
+# extension (show-desktop@eitan.local) does the minimising for us over D-Bus.
+#
+# ONE target state is decided here, from what is actually on screen, and both
+# widgets are driven to it explicitly with --show/--hide. Letting each widget
+# toggle itself is what let them drift apart (money up, surf down).
+#
+# Detaches so the terminal / caller is freed immediately.
+
+PORTFOLIO=/home/eitan/code/portfolio-desktop/portfolio.py
+SURF=/home/eitan/code/surf-desktop/surf.py
+
+desktop() {   # $1 = Show | Restore
+    gdbus call --session --dest org.gnome.Shell \
+        --object-path /org/gnome/Shell/Extensions/ShowDesktop \
+        --method "org.gnome.Shell.Extensions.ShowDesktop.$1" >/dev/null 2>&1
+}
+
+up() {        # $1 = state dir under ~/.local/state — is that widget on screen?
+    local d="$HOME/.local/state/$1" pid
+    pid=$(cat "$d/pid" 2>/dev/null) || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [ "$(cat "$d/visible" 2>/dev/null)" = "1" ]
+}
+
+if up portfolio || up surf; then
+    setsid -f "$PORTFOLIO" --widget --hide >/dev/null 2>&1
+    setsid -f "$SURF" --widget --hide >/dev/null 2>&1
+    desktop Restore                       # give the user their windows back
+else
+    if ! desktop Show; then
+        # The extension only loads when GNOME Shell starts, so it stays missing
+        # until the first log out after installing it. Say so, instead of
+        # silently revealing the panels underneath everything.
+        notify-send -i video-display 'Desktop panels' \
+            'Log out and back in once to finish enabling Show Desktop.' \
+            >/dev/null 2>&1
+    fi
+    setsid -f "$PORTFOLIO" --widget --show >/dev/null 2>&1
+    setsid -f "$SURF" --widget --show >/dev/null 2>&1
+fi
