@@ -35,8 +35,10 @@ done
 
 echo "==> systemd user timer"
 cp "$REPO"/systemd/rotate-bg.{service,timer} "$SYSD/"
+cp "$REPO"/systemd/media-keep-awake.service "$SYSD/"
 systemctl --user daemon-reload 2>/dev/null || true
 systemctl --user enable --now rotate-bg.timer 2>/dev/null || true
+systemctl --user enable --now media-keep-awake.service 2>/dev/null || true
 
 echo "==> autostart entries -> $AUTOSTART"
 for f in "$REPO"/autostart/*.desktop; do

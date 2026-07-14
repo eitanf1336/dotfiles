@@ -1,0 +1,14 @@
+[Unit]
+Description=Keep the screen awake while media is playing (MPRIS idle inhibitor)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/media-keep-awake
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
