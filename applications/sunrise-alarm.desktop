@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Sunrise Alarm
+Comment=Gradual light and music wake-up alarm
+Exec=python3 /home/eitan/.local/share/sunrise-alarm/app.py
+Icon=alarm-symbolic
+Terminal=false
+Categories=Utility;
+StartupWMClass=sunrise-alarm
+Keywords=alarm;wake;sunrise;

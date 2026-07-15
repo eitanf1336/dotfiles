@@ -8,13 +8,16 @@ Everything here is hand-written. The repo doubles as a backup and a one-shot rei
 
 ## 🧩 GNOME Shell extensions
 
-Two extensions written from scratch (`gnome-extensions/`):
+Extensions written from scratch (`gnome-extensions/`):
 
 ### DisplayLink Night Light — `displaylink-nightlight@eitan.local`
 A software warm-tint **and** brightness/dimming overlay for monitors that lack hardware gamma or brightness control (DisplayLink/EVDI, USB docks) — the screens GNOME's built-in Night Light can't reach. Ships its own GSettings schema (`intensity`, `brightness`, `active`) plus a preferences panel. The `brightness`, `nightlight`, and `present` scripts below drive it.
 
 ### Terminal Tiler — `terminal-tiler@eitan.local`
 On-demand vertical tiling for terminals. **Super+Return** spawns a fullscreen terminal on the focused monitor; pressing again adds another and divides that monitor into equal vertical columns. Focusing a stray terminal and pressing the key absorbs it. **Super+Up** maximises the focused terminal over its group (hiding the division); **Super+Down** — or minimising the group — restores the columns. Manually moving/resizing a tiled window ejects it and re-flows the rest. Per-monitor, Wayland-native.
+
+### Claude Idle Shutdown (`claude-idle-shutdown@eitan.local`)
+Adds two items to the top-right **Power Off** menu: **"Off when Claude's done"** and **"Suspend when Claude's done"**. Each one runs `bin/await-claude-shut` in a terminal, which polls `claude-status` and then powers off (or suspends) once no Claude agent or chat is actively working, after a cancellable countdown that aborts if work starts up again. The two items are driven by one `ACTIONS` array in `extension.js`, so they share the exact same waiter logic.
 
 ---
 
@@ -26,7 +29,15 @@ In `python/`:
 A board/TUI for organizing Claude Code chats into categories (In Progress / Later / Done) with live status. State persists to JSON next to the script. Launched via `bin/claude-custom`.
 
 ### `claude-ask` (GTK3)
-A quick-prompt bar that slides up from the bottom of the screen on **Ctrl+Shift+A**. Streams Claude's answer live; multiple bars re-tile side-by-side. From an answer you can follow up, start fresh, file the chat to the `claude-c` board, or hand the conversation off to a terminal. Accent color tracks the current wallpaper theme. Bound to a global shortcut (see keybindings).
+A quick-prompt bar that slides up from the bottom of the screen on **Ctrl+Alt+A**. Streams Claude's answer live; multiple bars re-tile side-by-side. From an answer you can follow up, start fresh, file the chat to the `claude-c` board, or hand the conversation off to a terminal. Accent color tracks the current wallpaper theme. Bound to a global shortcut (see keybindings).
+
+---
+
+## 🌅 Sunrise Alarm
+
+`sunrise-alarm/` is a GTK wake-up alarm (installed to `~/.local/share/sunrise-alarm`, config in `~/.config/sunrise-alarm`). At the set time it ramps the DisplayLink screens from warm to white while a calm Spotify playlist fades up, then at the wake mark switches to a **random song from a chosen playlist** (shuffle + random skip) and holds bright until a key or click dismisses it. `engine.py` runs the sequence, `app.py` is the config UI (also on the app grid and via `bin/sunrise-alarm` / Ctrl+Shift+A), and `schedule.sh` arms/disarms the timers. To keep the panels lit through the whole ramp it sets GNOME's `idle-delay` to 0 for the duration and restores it on dismiss.
+
+> Depends on the DisplayLink Night Light `brightness`/`nightlight` scripts below, a running Spotify with MPRIS, and PipeWire audio. The RTC-wake helper needs `pkexec` (root) and is best-effort on this hardware (see notes in `schedule.sh`).
 
 ---
 
@@ -43,6 +54,8 @@ In `bin/` (installed to `~/.local/bin`):
 | `rotate-bg.sh` | Rotates desktop wallpaper + matching Terminator terminal background through 7 themes; updates live in running terminals via remotinator. |
 | `claude-custom` | Launcher for the `claude-c` chats board. |
 | `claude-desktop` | Launches the community Claude Desktop AppImage fully detached from the terminal. |
+| `await-claude-shut` | Waits until no Claude agent/chat is actively running, then `systemctl <poweroff\|suspend\|reboot\|halt>` after a cancellable grace countdown that re-checks and aborts if Claude starts working again. Backs the "…when Claude's done" power-menu items. |
+| `sunrise-alarm` | Opens the Sunrise Alarm config panel (also on the app grid and **Ctrl+Shift+A**). Detaches via `setsid -f`. |
 | `setup-rclone-gdrive` | One-shot: installs rclone and configures full read/write Google Drive access (remote `gdrive`). Run once, authorize in browser. No secrets stored in the repo — the token lives only in `~/.config/rclone/rclone.conf`. |
 | `git-morning-check` | Scans all git repos under `$HOME` and, via the `git-morning-check` systemd timer, pops a daily 08:00 desktop notification listing repos with uncommitted/unpushed work. Click it (or run `checkgit`) to open a GTK review window with per-repo commit message + Commit&Push / Ignore. |
 | `checkgit` | Opens the `git-morning-check` review window on demand. |
