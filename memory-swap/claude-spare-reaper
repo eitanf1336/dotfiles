@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# claude-spare-reaper: kill Claude Code bg-spare/bg-pty-host pairs whose daemon died.
+#
+# Claude Code leaks these. When a transient `claude daemon run` exits, the spare
+# pairs it pre-warmed are not reaped: they get reparented to systemd --user and
+# squat for 24h+, each holding roughly 230 MB RSS + 250 MB swap. On a 16 GB box
+# that silently eats gigabytes and gets other apps OOM-killed.
+#
+# Safety: ALL of these must hold before anything is killed.
+#   1. exe lives under ~/.local/share/claude/versions/   (it really is Claude)
+#   2. the bg-pty-host is reparented to init/systemd      (its daemon is gone)
+#   3. nothing is running inside it (bg-spare has no children)
+#   4. it is older than MIN_AGE seconds                   (never race a new session)
+# Rule 3 is the one that protects a LIVE session whose daemon happened to die.
+# Rule 2 alone is not enough.
+set -uo pipefail
+
+MIN_AGE=${MIN_AGE:-600}
+UID_N=$(id -u)
+SYSD=$(pgrep -u "$UID_N" -x systemd 2>/dev/null | head -1)
+
+# never touch ourselves or our own ancestors
+declare -A SELF
+p=$$
+while [ "${p:-0}" -gt 1 ] 2>/dev/null; do
+  SELF[$p]=1
+  p=$(awk '/^PPid:/{print $2}' "/proc/$p/status" 2>/dev/null)
+done
+
+victims=()
+rss_k=0
+swap_k=0
+
+for pty in $(pgrep -u "$UID_N" -f 'bg-pty-host' 2>/dev/null); do
+  [ -n "${SELF[$pty]:-}" ] && continue
+  [ -r "/proc/$pty/status" ] || continue
+
+  # 1. is it really Claude?
+  exe=$(readlink -f "/proc/$pty/exe" 2>/dev/null) || continue
+  case "$exe" in *"/claude/versions/"*) ;; *) continue ;; esac
+
+  # 2. is its daemon dead (reparented to init/systemd --user)?
+  ppid=$(awk '/^PPid:/{print $2}' "/proc/$pty/status" 2>/dev/null)
+  [ "$ppid" = "1" ] || [ "$ppid" = "${SYSD:-0}" ] || continue
+
+  # 4. old enough?
+  age=$(ps -o etimes= -p "$pty" 2>/dev/null | tr -d ' ')
+  [ -n "$age" ] || continue
+  [ "$age" -ge "$MIN_AGE" ] || continue
+
+  # 3. idle? (its bg-spare child must have no children of its own)
+  kids=$(pgrep -P "$pty" 2>/dev/null)
+  busy=0
+  for k in $kids; do
+    [ -n "${SELF[$k]:-}" ] && busy=1 && break
+    [ -n "$(pgrep -P "$k" 2>/dev/null)" ] && busy=1 && break
+  done
+  [ "$busy" -eq 1 ] && continue
+
+  for q in $pty $kids; do
+    rss_k=$(( rss_k + $(awk '/^VmRSS:/{print $2}'  "/proc/$q/status" 2>/dev/null || echo 0) ))
+    swap_k=$(( swap_k + $(awk '/^VmSwap:/{print $2}' "/proc/$q/status" 2>/dev/null || echo 0) ))
+    victims+=("$q")
+  done
+done
+
+if [ ${#victims[@]} -eq 0 ]; then
+  echo "no orphaned Claude spares"
+  exit 0
+fi
+
+kill -TERM "${victims[@]}" 2>/dev/null
+sleep 3
+for q in "${victims[@]}"; do
+  kill -0 "$q" 2>/dev/null && kill -KILL "$q" 2>/dev/null
+done
+
+echo "reaped ${#victims[@]} orphaned Claude process(es); freed ~$((rss_k/1024)) MB RSS + ~$((swap_k/1024)) MB swap"

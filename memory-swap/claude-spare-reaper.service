@@ -1,0 +1,6 @@
+[Unit]
+Description=Reap orphaned Claude Code spare processes (daemon died, nothing running inside)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-spare-reaper

@@ -1,0 +1,14 @@
+# Act when BOTH available RAM and free swap fall below the threshold.
+# SIGTERM at 5%, SIGKILL at 2%.
+#
+# NOTE: deliberately NO --prefer. An earlier version of this config used
+#   --prefer ^(chrome|chromium|ffmpeg|java|codium|code|spotify|QtWebEngineProc)$
+#   --avoid  ^(...|claude)$
+# which made Chrome the scapegoat for a Claude Code process leak: Chrome was
+# killed 130 times in a single day while the actual leaker was protected.
+# Without --prefer, earlyoom kills whatever is genuinely the biggest memory hog,
+# which is the correct and honest behaviour.
+#
+# --avoid covers only true desktop essentials, so a memory crunch can never take
+# down the session itself. claude is deliberately NOT protected any more.
+EARLYOOM_ARGS="-r 3600 -m 5,2 -s 5,2 --avoid ^(gnome-shell|gnome-session.*|Xwayland|Xorg|gdm.*|systemd.*|dbus-daemon|pipewire.*|wireplumber|sshd|pkexec)$"
