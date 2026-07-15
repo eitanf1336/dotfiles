@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.blackout-screen"
+          path="/org/gnome/shell/extensions/blackout-screen/">
+    <key name="toggle-blackout" type="as">
+      <default><![CDATA[['<Super>b']]]></default>
+      <summary>Toggle blackout on the current monitor</summary>
+      <description>Covers the monitor under the pointer with an opaque black overlay. Press again while on that monitor to restore it.</description>
+    </key>
+  </schema>
+</schemalist>

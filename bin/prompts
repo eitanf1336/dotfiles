@@ -1,0 +1,1008 @@
+#!/usr/bin/env python3
+"""prompts — a tiny personal prompt library.
+
+Save, search, copy, type and edit reusable prompts. Three front-ends, one store:
+
+  • terminal TUI : `prompts`                 (type to filter, ↑/↓, Enter copies)
+  • GTK popup    : `prompts gui`             (bound to Ctrl+Shift+P; press again to close)
+  • plumbing     : `prompts ls|get|add|new|edit|rm|cp|type|search|path|git`
+
+Every prompt is one markdown file under ~/.claude/prompts/<slug>.md with a small
+frontmatter (title, tags, created, updated). That store is its own private git
+repo, so edits are versioned but never leave the machine. The format is trivial
+for Claude Code to read/write — see the /prompts slash command.
+"""
+import os, sys, re, json, shutil, subprocess, textwrap, time, signal
+from datetime import datetime
+
+DIR = os.path.expanduser(os.environ.get('PROMPTS_DIR', '~/.claude/prompts'))
+EDITOR = os.environ.get('EDITOR') or shutil.which('nano') or shutil.which('vi') or 'vi'
+
+# accent borrowed from the wallpaper-rotation theme (matches claude-ask) -------
+ORDER = ['green', 'blue', 'purple', 'red', 'gold', 'brown', 'wood']
+ACCENTS = {'green': '#4ade80', 'blue': '#60a5fa', 'purple': '#c084fc',
+           'red': '#f87171', 'gold': '#fbbf24', 'brown': '#d2a679',
+           'wood': '#deb887'}
+
+
+def current_accent():
+    try:
+        idx = int(open(os.path.expanduser(
+            '~/.local/state/desktop-rotation/index')).read().strip())
+        return ACCENTS[ORDER[idx % len(ORDER)]]
+    except Exception:
+        return '#c084fc'
+
+
+# --- store -------------------------------------------------------------------
+def ensure_dir():
+    os.makedirs(DIR, exist_ok=True)
+
+
+def now():
+    return datetime.now().isoformat(timespec='seconds')
+
+
+def slugify(s, fallback='prompt'):
+    s = re.sub(r'[^a-z0-9]+', '-', (s or '').lower()).strip('-')
+    return (s or fallback)[:48]
+
+
+def parse_file(path):
+    txt = open(path, encoding='utf-8').read()
+    meta = {'title': '', 'tags': [], 'created': '', 'updated': ''}
+    body = txt
+    if txt.startswith('---'):
+        lines = txt.split('\n')
+        end = next((i for i in range(1, len(lines))
+                    if lines[i].strip() == '---'), None)
+        if end is not None:
+            for line in lines[1:end]:
+                if ':' not in line:
+                    continue
+                k, v = line.split(':', 1)
+                k, v = k.strip().lower(), v.strip()
+                if k == 'tags':
+                    meta['tags'] = [t for t in re.split(r'[,\s]+', v.strip('[]'))
+                                    if t]
+                elif k in meta:
+                    meta[k] = v
+            body = '\n'.join(lines[end + 1:])
+    pid = os.path.splitext(os.path.basename(path))[0]
+    meta.update(id=pid, body=body.strip('\n'), path=path)
+    if not meta['title']:
+        meta['title'] = pid
+    return meta
+
+
+def dump(meta):
+    tags = ', '.join(meta.get('tags', []))
+    return ('---\n'
+            f"title: {meta.get('title', '')}\n"
+            f"tags: {tags}\n"
+            f"created: {meta.get('created') or now()}\n"
+            f"updated: {now()}\n"
+            '---\n' + meta.get('body', '').strip('\n') + '\n')
+
+
+def load_all():
+    ensure_dir()
+    items = [parse_file(os.path.join(DIR, f))
+             for f in os.listdir(DIR) if f.endswith('.md')]
+    items.sort(key=lambda m: m.get('updated', ''), reverse=True)
+    return items
+
+
+def unique_path(slug):
+    p = os.path.join(DIR, slug + '.md')
+    n = 2
+    while os.path.exists(p):
+        p = os.path.join(DIR, f'{slug}-{n}.md')
+        n += 1
+    return p
+
+
+def save_new(title, body, tags=None, created=None):
+    ensure_dir()
+    path = unique_path(slugify(title))
+    meta = {'title': title or 'untitled', 'tags': tags or [],
+            'created': created or now(), 'body': body}
+    open(path, 'w', encoding='utf-8').write(dump(meta))
+    git_commit('add ' + os.path.basename(path))
+    return parse_file(path)
+
+
+def save_over(path, meta):
+    open(path, 'w', encoding='utf-8').write(dump(meta))
+    git_commit('edit ' + os.path.basename(path))
+
+
+class Ambiguous(Exception):
+    def __init__(self, cands):
+        self.cands = cands
+
+
+def resolve(arg):
+    items = load_all()
+    for it in items:
+        if it['id'] == arg:
+            return it
+    pre = [it for it in items if it['id'].startswith(arg)]
+    if len(pre) == 1:
+        return pre[0]
+    al = arg.lower()
+    sub = [it for it in items if al in it['id'].lower() or al in it['title'].lower()]
+    if len(sub) == 1:
+        return sub[0]
+    cands = pre or sub
+    if not cands:
+        return None
+    raise Ambiguous(cands)
+
+
+def search(items, query):
+    q = query.lower().strip()
+    if not q:
+        return items
+    terms = q.split()
+
+    def score(it):
+        hay = (it['title'] + ' ' + ' '.join(it['tags']) + ' ' + it['body']).lower()
+        if not all(t in hay for t in terms):
+            return -1
+        s = 0
+        for t in terms:
+            if t in it['title'].lower():
+                s += 3
+            if any(t in tag.lower() for tag in it['tags']):
+                s += 2
+            if t in it['body'].lower():
+                s += 1
+        return s
+    scored = [(score(it), it) for it in items]
+    scored = [(s, it) for s, it in scored if s >= 0]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [it for _, it in scored]
+
+
+# --- git (private, never pushed automatically) -------------------------------
+def is_git():
+    return os.path.isdir(os.path.join(DIR, '.git'))
+
+
+def git(*args, check=False):
+    return subprocess.run(['git', '-C', DIR, *args],
+                          capture_output=True, text=True, check=check)
+
+
+def git_commit(msg):
+    if not is_git():
+        return
+    git('add', '-A')
+    if git('diff', '--cached', '--quiet').returncode != 0:
+        git('-c', 'user.name=prompts', '-c', 'user.email=prompts@local',
+            'commit', '-m', msg)
+
+
+def git_init():
+    if is_git():
+        return
+    ensure_dir()
+    git('init', '-q')
+    git_commit('init prompt library')
+
+
+# --- clipboard + typing ------------------------------------------------------
+SELF = os.path.realpath(__file__)
+CLIP_HOLD_SECONDS = 600
+
+
+def set_clipboard(text):
+    """Best-effort copy. Prefers wl-copy/xclip/xsel; otherwise spawns a small
+    detached helper that *holds* the X CLIPBOARD selection for a while (the
+    xclip trick) — GNOME's store() is racy and often drops the contents once
+    the setting process exits."""
+    for cmd in (['wl-copy'], ['xclip', '-selection', 'clipboard'],
+                ['xsel', '-ib']):
+        if shutil.which(cmd[0]):
+            try:
+                # Fire-and-forget: feed the text on stdin and do NOT wait. Two
+                # reasons we must not block on this child:
+                #   1) wl-copy/xclip fork a daemon that keeps serving the
+                #      selection, inheriting our stdio — if that's the journal
+                #      pipe from a GNOME keybinding launch, waiting deadlocks.
+                #   2) When called from the GTK popup, GLib's main loop reaps
+                #      SIGCHLD itself, so subprocess.run's waitpid() would hang
+                #      forever — freezing the window. Not waiting sidesteps both.
+                # The pipe buffers the text, so the tool still reads it even if
+                # we return (and exit) immediately. start_new_session detaches
+                # the daemon so it survives us.
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL,
+                                     start_new_session=True)
+                p.stdin.write(text.encode())
+                p.stdin.close()
+                return True
+            except Exception:
+                pass
+    try:  # GTK fallback: detached owner process that serves pastes
+        p = subprocess.Popen([sys.executable, SELF, '__clip-serve'],
+                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        p.stdin.write(text.encode())
+        p.stdin.close()
+        time.sleep(0.2)   # let it grab ownership before we exit
+        return p.poll() is None
+    except Exception:
+        return False
+
+
+def cmd_clip_serve(args):
+    """Hidden: own the clipboard with stdin's text until replaced or timeout.
+    GTK serves the selection only while this process's main loop runs, so we
+    stay alive — that's what makes the copy survive the caller exiting."""
+    text = sys.stdin.read()
+    os.environ.setdefault('GDK_BACKEND', 'x11')
+    import gi
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gtk, Gdk, GLib
+    cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+    cb.set_text(text, -1)
+    cb.store()
+    # After a grace period, quit as soon as someone else takes the clipboard
+    # (so we don't linger). Until armed, ignore our own ownership change.
+    armed = {'v': False}
+    GLib.timeout_add(900, lambda: armed.__setitem__('v', True) or False)
+    cb.connect('owner-change',
+               lambda *_: Gtk.main_quit() if armed['v'] else None)
+    GLib.timeout_add_seconds(CLIP_HOLD_SECONDS, Gtk.main_quit)
+    try:
+        Gtk.main()
+    except KeyboardInterrupt:
+        pass
+
+
+def ydotool_env():
+    env = os.environ.copy()
+    if 'YDOTOOL_SOCKET' not in env:
+        for c in (f"/run/user/{os.getuid()}/.ydotool_socket",
+                  os.path.expanduser('~/.ydotool_socket')):
+            if os.path.exists(c):
+                env['YDOTOOL_SOCKET'] = c
+                break
+    return env
+
+
+def type_text(text):
+    """Type into the focused window via ydotool. Returns True on success."""
+    exe = shutil.which('ydotool')
+    if not exe:
+        return False
+    try:
+        r = subprocess.run([exe, 'type', '--key-delay', '1', '--', text],
+                           env=ydotool_env(), capture_output=True, timeout=60)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def notify(title, body=''):
+    if shutil.which('notify-send'):
+        try:
+            subprocess.Popen(['notify-send', '-a', 'prompts', title, body])
+        except Exception:
+            pass
+
+
+def read_stdin_if_piped():
+    if not sys.stdin.isatty():
+        data = sys.stdin.read()
+        return data if data.strip() else None
+    return None
+
+
+# --- terminal TUI ------------------------------------------------------------
+def tui():
+    items = load_all()
+    if not items:
+        print('No prompts yet. Add one:  prompts new   (or  prompts add "Title")')
+        return
+    if not sys.stdout.isatty():
+        return cmd_ls([])
+    import curses
+
+    def run(stdscr):
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        try:
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_CYAN, -1)     # accent
+            curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)  # sel
+            curses.init_pair(3, curses.COLOR_BLUE, -1)     # tags
+        except Exception:
+            pass
+        query, sel = '', 0
+        while True:
+            res = search(items, query)
+            if not res:
+                sel = 0
+            else:
+                sel = max(0, min(sel, len(res) - 1))
+            h, w = stdscr.getmaxyx()
+            stdscr.erase()
+            head = ' prompts'
+            stdscr.addstr(0, 0, head[:w - 1], curses.color_pair(1) | curses.A_BOLD)
+            stdscr.addstr(0, len(head) + 1,
+                          ('› ' + query)[:max(0, w - len(head) - 2)])
+            stdscr.addstr(1, 0, '─' * (w - 1))
+            top = 2
+            avail = h - top - 1
+            start = max(0, sel - avail + 1) if sel >= avail else 0
+            for i, it in enumerate(res[start:start + avail]):
+                idx = start + i
+                y = top + i
+                line = it['title']
+                tagstr = '  ' + ' '.join('#' + t for t in it['tags']) if it['tags'] else ''
+                full = (line + tagstr)[:w - 2]
+                if idx == sel:
+                    stdscr.addstr(y, 0, ' ' + full.ljust(w - 2),
+                                  curses.color_pair(2))
+                else:
+                    stdscr.addstr(y, 0, ' ' + line[:w - 2])
+                    if tagstr:
+                        x = 1 + len(line[:w - 2])
+                        if x < w - 1:
+                            stdscr.addstr(y, x, tagstr[:w - 1 - x],
+                                          curses.color_pair(3))
+            hint = 'Enter copy · Ctrl+T type · type to filter · Esc quit'
+            stdscr.addstr(h - 1, 0, hint[:w - 1], curses.A_DIM)
+            stdscr.refresh()
+            try:
+                ch = stdscr.get_wch()
+            except KeyboardInterrupt:
+                return None
+            if ch in ('\x1b',):
+                return None
+            elif ch in ('\n', '\r', curses.KEY_ENTER):
+                return ('copy', res[sel]) if res else None
+            elif ch == '\x14':  # Ctrl+T
+                return ('type', res[sel]) if res else None
+            elif ch in (curses.KEY_UP,) or ch == '\x10':
+                sel -= 1
+            elif ch in (curses.KEY_DOWN,) or ch == '\x0e':
+                sel += 1
+            elif ch in (curses.KEY_BACKSPACE, '\x7f', '\b'):
+                query = query[:-1]
+                sel = 0
+            elif isinstance(ch, str) and ch.isprintable():
+                query += ch
+                sel = 0
+            if res:
+                sel = max(0, min(sel, len(search(items, query)) - 1 if search(items, query) else 0))
+
+    action = curses.wrapper(run)
+    if not action:
+        return
+    kind, it = action
+    if kind == 'type':
+        if type_text(it['body']):
+            return
+        print('(ydotool not available — copied instead; run: prompts setup-typing)',
+              file=sys.stderr)
+    ok = set_clipboard(it['body'])
+    print(('✓ copied: ' if ok else '✗ copy failed: ') + it['title'], file=sys.stderr)
+    sys.stdout.write(it['body'] + '\n')
+
+
+# --- commands ----------------------------------------------------------------
+def cmd_ls(args):
+    items = load_all()
+    if '--json' in args:
+        print(json.dumps([{k: it[k] for k in ('id', 'title', 'tags', 'updated')}
+                          for it in items], indent=2))
+        return
+    if not items:
+        print('(no prompts yet)')
+        return
+    width = max((len(it['id']) for it in items), default=4)
+    for it in items:
+        tags = ' '.join('#' + t for t in it['tags'])
+        print(f"{it['id'].ljust(width)}  {it['title']}"
+              + (f"   {tags}" if tags else ''))
+
+
+def cmd_get(args):
+    if not args:
+        die('usage: prompts get <id>')
+    it = resolve_or_die(args[0])
+    sys.stdout.write(it['body'] + '\n')
+
+
+def cmd_show(args):
+    if not args:
+        die('usage: prompts show <id>')
+    it = resolve_or_die(args[0])
+    print(f"# {it['title']}")
+    if it['tags']:
+        print('tags: ' + ', '.join(it['tags']))
+    print(f"id: {it['id']}   updated: {it['updated']}")
+    print('─' * 40)
+    print(it['body'])
+
+
+def _pop_opt(args, *names, has_val=True):
+    for n in names:
+        if n in args:
+            i = args.index(n)
+            if has_val:
+                val = args[i + 1] if i + 1 < len(args) else ''
+                del args[i:i + 2]
+                return val
+            del args[i]
+            return True
+    return None if has_val else False
+
+
+def cmd_add(args):
+    args = list(args)
+    tags = _pop_opt(args, '--tags', '-t') or ''
+    body = _pop_opt(args, '--body', '-b')
+    from_clip = _pop_opt(args, '--from-clipboard', '--clip', has_val=False)
+    stdin_flag = '-' in args
+    if stdin_flag:
+        args.remove('-')
+    title = ' '.join(a for a in args if not a.startswith('-')).strip()
+    if body is None:
+        piped = read_stdin_if_piped()
+        if from_clip:
+            body = clipboard_get() or ''
+        elif piped is not None or stdin_flag:
+            body = piped or sys.stdin.read()
+        else:
+            return cmd_new([title] if title else [])
+    if not title:
+        first = body.strip().splitlines()[0] if body.strip() else 'untitled'
+        title = first[:50]
+    taglist = [t for t in re.split(r'[,\s]+', tags) if t]
+    it = save_new(title, body, taglist)
+    print(f"saved: {it['id']}")
+
+
+def cmd_new(args):
+    ensure_dir()
+    title = ' '.join(args).strip()
+    slug = slugify(title) if title else 'untitled'
+    path = unique_path(slug)
+    template = ('---\n'
+                f"title: {title or 'My prompt'}\n"
+                'tags: \n'
+                f'created: {now()}\n'
+                f'updated: {now()}\n'
+                '---\n'
+                'Write your prompt here.\n')
+    open(path, 'w', encoding='utf-8').write(template)
+    subprocess.call([EDITOR, path])
+    meta = parse_file(path)
+    if meta['body'].strip() in ('', 'Write your prompt here.'):
+        os.remove(path)
+        print('discarded (empty).')
+        return
+    # rename to match (possibly edited) title
+    want = unique_path(slugify(meta['title'])) if slugify(meta['title']) != slug else path
+    save_over(path, meta)
+    if os.path.basename(want) != os.path.basename(path):
+        os.rename(path, want)
+        git_commit('rename ' + os.path.basename(want))
+        path = want
+    print(f"saved: {os.path.splitext(os.path.basename(path))[0]}")
+
+
+def cmd_edit(args):
+    if not args:
+        die('usage: prompts edit <id>')
+    it = resolve_or_die(args[0])
+    subprocess.call([EDITOR, it['path']])
+    meta = parse_file(it['path'])
+    save_over(it['path'], meta)   # bumps updated, keeps filename stable
+    print(f"updated: {it['id']}")
+
+
+def cmd_rm(args):
+    if not args:
+        die('usage: prompts rm <id>')
+    it = resolve_or_die(args[0])
+    if '-f' not in args and '--force' not in args:
+        ans = input(f"delete '{it['title']}' ({it['id']})? [y/N] ").strip().lower()
+        if ans not in ('y', 'yes'):
+            print('cancelled.')
+            return
+    os.remove(it['path'])
+    git_commit('rm ' + os.path.basename(it['path']))
+    print(f"deleted: {it['id']}")
+
+
+def cmd_cp(args):
+    if not args:
+        die('usage: prompts cp <id>')
+    it = resolve_or_die(args[0])
+    if set_clipboard(it['body']):
+        print(f"✓ copied: {it['title']}", file=sys.stderr)
+    else:
+        die('copy failed (no clipboard backend)')
+
+
+def cmd_type(args):
+    if not args:
+        die('usage: prompts type <id>')
+    it = resolve_or_die(args[0])
+    delay = _pop_opt(list(args), '--delay', '-d') or '0'
+    if type_text(it['body']):
+        print(f"typed: {it['title']}", file=sys.stderr)
+    else:
+        die('ydotool not available — run: prompts setup-typing')
+
+
+def cmd_search(args):
+    q = ' '.join(args)
+    for it in search(load_all(), q):
+        tags = ' '.join('#' + t for t in it['tags'])
+        print(f"{it['id']}  {it['title']}" + (f"   {tags}" if tags else ''))
+
+
+def cmd_path(args):
+    if args:
+        print(resolve_or_die(args[0])['path'])
+    else:
+        print(DIR)
+
+
+def cmd_git(args):
+    git_init()
+    os.execvp('git', ['git', '-C', DIR, *args])
+
+
+GUI_PIDFILE = os.path.expanduser('~/.local/state/prompts/gui.pid')
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def cmd_gui(args):
+    # Single-instance toggle: if the popup is already open, a second launch
+    # (e.g. pressing Ctrl+Shift+P again) closes it instead of stacking a new one.
+    os.makedirs(os.path.dirname(GUI_PIDFILE), exist_ok=True)
+    try:
+        old = int(open(GUI_PIDFILE).read().strip())
+        if old != os.getpid() and _pid_alive(old):
+            try:
+                os.kill(old, signal.SIGUSR1)     # ask the open popup to close cleanly
+            except Exception:
+                pass
+            return
+    except (FileNotFoundError, ValueError):
+        pass
+    with open(GUI_PIDFILE, 'w') as f:
+        f.write(str(os.getpid()))
+    try:
+        run_gui()
+    finally:
+        try:
+            os.remove(GUI_PIDFILE)
+        except Exception:
+            pass
+
+
+def cmd_setup_typing(args):
+    sock = f"/run/user/{os.getuid()}/.ydotool_socket"
+    unit = os.path.expanduser('~/.config/systemd/user/ydotoold.service')
+    os.makedirs(os.path.dirname(unit), exist_ok=True)
+    open(unit, 'w').write(
+        '[Unit]\nDescription=ydotool daemon\n\n'
+        '[Service]\n'
+        f'ExecStart=/usr/bin/ydotoold -p {sock} -P 0660\n'
+        'Restart=on-failure\n\n'
+        '[Install]\nWantedBy=default.target\n')
+    print(textwrap.dedent(f"""\
+        Wrote user service: {unit}
+
+        Auto-typing needs the ydotool binary + access to /dev/uinput. Run these
+        (they need sudo — in Claude Code you can prefix with `!`):
+
+          sudo apt-get install -y ydotool wl-clipboard
+          echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' \\
+            | sudo tee /etc/udev/rules.d/80-uinput.rules
+          sudo usermod -aG input "$USER"
+          sudo udevadm control --reload-rules && sudo udevadm trigger
+          systemctl --user daemon-reload && systemctl --user enable --now ydotoold
+
+        Then log out/in once (for the 'input' group). Test:  prompts type <id>
+        Until then, Shift+Enter in the popup falls back to copying.
+        """))
+
+
+def clipboard_get():
+    for cmd in (['wl-paste', '-n'], ['xclip', '-selection', 'clipboard', '-o'],
+                ['xsel', '-ob']):
+        if shutil.which(cmd[0]):
+            try:
+                return subprocess.run(cmd, capture_output=True, text=True).stdout
+            except Exception:
+                pass
+    try:  # GTK fallback (no wl-paste/xclip installed)
+        os.environ.setdefault('GDK_BACKEND', 'x11')
+        import gi
+        gi.require_version('Gtk', '3.0')
+        from gi.repository import Gtk, Gdk
+        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        return cb.wait_for_text()
+    except Exception:
+        return None
+
+
+# --- GTK popup ---------------------------------------------------------------
+def run_gui():
+    os.environ.setdefault('GDK_BACKEND', 'x11')
+    import gi
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gtk, Gdk, GLib, Pango
+
+    accent = current_accent()
+
+    def hexrgba(h, a):
+        h = h.lstrip('#')
+        return 'rgba(%d,%d,%d,%s)' % (int(h[0:2], 16), int(h[2:4], 16),
+                                      int(h[4:6], 16), a)
+
+    class PromptsWindow(Gtk.Window):
+        def __init__(self):
+            super().__init__(title='prompts')
+            self.set_decorated(False)
+            self.set_keep_above(True)
+            self.set_skip_taskbar_hint(True)
+            self.set_default_size(560, 540)
+            self.set_position(Gtk.WindowPosition.CENTER)
+            self.items = []
+            self.filtered = []
+            self._apply_css()
+
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            root.get_style_context().add_class('root')
+            self.add(root)
+
+            top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            badge = Gtk.Label(label='prompts')
+            badge.get_style_context().add_class('badge')
+            top.pack_start(badge, False, False, 0)
+            self.entry = Gtk.SearchEntry()
+            self.entry.set_placeholder_text('search prompts…')
+            self.entry.get_style_context().add_class('entry')
+            self.entry.connect('search-changed', lambda *_: self.refilter())
+            top.pack_start(self.entry, True, True, 0)
+            root.pack_start(top, False, False, 0)
+
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroller.set_vexpand(True)
+            self.listbox = Gtk.ListBox()
+            self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+            # A single click on a prompt copies it and closes the popup.
+            self.listbox.set_activate_on_single_click(True)
+            self.listbox.connect('row-activated', lambda *_: self.do_copy())
+            scroller.add(self.listbox)
+            root.pack_start(scroller, True, True, 0)
+
+            btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            for label, cb, primary in (
+                    ('copy', self.do_copy, True),
+                    ('type', self.do_type, False),
+                    ('new', self.do_new, False),
+                    ('edit', self.do_edit, False),
+                    ('delete', self.do_delete, False)):
+                b = Gtk.Button(label=label)
+                b.get_style_context().add_class('btn')
+                if primary:
+                    b.get_style_context().add_class('primary')
+                b.connect('clicked', lambda _w, f=cb: f())
+                btns.pack_start(b, True, True, 0)
+            root.pack_start(btns, False, False, 0)
+
+            self.hintlbl = Gtk.Label()
+            self.hintlbl.set_xalign(0)
+            self.hintlbl.get_style_context().add_class('hint')
+            self.hintlbl.set_markup(
+                '<small>Click/Enter copy · Shift+Enter type · Ctrl+N new · '
+                'Ctrl+E edit · Esc close</small>')
+            root.pack_start(self.hintlbl, False, False, 0)
+
+            self.connect('key-press-event', self.on_key)
+            self.connect('destroy', Gtk.main_quit)
+            self.reload()
+
+        def _apply_css(self):
+            a = accent
+            css = ('''
+            window { background-color: transparent; }
+            .root { background-color: #0c0c11; border: 1px solid %(border)s;
+                border-radius: 16px; padding: 14px; }
+            .badge { background-color: #0c0c11; color: #b8b8c6;
+                border: 1px solid %(border)s; border-radius: 7px;
+                padding: 2px 8px; font-family: monospace; font-size: 13px;
+                letter-spacing: 1px; }
+            entry.entry { background: #14141c; border: 1px solid %(border)s;
+                border-radius: 8px; padding: 4px 8px; color: #eaeaf2;
+                caret-color: %(a)s; font-size: 16px; }
+            list { background: transparent; }
+            row { background: transparent; border-radius: 9px; padding: 2px; }
+            row:selected { background: %(glow)s; }
+            row:selected .ptitle { color: %(a)s; }
+            .ptitle { color: #eaeaf2; font-size: 16px; }
+            .ptags { color: %(a)s; font-family: monospace; font-size: 11px; }
+            .ppreview { color: #76768a; font-size: 12px; }
+            .btn { background: rgba(255,255,255,0.03); color: #9a9aa8;
+                border: 1px solid #2a2a36; border-radius: 9px; padding: 5px 8px;
+                min-width: 0; min-height: 0; }
+            .btn:hover { color: %(a)s; border-color: %(a)s; background: %(glow)s; }
+            .btn.primary { color: %(a)s; border-color: %(a)s; }
+            .hint { color: #5a5a6a; }
+            .empty { color: #76768a; font-size: 15px; }
+            ''' % {'a': a, 'border': hexrgba(a, '0.5'), 'glow': hexrgba(a, '0.13')})
+            prov = Gtk.CssProvider()
+            prov.load_from_data(css.encode())
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(), prov,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        def reload(self):
+            self.items = load_all()
+            self.refilter()
+
+        def refilter(self):
+            for c in self.listbox.get_children():
+                self.listbox.remove(c)
+            self.filtered = search(self.items, self.entry.get_text())
+            if not self.filtered:
+                row = Gtk.ListBoxRow()
+                row.set_selectable(False)
+                lbl = Gtk.Label(label='no prompts — press “new” to add one'
+                                if not self.items else 'no matches')
+                lbl.get_style_context().add_class('empty')
+                lbl.set_margin_top(20)
+                row.add(lbl)
+                self.listbox.add(row)
+                self.listbox.show_all()
+                return
+            for it in self.filtered:
+                self.listbox.add(self._row(it))
+            self.listbox.show_all()
+            first = self.listbox.get_row_at_index(0)
+            if first:
+                self.listbox.select_row(first)
+
+        def _row(self, it):
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            box.set_margin_top(4)
+            box.set_margin_bottom(4)
+            box.set_margin_start(6)
+            box.set_margin_end(6)
+            head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            t = Gtk.Label(label=it['title'], xalign=0)
+            t.get_style_context().add_class('ptitle')
+            t.set_ellipsize(Pango.EllipsizeMode.END)
+            head.pack_start(t, True, True, 0)
+            if it['tags']:
+                tg = Gtk.Label(label=' '.join('#' + x for x in it['tags']), xalign=1)
+                tg.get_style_context().add_class('ptags')
+                head.pack_end(tg, False, False, 0)
+            box.pack_start(head, False, False, 0)
+            preview = ' '.join(it['body'].split())[:80]
+            if preview:
+                p = Gtk.Label(label=preview, xalign=0)
+                p.get_style_context().add_class('ppreview')
+                p.set_ellipsize(Pango.EllipsizeMode.END)
+                box.pack_start(p, False, False, 0)
+            row.add(box)
+            row._item = it
+            return row
+
+        def current(self):
+            r = self.listbox.get_selected_row()
+            return getattr(r, '_item', None) if r else None
+
+        def move(self, delta):
+            rows = [r for r in self.listbox.get_children() if r.get_selectable()]
+            if not rows:
+                return
+            cur = self.listbox.get_selected_row()
+            i = rows.index(cur) if cur in rows else -1
+            i = max(0, min(len(rows) - 1, i + delta))
+            self.listbox.select_row(rows[i])
+            rows[i].grab_focus()
+            self.entry.grab_focus_without_selecting()
+
+        def on_key(self, _w, ev):
+            kv = ev.keyval
+            ctrl = ev.state & Gdk.ModifierType.CONTROL_MASK
+            shift = ev.state & Gdk.ModifierType.SHIFT_MASK
+            if kv == Gdk.KEY_Escape:
+                self.destroy()
+                return True
+            if kv in (Gdk.KEY_Down, Gdk.KEY_Up):
+                self.move(1 if kv == Gdk.KEY_Down else -1)
+                return True
+            if kv in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+                self.do_type() if shift else self.do_copy()
+                return True
+            if ctrl and kv in (Gdk.KEY_n, Gdk.KEY_N):
+                self.do_new()
+                return True
+            if ctrl and kv in (Gdk.KEY_e, Gdk.KEY_E):
+                self.do_edit()
+                return True
+            return False
+
+        def do_copy(self):
+            it = self.current()
+            if not it:
+                return
+            # set_clipboard spawns a detached owner process, so the copy
+            # survives this window closing.
+            set_clipboard(it['body'])
+            notify('prompts', 'Copied: ' + it['title'])
+            GLib.timeout_add(160, self.destroy)
+
+        def do_type(self):
+            it = self.current()
+            if not it:
+                return
+            if not shutil.which('ydotool'):
+                notify('prompts', 'Auto-type off — copied instead. '
+                                  'Run: prompts setup-typing')
+                self.do_copy()
+                return
+            text = it['body']
+            self.hide()
+
+            def later():
+                if not type_text(text):
+                    set_clipboard(text)
+                    notify('prompts', 'Type failed — copied instead')
+                Gtk.main_quit()
+                return False
+            GLib.timeout_add(320, later)
+
+        def _term(self, shell_cmd):
+            term = (shutil.which('terminator') or shutil.which('gnome-terminal')
+                    or shutil.which('x-terminal-emulator') or shutil.which('xterm'))
+            if not term:
+                return
+            base = os.path.basename(term)
+            if base == 'terminator':
+                subprocess.Popen([term, '-T', 'prompts', '-e',
+                                  "bash -lc %s" % _q(shell_cmd)])
+            elif base == 'gnome-terminal':
+                subprocess.Popen([term, '--title', 'prompts', '--', 'bash',
+                                  '-lc', shell_cmd])
+            else:
+                subprocess.Popen([term, '-e', 'bash -lc %s' % _q(shell_cmd)])
+
+        def do_new(self):
+            self._term('prompts new')
+            self.destroy()
+
+        def do_edit(self):
+            it = self.current()
+            if not it:
+                return
+            self._term('prompts edit %s' % _q(it['id']))
+            self.destroy()
+
+        def do_delete(self):
+            it = self.current()
+            if not it:
+                return
+            dlg = Gtk.MessageDialog(
+                transient_for=self, modal=True,
+                message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.YES_NO,
+                text="Delete prompt “%s”?" % it['title'])
+            resp = dlg.run()
+            dlg.destroy()
+            if resp == Gtk.ResponseType.YES:
+                os.remove(it['path'])
+                git_commit('rm ' + os.path.basename(it['path']))
+                self.reload()
+
+    win = PromptsWindow()
+    # let the toggle (a second `prompts gui`) close us cleanly via SIGUSR1
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1,
+                         lambda: (win.destroy(), False)[1])
+    win.show_all()
+    win.entry.grab_focus()
+    win.present()
+    Gtk.main()
+
+
+def _q(s):
+    import shlex
+    return shlex.quote(s)
+
+
+# --- dispatch ----------------------------------------------------------------
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def resolve_or_die(arg):
+    try:
+        it = resolve(arg)
+    except Ambiguous as e:
+        print('ambiguous; matches:', file=sys.stderr)
+        for c in e.cands:
+            print('  ' + c['id'] + '  ' + c['title'], file=sys.stderr)
+        sys.exit(2)
+    if not it:
+        die(f"no prompt matches '{arg}'")
+    return it
+
+
+HELP = """prompts — personal prompt library
+
+  prompts                 open the terminal picker (type to filter)
+  prompts gui             open/close the GTK popup (bound to Ctrl+Shift+P)
+  prompts ls [--json]     list all prompts
+  prompts get <id>        print a prompt's body (for piping / Claude)
+  prompts show <id>       pretty-print a prompt with metadata
+  prompts add <title> [--tags a,b] [--body TEXT | - | --clip]
+  prompts new [title]     create one in $EDITOR
+  prompts edit <id>       edit in $EDITOR
+  prompts rm <id> [-f]    delete
+  prompts cp <id>         copy body to clipboard
+  prompts type <id>       type body into the focused window (ydotool)
+  prompts search <query>  search titles/tags/body
+  prompts path [<id>]     print store dir (or a prompt's file)
+  prompts git <args…>     run git in the prompt store
+  prompts setup-typing    set up ydotool auto-typing
+
+Store: %s  (private git repo)
+ id may be a full slug, a prefix, or a unique word from the title.""" % DIR
+
+CMDS = {
+    'gui': cmd_gui, 'ls': cmd_ls, 'list': cmd_ls, 'get': cmd_get,
+    'show': cmd_show, 'cat': cmd_show, 'add': cmd_add, 'new': cmd_new,
+    'edit': cmd_edit, 'rm': cmd_rm, 'del': cmd_rm, 'delete': cmd_rm,
+    'cp': cmd_cp, 'copy': cmd_cp, 'type': cmd_type, 'search': cmd_search,
+    'find': cmd_search, 'path': cmd_path, 'git': cmd_git,
+    'setup-typing': cmd_setup_typing, '__clip-serve': cmd_clip_serve,
+}
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        return tui()
+    cmd = argv[0]
+    if cmd in ('-h', '--help', 'help'):
+        print(HELP)
+        return
+    fn = CMDS.get(cmd)
+    if not fn:
+        # bare `prompts <query>` → search-pick is surprising; treat unknown as help
+        die(f"unknown command '{cmd}'\n\n{HELP}")
+    fn(argv[1:])
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)

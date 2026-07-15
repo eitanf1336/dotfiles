@@ -14,7 +14,7 @@ Two extensions written from scratch (`gnome-extensions/`):
 A software warm-tint **and** brightness/dimming overlay for monitors that lack hardware gamma or brightness control (DisplayLink/EVDI, USB docks) — the screens GNOME's built-in Night Light can't reach. Ships its own GSettings schema (`intensity`, `brightness`, `active`) plus a preferences panel. The `brightness`, `nightlight`, and `present` scripts below drive it.
 
 ### Terminal Tiler — `terminal-tiler@eitan.local`
-On-demand vertical tiling for terminals. **Super+Return** spawns a fullscreen terminal on the focused monitor; pressing again adds another and divides that monitor into equal vertical columns. Focusing a stray terminal and pressing the key absorbs it. Manually moving/resizing a tiled window ejects it and re-flows the rest. Per-monitor, Wayland-native.
+On-demand vertical tiling for terminals. **Super+Return** spawns a fullscreen terminal on the focused monitor; pressing again adds another and divides that monitor into equal vertical columns. Focusing a stray terminal and pressing the key absorbs it. **Super+Up** maximises the focused terminal over its group (hiding the division); **Super+Down** — or minimising the group — restores the columns. Manually moving/resizing a tiled window ejects it and re-flows the rest. Per-monitor, Wayland-native.
 
 ---
 

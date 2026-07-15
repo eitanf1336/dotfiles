@@ -134,3 +134,12 @@ if gsettings list-schemas 2>/dev/null | grep -qx "$TA"; then
     gsettings set "$TA" tile-right-half "['<Super>KP_6']"
     echo "De-conflicted Tiling Assistant (freed <Super>Left/Right for terminal-tiler)."
 fi
+
+# Also free the arrows from Mutter's BUILT-IN edge-tiling. These default to
+# <Super>Left/Right in Ubuntu and can reappear after a settings reset/update,
+# re-introducing the same conflict with the terminal-tiler (symptom: one arrow
+# moves terminals, the other snaps the window to a screen half). Clearing them
+# leaves the arrows solely to the tiler; half-tiling stays on <Super>KP_4/KP_6.
+gsettings set org.gnome.mutter.keybindings toggle-tiled-left  "@as []"
+gsettings set org.gnome.mutter.keybindings toggle-tiled-right "@as []"
+echo "Cleared Mutter edge-tiling off <Super>Left/Right."

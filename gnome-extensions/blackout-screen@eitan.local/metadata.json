@@ -1,0 +1,8 @@
+{
+  "uuid": "blackout-screen@eitan.local",
+  "name": "Blackout Screen",
+  "description": "Toggle an opaque black overlay on the monitor under the pointer with a keyboard shortcut (default Super+B). Press the shortcut again while on that monitor to restore it. Handy for 'switching off' a distracting or secondary display on Wayland, where per-monitor DPMS is not available (DisplayLink/EVDI, docks).",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "settings-schema": "org.gnome.shell.extensions.blackout-screen",
+  "gettext-domain": "blackout-screen"
+}

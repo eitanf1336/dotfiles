@@ -22,6 +22,12 @@ ln -sf "$REPO/python/claude-ask" "$BIN/claude-ask"
 ln -sf "$BIN/claude-custom" "$BIN/claude-c"
 ln -sf "$BIN/claude-desktop" "$BIN/claude-d"
 
+echo "==> Claude Code slash commands -> ~/.claude/commands"
+mkdir -p "$HOME/.claude/commands"
+for f in "$REPO"/claude/commands/*.md; do
+    ln -sf "$f" "$HOME/.claude/commands/$(basename "$f")"
+done
+
 echo "==> GNOME extensions -> $EXT"
 for d in "$REPO"/gnome-extensions/*/; do
     name="$(basename "$d")"
