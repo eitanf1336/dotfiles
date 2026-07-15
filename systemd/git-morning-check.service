@@ -1,0 +1,6 @@
+[Unit]
+Description=Daily check for git projects with uncommitted/unpushed work
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/git-morning-check scan

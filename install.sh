@@ -39,11 +39,13 @@ for d in "$REPO"/gnome-extensions/*/; do
     echo "    installed $name"
 done
 
-echo "==> systemd user timer"
-cp "$REPO"/systemd/rotate-bg.{service,timer} "$SYSD/"
-cp "$REPO"/systemd/media-keep-awake.service "$SYSD/"
+echo "==> systemd user units"
+cp "$REPO"/systemd/*.service "$REPO"/systemd/*.timer "$SYSD/" 2>/dev/null || true
 systemctl --user daemon-reload 2>/dev/null || true
-systemctl --user enable --now rotate-bg.timer 2>/dev/null || true
+for t in "$REPO"/systemd/*.timer; do
+    systemctl --user enable --now "$(basename "$t")" 2>/dev/null || true
+done
+# Units that are not timer-driven still need enabling explicitly.
 systemctl --user enable --now media-keep-awake.service 2>/dev/null || true
 
 echo "==> autostart entries -> $AUTOSTART"

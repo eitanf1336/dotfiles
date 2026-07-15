@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+"""git-morning-check — daily nudge for git projects with pending work.
+
+Modes:
+  scan    Scan all git repos under $HOME for uncommitted changes and/or
+          unpushed commits. If any are "actionable" (not previously ignored
+          in their current state), pop a desktop notification whose action
+          button opens the review window. Run by the systemd timer at 08:00.
+  window  GTK review window: one row per actionable repo with an editable
+          commit message and [Commit & Push] / [Ignore] buttons.
+
+"Ignore" records a fingerprint of the repo's current pending state; it will
+not be shown again until that state changes (new uncommitted/unpushed work).
+A successful Commit & Push clears any stored ignore so future changes notify.
+"""
+import os, sys, json, hashlib, subprocess, threading
+
+HOME = os.path.expanduser('~')
+STATE_DIR = os.path.join(HOME, '.local', 'state', 'git-morning-check')
+IGNORE_FILE = os.path.join(STATE_DIR, 'ignored.json')
+SELF = os.path.abspath(__file__)
+
+# Directory names we never descend into while hunting for repos.
+SKIP = {
+    'node_modules', '.cache', '.npm', '.var', '.rustup', '.cargo', '.gradle',
+    '.m2', '__pycache__', '.venv', 'venv', '.tox', '.mypy_cache', '.cargo',
+    'site-packages', '.steam', 'snap', '.nvm', '.pyenv', 'Trash',
+}
+
+
+# --------------------------------------------------------------------------- #
+# git helpers
+# --------------------------------------------------------------------------- #
+def git(repo, *args, check=True):
+    p = subprocess.run(['git', '-C', repo, *args],
+                       capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(p.stderr.strip() or f'git {" ".join(args)} failed')
+    return p.stdout.rstrip('\n'), p.returncode, p.stderr.strip()
+
+
+def find_repos():
+    repos = []
+    for root, dirs, _ in os.walk(HOME, topdown=True):
+        dirs[:] = [d for d in dirs if d not in SKIP]
+        if os.sep + '.claude' + os.sep + 'worktrees' in root + os.sep:
+            dirs[:] = []
+            continue
+        if os.path.isdir(os.path.join(root, '.git')):
+            repos.append(root)
+            dirs[:] = []          # don't descend into a repo (skip submodules)
+    return sorted(repos)
+
+
+def repo_state(repo):
+    """Return None if clean, else dict describing pending work + fingerprint."""
+    porcelain, _, _ = git(repo, 'status', '--porcelain')
+    branch, _, _ = git(repo, 'rev-parse', '--abbrev-ref', 'HEAD', check=False)
+    up, rc, _ = git(repo, 'rev-parse', '--abbrev-ref',
+                    '--symbolic-full-name', '@{u}', check=False)
+    unpushed = []
+    has_upstream = rc == 0 and up
+    if has_upstream:
+        out, _, _ = git(repo, 'log', '--oneline', '@{u}..HEAD', check=False)
+        unpushed = [l for l in out.splitlines() if l.strip()]
+    porc_lines = [l for l in porcelain.splitlines() if l.strip()]
+    if not porc_lines and not unpushed:
+        return None
+    fp = hashlib.sha1(
+        ('\n'.join(sorted(porc_lines)) + '\v' + '\n'.join(unpushed)
+         ).encode('utf-8', 'replace')).hexdigest()
+    return {
+        'repo': repo,
+        'branch': branch,
+        'porcelain': porc_lines,
+        'n_uncommitted': len(porc_lines),
+        'unpushed': unpushed,
+        'n_unpushed': len(unpushed),
+        'has_upstream': bool(has_upstream),
+        'fp': fp,
+    }
+
+
+def auto_message(state):
+    names = []
+    for l in state['porcelain']:
+        path = l[3:].split(' -> ')[-1].strip().strip('"')
+        names.append(os.path.basename(path.rstrip('/')))
+    uniq = sorted(set(n for n in names if n))[:8]
+    n = state['n_uncommitted']
+    if n == 0:
+        return ''
+    head = f'Update working tree ({n} files)' if n > 8 else 'Update working tree'
+    return f'{head}: ' + ', '.join(uniq)
+
+
+# --------------------------------------------------------------------------- #
+# ignore-state persistence
+# --------------------------------------------------------------------------- #
+def load_ignored():
+    """Return {'states': {repo: fp}, 'projects': [repo, ...]}.
+
+    'states' = mute this exact changeset (re-notify when it changes).
+    'projects' = mute the whole repo forever (until restored).
+    Migrates the old flat {repo: fp} format.
+    """
+    try:
+        with open(IGNORE_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        return {'states': {}, 'projects': []}
+    if isinstance(data, dict) and ('states' in data or 'projects' in data):
+        data.setdefault('states', {})
+        data.setdefault('projects', [])
+        return data
+    if isinstance(data, dict):                 # old flat format
+        return {'states': data, 'projects': []}
+    return {'states': {}, 'projects': []}
+
+
+def save_ignored(d):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = IGNORE_FILE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(d, f, indent=2)
+    os.replace(tmp, IGNORE_FILE)
+
+
+def all_pending_states():
+    """Every repo with pending work, ignore-agnostic."""
+    out = []
+    for repo in find_repos():
+        try:
+            st = repo_state(repo)
+        except Exception:
+            continue
+        if st:
+            out.append(st)
+    return out
+
+
+def actionable_repos():
+    ig = load_ignored()
+    projects = set(ig.get('projects', []))
+    states = ig.get('states', {})
+    out = []
+    for st in all_pending_states():
+        repo = st['repo']
+        if repo in projects:
+            continue
+        if states.get(repo) == st['fp']:
+            continue
+        out.append(st)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# scan mode  (run by the timer)
+# --------------------------------------------------------------------------- #
+def short(repo):
+    return repo.replace(HOME, '~', 1)
+
+
+def _open_window_detached():
+    """Launch the review window so it outlives this short-lived helper."""
+    subprocess.Popen(['setsid', '-f', sys.executable, SELF, 'window'],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     stdin=subprocess.DEVNULL)
+
+
+def _notify_plain(title, body):
+    """Fallback notification (no action button) if the D-Bus path is unavailable."""
+    try:
+        subprocess.run(['notify-send', '-a', 'git-morning-check', '-u',
+                        'normal', '-i', 'folder-git', title, body], timeout=20)
+    except Exception:
+        pass
+
+
+def _close_notification(bus, nid):
+    """Dismiss the notification once it's been acted on or capped out."""
+    try:
+        from gi.repository import Gio, GLib
+        bus.call_sync('org.freedesktop.Notifications',
+                      '/org/freedesktop/Notifications',
+                      'org.freedesktop.Notifications', 'CloseNotification',
+                      GLib.Variant('(u)', (nid,)), None,
+                      Gio.DBusCallFlags.NONE, 5000, None)
+    except Exception:
+        pass
+
+
+def do_scan():
+    repos = actionable_repos()
+    if not repos:
+        return 0
+    n = len(repos)
+    body_lines = []
+    for st in repos[:6]:
+        bits = []
+        if st['n_uncommitted']:
+            bits.append(f"{st['n_uncommitted']} uncommitted")
+        if st['n_unpushed']:
+            bits.append(f"{st['n_unpushed']} unpushed")
+        body_lines.append(f"• {short(st['repo'])} — {', '.join(bits)}")
+    if n > 6:
+        body_lines.append(f"…and {n - 6} more")
+    title = f"{n} git project{'s' if n != 1 else ''} need attention"
+    body = '\n'.join(body_lines)
+
+    # Post via the freedesktop.Notifications D-Bus API directly. Two other
+    # paths were tried and fail on GNOME 50: `notify-send -A` (libnotify 0.8
+    # rejects its action mechanism) and Gio.Application/GNotification (GNOME
+    # silently drops org.gtk.Notifications from an app with no matching
+    # .desktop file). The freedesktop API renders reliably here with no
+    # desktop file, and we listen for the click signals ourselves to open the
+    # review window. 'default' fires on clicking the body; 'review' is the
+    # button. timeout 0 = stay until acted on; a 12h cap closes it otherwise.
+    try:
+        import gi
+        from gi.repository import Gio, GLib
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except Exception:
+        _notify_plain(title, body)     # last resort: at least something pops
+        return 0
+
+    actions = ['default', 'Review changes', 'review', 'Review changes']
+    # urgency 2 = critical: GNOME keeps it on screen until acted on, instead of
+    # auto-hiding the banner into the tray after a few seconds (easy to miss).
+    hints = {'urgency': GLib.Variant('y', 2)}
+    params = GLib.Variant(
+        '(susssasa{sv}i)',
+        ('git-morning-check', 0, 'folder-git', title, body, actions, hints, 0))
+    try:
+        reply = bus.call_sync(
+            'org.freedesktop.Notifications',
+            '/org/freedesktop/Notifications',
+            'org.freedesktop.Notifications', 'Notify', params,
+            GLib.VariantType.new('(u)'), Gio.DBusCallFlags.NONE, 15000, None)
+        notif_id = reply.unpack()[0]
+    except Exception:
+        _notify_plain(title, body)
+        return 0
+
+    loop = GLib.MainLoop()
+
+    def on_signal(_conn, _sender, _obj, _iface, signal, gparams):
+        vals = gparams.unpack()
+        if not vals or vals[0] != notif_id:
+            return
+        if signal == 'ActionInvoked':        # body or button clicked
+            _open_window_detached()
+            _close_notification(bus, notif_id)
+            loop.quit()
+        elif signal == 'NotificationClosed':  # dismissed/expired
+            loop.quit()
+
+    for sig in ('ActionInvoked', 'NotificationClosed'):
+        bus.signal_subscribe(
+            'org.freedesktop.Notifications',
+            'org.freedesktop.Notifications', sig,
+            '/org/freedesktop/Notifications', None,
+            Gio.DBusSignalFlags.NONE, on_signal)
+
+    def _cap():                              # give up after 12h
+        _close_notification(bus, notif_id)
+        loop.quit()
+        return GLib.SOURCE_REMOVE
+    GLib.timeout_add_seconds(12 * 3600, _cap)
+
+    loop.run()
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# window mode  (GTK review UI)
+# --------------------------------------------------------------------------- #
+def do_window():
+    os.environ.setdefault('GDK_BACKEND', 'x11')
+    import gi
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gtk, Gdk, GLib, Pango
+
+    # All repos with pending work, ignore-agnostic. Mutated as repos get
+    # committed/pushed so the views stay in sync without a full rescan.
+    all_states = all_pending_states()
+
+    ACCENT = current_accent()
+    css = Gtk.CssProvider()
+    css.load_from_data((f"""
+    window {{ background:#15161b; }}
+    label {{ color:#e6e6ea; }}
+    .repo {{ color:{ACCENT}; font-weight:bold; font-size:13pt; }}
+    .meta {{ color:#9aa0aa; font-size:9pt; }}
+    .ok   {{ color:#4ade80; }}
+    .err  {{ color:#f87171; }}
+    .muted {{ color:#6b7280; }}
+    entry {{ background:#1e2027; color:#e6e6ea; border-radius:6px; }}
+    button {{ border-radius:6px; }}
+    .card {{ background:#1b1d24; border-radius:10px; }}
+    """).encode())
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), css,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    win = Gtk.Window(title='Git morning check')
+    win.set_default_size(740, 580)
+    win.set_position(Gtk.WindowPosition.CENTER)
+    win.connect('destroy', Gtk.main_quit)
+    win.connect('key-press-event',
+                lambda w, e: Gtk.main_quit()
+                if e.keyval == Gdk.KEY_Escape else None)
+
+    notebook = Gtk.Notebook()
+    notebook.set_margin_top(10); notebook.set_margin_bottom(10)
+    notebook.set_margin_start(10); notebook.set_margin_end(10)
+    win.add(notebook)
+
+    def scrolled_list():
+        sc = Gtk.ScrolledWindow()
+        sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(8); box.set_margin_bottom(8)
+        box.set_margin_start(6); box.set_margin_end(6)
+        sc.add(box)
+        return sc, box
+
+    pending_sc, pending_box = scrolled_list()
+    ignored_sc, ignored_box = scrolled_list()
+    tab_pending = Gtk.Label(label='Pending')
+    tab_ignored = Gtk.Label(label='Ignored')
+    notebook.append_page(pending_sc, tab_pending)
+    notebook.append_page(ignored_sc, tab_ignored)
+
+    def run_async(fn, on_done):
+        def worker():
+            try:
+                res = fn()
+            except Exception as e:
+                res = (False, str(e))
+            GLib.idle_add(on_done, res)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def card_base(st):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        card.get_style_context().add_class('card')
+        card.set_margin_top(6); card.set_margin_bottom(6)
+        card.set_margin_start(8); card.set_margin_end(8)
+        title = Gtk.Label(xalign=0, label=short(st['repo']))
+        title.get_style_context().add_class('repo')
+        title.set_selectable(True)
+        card.pack_start(title, False, False, 0)
+        bits = [f"branch {st['branch']}"]
+        if st['n_uncommitted']:
+            bits.append(f"{st['n_uncommitted']} uncommitted")
+        if st['n_unpushed']:
+            bits.append(f"{st['n_unpushed']} unpushed")
+        if not st['has_upstream']:
+            bits.append('no upstream')
+        meta = Gtk.Label(xalign=0, label='  ·  '.join(bits))
+        meta.get_style_context().add_class('meta')
+        card.pack_start(meta, False, False, 0)
+        return card
+
+    def make_pending_card(st):
+        card = card_base(st)
+
+        det_lines = list(st['porcelain'][:6])
+        if st['n_uncommitted'] > 6:
+            det_lines.append(f"  …+{st['n_uncommitted'] - 6} more")
+        det_lines += [f"⬆ {c}" for c in st['unpushed'][:4]]
+        if det_lines:
+            det = Gtk.Label(xalign=0, label='\n'.join(det_lines))
+            det.get_style_context().add_class('meta')
+            det.set_ellipsize(Pango.EllipsizeMode.END)
+            det.set_lines(10)
+            det.set_line_wrap(True)
+            card.pack_start(det, False, False, 0)
+
+        entry = Gtk.Entry()
+        entry.set_text(auto_message(st) or f"Push {st['n_unpushed']} commit(s)")
+        entry.set_sensitive(st['n_uncommitted'] > 0)
+        card.pack_start(entry, False, False, 0)
+
+        status = Gtk.Label(xalign=0, label='')
+        card.pack_start(status, False, False, 0)
+
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        b_commit = Gtk.Button(label='Commit & Push' if st['n_uncommitted']
+                              else 'Push')
+        b_commit.get_style_context().add_class('suggested-action')
+        b_ignore = Gtk.Button(label='Ignore')
+        b_ignore.set_tooltip_text(
+            'Hide this changeset; re-notify if it changes')
+        b_ignore_proj = Gtk.Button(label='Ignore project')
+        b_ignore_proj.get_style_context().add_class('destructive-action')
+        b_ignore_proj.set_tooltip_text(
+            'Never notify about this repo again (until restored)')
+        btns.pack_end(b_commit, False, False, 0)
+        btns.pack_end(b_ignore, False, False, 0)
+        btns.pack_end(b_ignore_proj, False, False, 0)
+        card.pack_start(btns, False, False, 0)
+
+        def on_commit(_):
+            b_commit.set_sensitive(False)
+            b_ignore.set_sensitive(False)
+            b_ignore_proj.set_sensitive(False)
+            status.set_text('Working…')
+            msg = entry.get_text().strip() or auto_message(st) or 'Update'
+            repo = st['repo']
+
+            def work():
+                if st['n_uncommitted']:
+                    git(repo, 'add', '-A')
+                    # Never commit embedded git repos (e.g. .claude worktrees)
+                    # as bogus submodules — drop any staged gitlink that isn't
+                    # a declared submodule.
+                    staged, _, _ = git(repo, 'ls-files', '--stage',
+                                       check=False)
+                    try:
+                        gitmods = open(os.path.join(repo,
+                                       '.gitmodules')).read()
+                    except Exception:
+                        gitmods = ''
+                    for line in staged.splitlines():
+                        if line.startswith('160000') and '\t' in line:
+                            path = line.split('\t', 1)[1]
+                            if path not in gitmods:
+                                git(repo, 'rm', '--cached', '-q', path,
+                                    check=False)
+                    git(repo, 'commit', '-m', msg, '-m',
+                        'Co-Authored-By: Claude Opus 4.8 '
+                        '<noreply@anthropic.com>')
+                out, rc, err = git(repo, 'push', check=False)
+                if rc != 0:
+                    o2, rc2, err2 = git(repo, 'push', '-u', 'origin',
+                                        st['branch'], check=False)
+                    if rc2 != 0:
+                        return (False, err or err2 or 'push failed')
+                return (True, 'Committed & pushed' if st['n_uncommitted']
+                        else 'Pushed')
+
+            def done(res):
+                ok, text = res
+                if ok:
+                    status.get_style_context().add_class('ok')
+                    status.set_text('✓ ' + text)
+                    ig = load_ignored()
+                    ig.get('states', {}).pop(st['repo'], None)
+                    save_ignored(ig)
+                    update_repo(st['repo'])
+                    GLib.timeout_add(700, lambda: (refresh(), False)[1])
+                else:
+                    status.get_style_context().add_class('err')
+                    status.set_text('✗ ' + text)
+                    b_commit.set_sensitive(True)
+                    b_ignore.set_sensitive(True)
+                    b_ignore_proj.set_sensitive(True)
+                return False
+
+            run_async(work, done)
+
+        def on_ignore(_):
+            ig = load_ignored()
+            ig.setdefault('states', {})[st['repo']] = st['fp']
+            save_ignored(ig)
+            refresh()
+
+        def on_ignore_proj(_):
+            ig = load_ignored()
+            if st['repo'] not in ig.setdefault('projects', []):
+                ig['projects'].append(st['repo'])
+            save_ignored(ig)
+            refresh()
+
+        b_commit.connect('clicked', on_commit)
+        b_ignore.connect('clicked', on_ignore)
+        b_ignore_proj.connect('clicked', on_ignore_proj)
+        return card
+
+    def make_ignored_row(repo, kind, st):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.get_style_context().add_class('card')
+        row.set_margin_top(4); row.set_margin_bottom(4)
+        row.set_margin_start(8); row.set_margin_end(8)
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        info.set_margin_top(6); info.set_margin_bottom(6)
+        info.set_margin_start(6)
+        name = Gtk.Label(xalign=0, label=short(repo))
+        name.get_style_context().add_class('repo')
+        name.set_selectable(True)
+        info.pack_start(name, False, False, 0)
+        if kind == 'project':
+            sub = 'whole project muted'
+        else:
+            sub = 'this changeset muted'
+        if st:
+            extra = []
+            if st['n_uncommitted']:
+                extra.append(f"{st['n_uncommitted']} uncommitted")
+            if st['n_unpushed']:
+                extra.append(f"{st['n_unpushed']} unpushed")
+            if extra:
+                sub += '  ·  ' + ', '.join(extra)
+        sublab = Gtk.Label(xalign=0, label=sub)
+        sublab.get_style_context().add_class('muted')
+        info.pack_start(sublab, False, False, 0)
+        row.pack_start(info, True, True, 0)
+
+        b_show = Gtk.Button(label='Show again')
+        b_show.set_tooltip_text('Un-ignore and move back to Pending')
+        b_show.set_margin_end(6)
+
+        def on_show(_):
+            ig = load_ignored()
+            if kind == 'project':
+                if repo in ig.get('projects', []):
+                    ig['projects'].remove(repo)
+            else:
+                ig.get('states', {}).pop(repo, None)
+            save_ignored(ig)
+            refresh()
+
+        b_show.connect('clicked', on_show)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.set_valign(Gtk.Align.CENTER)
+        box.pack_start(b_show, False, False, 0)
+        row.pack_end(box, False, False, 0)
+        return row
+
+    def update_repo(repo):
+        new = None
+        try:
+            new = repo_state(repo)
+        except Exception:
+            new = None
+        all_states[:] = [s for s in all_states if s['repo'] != repo]
+        if new:
+            all_states.append(new)
+
+    def clear(box):
+        for ch in box.get_children():
+            box.remove(ch)
+
+    def refresh():
+        ig = load_ignored()
+        projects = set(ig.get('projects', []))
+        states = ig.get('states', {})
+        by_repo = {s['repo']: s for s in all_states}
+
+        # --- Pending tab ---
+        clear(pending_box)
+        pend = [s for s in sorted(all_states, key=lambda s: s['repo'])
+                if s['repo'] not in projects
+                and states.get(s['repo']) != s['fp']]
+        if not pend:
+            lbl = Gtk.Label(xalign=0,
+                            label='Nothing pending — all clear. 🎉')
+            lbl.set_margin_top(12)
+            pending_box.pack_start(lbl, False, False, 0)
+        for st in pend:
+            pending_box.pack_start(make_pending_card(st), False, False, 0)
+
+        # --- Ignored tab ---
+        clear(ignored_box)
+        rows = []
+        for repo in sorted(projects):
+            rows.append((repo, 'project', by_repo.get(repo)))
+        for repo in sorted(states):
+            st = by_repo.get(repo)
+            if st and st['fp'] == states[repo]:   # still hidden by this state
+                rows.append((repo, 'state', st))
+        if not rows:
+            lbl = Gtk.Label(xalign=0, label='Nothing ignored.')
+            lbl.set_margin_top(12)
+            ignored_box.pack_start(lbl, False, False, 0)
+        for repo, kind, st in rows:
+            ignored_box.pack_start(make_ignored_row(repo, kind, st),
+                                   False, False, 0)
+
+        tab_pending.set_text(f'Pending ({len(pend)})')
+        tab_ignored.set_text(f'Ignored ({len(rows)})')
+        win.show_all()
+
+    refresh()
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# theme accent (borrowed from wallpaper rotation, like claude-ask)
+# --------------------------------------------------------------------------- #
+def current_accent():
+    ORDER = ['green', 'blue', 'purple', 'red', 'gold', 'brown', 'wood']
+    ACCENTS = {'green': '#4ade80', 'blue': '#60a5fa', 'purple': '#c084fc',
+               'red': '#f87171', 'gold': '#fbbf24', 'brown': '#d2a679',
+               'wood': '#deb887'}
+    try:
+        p = os.path.expanduser('~/.local/state/desktop-rotation/index')
+        idx = int(open(p).read().strip())
+        return ACCENTS[ORDER[idx % len(ORDER)]]
+    except Exception:
+        return '#c084fc'
+
+
+# --------------------------------------------------------------------------- #
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else 'scan'
+    if mode == 'scan':
+        return do_scan()
+    if mode == 'window':
+        return do_window()
+    if mode == 'list':           # debug helper
+        for st in actionable_repos():
+            print(f"{short(st['repo'])}: {st['n_uncommitted']} uncommitted, "
+                  f"{st['n_unpushed']} unpushed")
+        return 0
+    sys.stderr.write(f'unknown mode: {mode}\n')
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

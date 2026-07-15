@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily 08:00 git morning check
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+Persistent=true
+AccuracySec=2min
+
+[Install]
+WantedBy=timers.target
