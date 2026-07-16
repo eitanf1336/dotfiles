@@ -17,7 +17,18 @@ done
 echo "==> python tools"
 # chats.py lives under ~/.claude/chats (its state files are written alongside it)
 mkdir -p "$HOME/.claude/chats"
-ln -sf "$REPO/python/chats.py" "$HOME/.claude/chats/chats.py"
+# Sessions sometimes replace that symlink with a real file and then edit it in
+# place, so the live file can hold work the repo copy has never seen. A plain
+# `ln -sf` here silently destroyed ~13KB of such work once. Never clobber it.
+LIVE_CHATS="$HOME/.claude/chats/chats.py"
+if [ -f "$LIVE_CHATS" ] && [ ! -L "$LIVE_CHATS" ] \
+   && ! cmp -s "$LIVE_CHATS" "$REPO/python/chats.py"; then
+    echo "    SKIP chats.py: $LIVE_CHATS is a local file that differs from the"
+    echo "         repo copy, so it is left alone. To adopt it into the repo:"
+    echo "           cp $LIVE_CHATS $REPO/python/chats.py && git -C $REPO diff"
+else
+    ln -sf "$REPO/python/chats.py" "$LIVE_CHATS"
+fi
 ln -sf "$REPO/python/claude-ask" "$BIN/claude-ask"
 ln -sf "$BIN/claude-custom" "$BIN/claude-c"
 ln -sf "$BIN/claude-desktop" "$BIN/claude-d"
@@ -38,6 +49,10 @@ for d in "$REPO"/gnome-extensions/*/; do
     fi
     echo "    installed $name"
 done
+
+echo "==> claude-beep chime -> ~/.local/share/claude-beep"
+mkdir -p "$HOME/.local/share/claude-beep"
+cp "$REPO"/sounds/claude-done.wav "$HOME/.local/share/claude-beep/"
 
 echo "==> Sunrise Alarm app -> ~/.local/share/sunrise-alarm"
 APPDIR="$HOME/.local/share/sunrise-alarm"
