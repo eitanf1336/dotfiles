@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Poleg surf-forecast PDF to WhatsApp (Surf Status group)
+Documentation=file://%h/code/surf-desktop/README.md
+
+[Service]
+Type=oneshot
+# user services get a bare PATH; make sure chrome + python are findable
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:%h/.local/bin
+ExecStart=%h/.local/bin/surf-report
+# don't hammer if it fails (e.g. offline) — the once-a-day guard + next trigger cover it
+TimeoutStartSec=180
