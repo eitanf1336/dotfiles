@@ -116,7 +116,57 @@ gsettings set "$k" name 'Sunrise Alarm'
 gsettings set "$k" binding '<Control><Shift>a'
 gsettings set "$k" command '/home/eitan/.local/bin/sunrise-alarm'
 
-# register the list of paths
+paths+=("/portfolio/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/portfolio/"
+gsettings set "$k" name 'Portfolio + surf desktop panels'
+gsettings set "$k" binding '<Control><Shift>m'
+gsettings set "$k" command '/home/eitan/.local/bin/panels'
+
+paths+=("/surf/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/surf/"
+gsettings set "$k" name 'Surf forecast widget'
+gsettings set "$k" binding '<Control><Shift>w'
+gsettings set "$k" command '/home/eitan/.local/bin/surf --widget'
+
+# Spotify transport on Ctrl+Super+arrows. These drive spotify-skip over MPRIS
+# and are deliberately NOT the XF86Audio* media keys, which the laptop lacks.
+paths+=("/spotify-next/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/spotify-next/"
+gsettings set "$k" name 'Spotify Next Track'
+gsettings set "$k" binding '<Control><Super>Right'
+gsettings set "$k" command '/home/eitan/.local/bin/spotify-skip next'
+
+paths+=("/spotify-prev/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/spotify-prev/"
+gsettings set "$k" name 'Spotify Previous Track'
+gsettings set "$k" binding '<Control><Super>Left'
+gsettings set "$k" command '/home/eitan/.local/bin/spotify-skip prev'
+
+paths+=("/spotify-play/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/spotify-play/"
+gsettings set "$k" name 'Spotify Play'
+gsettings set "$k" binding '<Control><Super>Up'
+gsettings set "$k" command '/home/eitan/.local/bin/spotify-skip play'
+
+paths+=("/spotify-pause/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/spotify-pause/"
+gsettings set "$k" name 'Spotify Pause'
+gsettings set "$k" binding '<Control><Super>Down'
+gsettings set "$k" command '/home/eitan/.local/bin/spotify-skip pause'
+
+# Register the list of paths. MERGE with whatever is already registered rather
+# than replacing it: a plain overwrite silently orphans any shortcut added since
+# this script was last edited (added via GNOME Settings, or by a tool that wrote
+# its own dconf entry). An orphaned entry still exists in dconf and still shows
+# in GNOME Settings, but gsd-media-keys never grabs it, so the key just dies --
+# which is exactly how the Spotify/portfolio/surf binds were lost.
+existing=$(gsettings get $BASE custom-keybindings)
+while read -r p; do
+    [ -n "$p" ] || continue
+    for have in "${paths[@]}"; do [ "$have" = "$p" ] && continue 2; done
+    paths+=("$p")
+done < <(echo "$existing" | tr ',' '\n' | sed "s|.*/custom-keybindings||; s|[]['\" ]||g" | grep -v '^$')
+
 arr="["
 for p in "${paths[@]}"; do arr="$arr'$p', "; done
 arr="${arr%, }]"
