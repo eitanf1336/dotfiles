@@ -122,12 +122,6 @@ gsettings set "$k" name 'Portfolio + surf desktop panels'
 gsettings set "$k" binding '<Control><Shift>m'
 gsettings set "$k" command '/home/eitan/.local/bin/panels'
 
-paths+=("/surf/")
-k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/surf/"
-gsettings set "$k" name 'Surf forecast widget'
-gsettings set "$k" binding '<Control><Shift>w'
-gsettings set "$k" command '/home/eitan/.local/bin/surf --widget'
-
 # Spotify transport on Ctrl+Super+arrows. These drive spotify-skip over MPRIS
 # and are deliberately NOT the XF86Audio* media keys, which the laptop lacks.
 paths+=("/spotify-next/")
