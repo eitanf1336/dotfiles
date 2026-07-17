@@ -50,10 +50,6 @@ for d in "$REPO"/gnome-extensions/*/; do
     echo "    installed $name"
 done
 
-echo "==> claude-beep chime -> ~/.local/share/claude-beep"
-mkdir -p "$HOME/.local/share/claude-beep"
-cp "$REPO"/sounds/claude-done.wav "$HOME/.local/share/claude-beep/"
-
 echo "==> Sunrise Alarm app -> ~/.local/share/sunrise-alarm"
 APPDIR="$HOME/.local/share/sunrise-alarm"
 mkdir -p "$APPDIR"
