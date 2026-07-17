@@ -1,10 +1,11 @@
-// Claude Beep: a "Sleeping" toggle in the quick settings panel, next to the
-// power button. While it is on, ~/.local/bin/claude-beep (the Stop hook that
-// chimes when a Claude session finishes writing) keeps quiet.
+// Sleep Mode: a "Sleeping" toggle in the quick settings panel, next to the
+// power button, for when you go to bed. It is a machine-wide switch rather than
+// any one app's setting, and tools opt in by checking it.
 //
-// The state is a marker file rather than a gsetting so the hook can test it
-// with [ -e ] and no dconf round-trip. The file is watched both ways, so
-// `claude-beep --sleep on` from a terminal moves the toggle too.
+// The state is a marker file rather than a gsetting so a shell script can test
+// it with [ -e ] and no dconf round-trip. The `sleeping` command owns that file;
+// this watches it, so flipping it from a terminal moves the toggle, and vice
+// versa.
 
 import GObject from 'gi://GObject';
 import Gio from 'gi://Gio';
@@ -16,7 +17,7 @@ import {QuickToggle, SystemIndicator}
     from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
 const STATE_DIR = GLib.build_filenamev(
-    [GLib.get_user_state_dir(), 'claude-beep']);
+    [GLib.get_user_state_dir(), 'sleep-mode']);
 const STATE_FILE = GLib.build_filenamev([STATE_DIR, 'sleeping']);
 const ICON = 'weather-clear-night-symbolic';
 
@@ -36,7 +37,7 @@ class SleepIndicator extends SystemIndicator {
     constructor() {
         super();
 
-        // Only shown while sleeping, as a reminder that chimes are muted.
+        // Only shown while sleeping, as a reminder that things are muted.
         this._icon = this._addIndicator();
         this._icon.iconName = ICON;
 
@@ -45,7 +46,7 @@ class SleepIndicator extends SystemIndicator {
     }
 });
 
-export default class ClaudeBeepExtension extends Extension {
+export default class SleepModeExtension extends Extension {
     enable() {
         this._writing = false;
         this._indicator = new SleepIndicator();
@@ -64,7 +65,7 @@ export default class ClaudeBeepExtension extends Extension {
                 .monitor_file(Gio.FileMonitorFlags.NONE, null);
             this._monitor.connect('changed', () => this._sync());
         } catch (e) {
-            logError(e, 'claude-beep: could not watch the sleeping file');
+            logError(e, 'sleep-mode: could not watch the sleeping file');
         }
 
         this._sync();
@@ -92,9 +93,7 @@ export default class ClaudeBeepExtension extends Extension {
 
     _render() {
         const sleeping = this._toggle.checked;
-        this._toggle.subtitle = sleeping
-            ? 'shhh… Claude is tiptoeing'
-            : 'Claude will chirp when done';
+        this._toggle.subtitle = sleeping ? 'shhh… quiet hours' : null;
         this._indicator._icon.visible = sleeping;
     }
 
@@ -111,7 +110,7 @@ export default class ClaudeBeepExtension extends Extension {
         } catch (e) {
             // Already gone is the state we wanted anyway.
             if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
-                logError(e, 'claude-beep: could not update the sleeping file');
+                logError(e, 'sleep-mode: could not update the sleeping file');
         }
     }
 }

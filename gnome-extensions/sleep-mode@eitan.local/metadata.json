@@ -1,0 +1,7 @@
+{
+  "uuid": "sleep-mode@eitan.local",
+  "name": "Sleep Mode",
+  "description": "Adds a \"Sleeping\" toggle to the quick settings panel (next to the power button) for when you go to bed, and shows a moon in the top bar while it is on. It is a machine-wide switch that any tool can respect: flip it from here or with the `sleeping` command, and check it from a script with `sleeping -q`.",
+  "shell-version": ["47", "48", "49", "50"],
+  "session-modes": ["user"]
+}

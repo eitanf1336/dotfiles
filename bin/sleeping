@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# sleeping: the machine-wide "I'm asleep, keep quiet" switch.
+#
+# One marker file that any tool can check, flipped either from here or from the
+# Sleeping toggle in the GNOME quick settings panel (the sleep-mode@eitan.local
+# extension). This script owns the file; everything else just reads it.
+#
+#   sleeping                 print the current state
+#   sleeping on|off|toggle   set it
+#   sleeping -q              exit 0 while sleeping, 1 while awake (for scripts)
+#
+# To make a new tool respect it, either call `sleeping -q` or test the file:
+#
+#   [ -e "${XDG_STATE_HOME:-$HOME/.local/state}/sleep-mode/sleeping" ]
+#
+# The toggle watches the file, so it follows changes made here, and vice versa.
+set -uo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/sleep-mode"
+SLEEP_FILE="$STATE_DIR/sleeping"
+
+sleeping() { [ -e "$SLEEP_FILE" ]; }
+
+report() {
+    if sleeping; then echo "sleeping"; else echo "awake"; fi
+}
+
+case "${1:-status}" in
+    on)     mkdir -p "$STATE_DIR"; : > "$SLEEP_FILE"; report ;;
+    off)    rm -f "$SLEEP_FILE"; report ;;
+    toggle) if sleeping; then rm -f "$SLEEP_FILE"; else mkdir -p "$STATE_DIR"; : > "$SLEEP_FILE"; fi
+            report ;;
+    status|'') report ;;
+    -q|--quiet) sleeping ;;
+    -h|--help)  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *)      printf 'sleeping: unknown argument %s (try --help)\n' "$1" >&2; exit 2 ;;
+esac

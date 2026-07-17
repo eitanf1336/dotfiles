@@ -1,7 +1,0 @@
-{
-  "uuid": "claude-beep@eitan.local",
-  "name": "Claude Beep",
-  "description": "Adds a \"Sleeping\" toggle to the quick settings panel (next to the power button). While it is on, the chime that Claude plays when a session finishes writing stays quiet, and a moon shows in the top bar as a reminder. The toggle is a marker file, so `claude-beep --sleep on|off` flips the same switch from a terminal.",
-  "shell-version": ["47", "48", "49", "50"],
-  "session-modes": ["user"]
-}
