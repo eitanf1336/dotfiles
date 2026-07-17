@@ -78,6 +78,13 @@ for f in "$REPO"/applications/*.desktop; do
     ln -sf "$f" "$APPS/$(basename "$f")"
 done
 
+echo "==> wireplumber drop-ins -> ~/.config/wireplumber/wireplumber.conf.d"
+WPCONF="$HOME/.config/wireplumber/wireplumber.conf.d"
+mkdir -p "$WPCONF"
+for f in "$REPO"/wireplumber/*.conf; do
+    ln -sf "$f" "$WPCONF/$(basename "$f")"
+done
+
 echo "==> keybindings"
 bash "$REPO/keybindings/restore-keybindings.sh" || true
 

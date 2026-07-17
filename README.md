@@ -70,6 +70,13 @@ In `bin/` (installed to `~/.local/bin`):
 - `rotate-bg.timer` + `rotate-bg.service` advance the wallpaper/terminal theme automatically every day at midnight.
 - `git-morning-check.timer` + `git-morning-check.service` run the git pending-work check every day at 08:00.
 
+## 🔊 Audio
+
+`wireplumber/` — drop-in configs symlinked into `~/.config/wireplumber/wireplumber.conf.d/`.
+
+### `51-displaylink-audio-buffer.conf`
+Fixes Spotify/audio stuttering while the DisplayLink dock is driving the screens. The DL6950 (`17e9:6000`) is a **single USB device carrying both video and audio**: `/opt/displaylink/DisplayLinkManager` pushes the compressed framebuffer over the same link the sound goes out on, so screen-update bursts starve the isochronous audio endpoints and the stream xruns. The drop-in gives that sink a deeper ALSA buffer (`periods = 4`, `headroom = 8192`, `node.latency = 2048/48000`) so it can ride out the bursts. If dropouts ever persist through this, the real cure is to stop sharing the link: switch output to the built-in analog jack or the HyperX headset, which sit on a different USB bus.
+
 ## 🚀 Autostart
 
 `autostart/` — XDG autostart entries dropped into `~/.config/autostart/` (honored by GNOME on Wayland, where the session manager no longer relaunches apps after logout).
