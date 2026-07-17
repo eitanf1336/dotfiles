@@ -167,8 +167,13 @@ while read -r p; do
     paths+=("$p")
 done < <(echo "$existing" | tr ',' '\n' | sed "s|.*/custom-keybindings||; s|[]['\" ]||g" | grep -v '^$')
 
+# Emit FULL dconf paths, the canonical form GNOME Settings itself writes.
+# gsd-media-keys happens to tolerate the bare '/rotate-bg/' form this script
+# used to write, but anything that addresses the per-binding schema as
+# "<schema>.custom-keybinding:<path>" (GNOME Settings, keys-cheatsheet) can only
+# resolve a full path, and silently sees no shortcuts at all with the bare form.
 arr="["
-for p in "${paths[@]}"; do arr="$arr'$p', "; done
+for p in "${paths[@]}"; do arr="$arr'$PREFIX$p', "; done
 arr="${arr%, }]"
 gsettings set $BASE custom-keybindings "$arr"
 echo "Restored ${#paths[@]} keybindings."
