@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# run-once-term — pop a terminal, read ONE command, run it, close when it ends.
+# run-once-term — pop a terminal, read ONE command, run it, then close (lingering
+# a beat so a GUI app it launched has time to surface before the window vanishes).
 # Bound to Ctrl+Alt+R (GNOME custom keybinding). See ~/.claude memory: launchers-must-detach.
 # Looks like the normal Ptyxis terminal but with a red border (private GTK css).
 
@@ -11,9 +12,25 @@ if [ "$1" = "__inner" ]; then
     IFS= read -e -r -p $'\033[1;31mRun \342\226\270 \033[0m' cmd || exit 0
     [ -z "$cmd" ] && exit 0
     # -i so aliases/functions from ~/.bashrc work (e.g. the `gemini` function),
-    # exactly like a normal interactive terminal. exec ties the window's life to
-    # the command: it closes the instant the command stops running.
-    exec bash -ic "$cmd"
+    # exactly like a normal interactive terminal.
+    bash -ic "$cmd"
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        # Failure: hold the window open so the error is readable.
+        printf '\n\033[1;31m[exited with status %d] press Enter to close \033[0m' "$status"
+        read -r _
+    else
+        # Success: DON'T slam the window shut. Many GUI apps are single-instance,
+        # so launching one just asks the already-running copy to raise its window;
+        # on GNOME Wayland that raise only lands while a recently-focused window is
+        # still alive. Closing instantly kills that grace window, so the app "never
+        # comes to the front" (this is exactly why whatsapp/gemini failed to open
+        # from here but work from a normal terminal that stays open). Linger a beat
+        # so the app can surface. Press Enter to close immediately; override the
+        # delay with RUN_ONCE_LINGER (seconds).
+        read -t "${RUN_ONCE_LINGER:-2}" -r _ 2>/dev/null || true
+    fi
+    exit "$status"
 fi
 
 # --- launch path -----------------------------------------------------------
