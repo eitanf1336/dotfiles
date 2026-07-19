@@ -1,3 +1,15 @@
 #!/usr/bin/env bash
-# Launch WhatsApp (ZapZap — a WhatsApp Web desktop client) from the terminal.
-exec flatpak run com.rtosta.zapzap "$@"
+# Launch or raise WhatsApp (ZapZap, a WhatsApp Web desktop client).
+#
+# Uses gtk-launch instead of a bare `flatpak run` on purpose. ZapZap is a
+# single-instance app: a second `flatpak run` just tells the already-running
+# copy to raise its window, then exits. On GNOME Wayland that raise only
+# succeeds if the request carries a valid xdg-activation token. A bare
+# `flatpak run` fired from a launcher window that closes instantly (Ctrl+Alt+R
+# run-once-term) has no token, so Mutter's focus-stealing prevention silently
+# refuses to bring the window forward and WhatsApp "never opens". gtk-launch
+# asks the compositor for an activation token, so the window is actually raised.
+#
+# setsid -f fully detaches it from the terminal (see memory: launchers-must-detach)
+# so closing the launcher window can't tear it down.
+setsid -f gtk-launch com.rtosta.zapzap "$@" >/dev/null 2>&1
