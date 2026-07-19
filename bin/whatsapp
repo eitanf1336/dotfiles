@@ -10,6 +10,6 @@
 # refuses to bring the window forward and WhatsApp "never opens". gtk-launch
 # asks the compositor for an activation token, so the window is actually raised.
 #
-# setsid -f fully detaches it from the terminal (see memory: launchers-must-detach)
-# so closing the launcher window can't tear it down.
-setsid -f gtk-launch com.rtosta.zapzap "$@" >/dev/null 2>&1
+# detach fully separates it from the terminal (see the `detach` helper) so
+# closing the launcher window can't tear it down.
+exec detach gtk-launch com.rtosta.zapzap "$@"
