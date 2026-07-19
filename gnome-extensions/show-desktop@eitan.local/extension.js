@@ -58,17 +58,22 @@ export default class ShowDesktopExtension extends Extension {
 
     // Skip the panels themselves and the desktop-icons window: they set
     // skip-taskbar, and they are the whole point of exposing the desktop.
-    _shouldHide(w) {
+    // Only touch windows on the primary monitor: the panels live there, so
+    // there is no reason to minimise whatever the user has open on the other
+    // screens. `primary` is the primary monitor index (see Show()).
+    _shouldHide(w, primary) {
         return !w.minimized && !w.skip_taskbar && w.can_minimize() &&
-               w.get_window_type() === Meta.WindowType.NORMAL;
+               w.get_window_type() === Meta.WindowType.NORMAL &&
+               w.get_monitor() === primary;
     }
 
     Show() {
         if (this.Showing)
             return;
 
+        const primary = global.display.get_primary_monitor();
         const ws = global.workspace_manager.get_active_workspace();
-        const windows = ws.list_windows().filter(w => this._shouldHide(w));
+        const windows = ws.list_windows().filter(w => this._shouldHide(w, primary));
 
         // Bottom-to-top, so Restore can replay the same order and hand back the
         // stack the user had rather than a reshuffled one.
