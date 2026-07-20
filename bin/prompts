@@ -566,11 +566,20 @@ GUI_PIDFILE = os.path.expanduser('~/.local/state/prompts/gui.pid')
 
 
 def _pid_alive(pid):
+    # Also confirm the pid really is our popup: a hard kill (SIGKILL, crash,
+    # logout) leaves the pidfile behind, and once the OS recycles that number
+    # onto an unrelated process the toggle would signal *it* and return without
+    # ever showing a window, i.e. the shortcut looks dead.
     try:
         os.kill(pid, 0)
-        return True
     except Exception:
         return False
+    try:
+        with open('/proc/%d/cmdline' % pid, 'rb') as f:
+            cmdline = f.read().decode('utf-8', 'replace')
+    except Exception:
+        return False
+    return 'prompts' in cmdline and 'gui' in cmdline
 
 
 def cmd_gui(args):

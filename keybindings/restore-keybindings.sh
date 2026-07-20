@@ -20,7 +20,7 @@ gsettings set "$k" command '/home/eitan/.local/bin/claude-ask'
 paths+=("/prompts/")
 k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/prompts/"
 gsettings set "$k" name 'Prompts library (popup)'
-gsettings set "$k" binding '<Control><Shift>l'
+gsettings set "$k" binding '<Control><Shift>p'
 gsettings set "$k" command '/home/eitan/.local/bin/prompts gui'
 
 paths+=("/fix-screen/")
