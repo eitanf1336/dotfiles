@@ -32,7 +32,9 @@ Keys:
                sections (it expands the section it lands in).
   P            projects panel — switch active project, add a folder, rename,
                remove. The active project filters the board and is where new
-               chats start.
+               chats start. Inside the panel: h hides (or unhides) the selected
+               project, dropping it from the list and its chats from the "all
+               projects" board; Ctrl+H toggles showing the hidden ones.
   d            delete the selected chat permanently (asks to confirm)
   Ctrl+R       reload this script (pick up edits without restarting)
   q            quit
@@ -228,6 +230,10 @@ def load_moved():
 PROJECTS_STORE = HOME / ".claude" / "chats" / "projects.json"
 COLLAPSE_STORE = HOME / ".claude" / "chats" / "collapsed.json"
 PROJECT_TAGS_STORE = HOME / ".claude" / "chats" / "chat_projects.json"
+# Persisted user preferences for the board itself (not per-chat). Currently just
+# the default thinking level offered when creating a new chat, settable from the
+# effort picker with 'd<n>'.
+SETTINGS_STORE = HOME / ".claude" / "chats" / "settings.json"
 
 # old sessionId -> new sessionId for chats that were reopened by resuming them
 # into a fresh BACKGROUND agent (so Ctrl+Z detaches instead of killing the work).
@@ -314,6 +320,48 @@ def _is_noise(text):
     return t.startswith(noise_prefixes)
 
 
+COMPACT_MARKER = "This session is being continued"
+
+
+def _all_uuids(path):
+    """Every message uuid in a transcript. Only ever called for the handful of
+    unlinked compact-continuations, so the full read is affordable."""
+    out = set()
+    try:
+        with path.open() as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(d, dict) and d.get("uuid"):
+                    out.add(d["uuid"])
+    except OSError:
+        pass
+    return out
+
+
+def _tail_last_uuid(path, tail=262144):
+    """The LAST message uuid, read from the end of the file so it stays cheap on a
+    multi-MB transcript. (A truncated first line just fails to parse and is skipped.)"""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            fh.seek(max(0, size - tail))
+            chunk = fh.read().decode("utf-8", "ignore")
+    except OSError:
+        return None
+    last = None
+    for line in chunk.split("\n"):
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(d, dict) and d.get("uuid"):
+            last = d["uuid"]
+    return last
+
+
 def parse_chat(path):
     """Return dict(id, cwd, title, ai_title, mtime) or None if unreadable/empty."""
     session_id = path.stem
@@ -351,6 +399,12 @@ def parse_chat(path):
         "cwd": cwd or "(unknown)",
         "title": title,
         "ai_title": ai_title,
+        # Claude auto-continues a full chat in a NEW session whose first message is
+        # its "continued from a previous conversation" summary. Free to detect here
+        # (it's just the first user text we already read) and the only signal that
+        # separates a real auto-continuation from a fork/copy, which starts with the
+        # original's own first message instead.
+        "compact_child": title.startswith(COMPACT_MARKER),
         "mtime": path.stat().st_mtime,
         "path": path,
     }
@@ -408,6 +462,41 @@ def agents_active():
         return {}
     return {x["sessionId"]: x for x in data
             if isinstance(x, dict) and x.get("sessionId")}
+
+
+def session_file(full_id):
+    """Path to a session's transcript on disk, or None. A freshly bg-resumed
+    agent writes NO file until it actually produces a turn, so absence here means
+    'opened but nothing was written'."""
+    if not full_id:
+        return None
+    for f in PROJECTS_DIR.glob(f"*/{full_id}.jsonl"):
+        return f
+    return None
+
+
+def session_has_user_turn(full_id):
+    """True only if this session's transcript contains a genuine user message —
+    not merely an auto 'continued from a previous conversation' summary turn. Used
+    to decide whether a resume produced real content (so it should supersede the
+    original) or was opened and abandoned (so we must NOT hide the original)."""
+    f = session_file(full_id)
+    if not f:
+        return False
+    try:
+        for line in f.open():
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("type") != "user":
+                continue
+            text = _text_from_content((o.get("message") or {}).get("content"))
+            if text and not text.startswith("This session is being continued"):
+                return True
+    except OSError:
+        return False
+    return False
 
 
 def job_tempo_map():
@@ -552,7 +641,9 @@ class App:
         self.store = load_store()
         self.names = load_names()  # sessionId -> user's custom name
         self.moved = load_moved()  # sessionId -> ts it was last (re)filed
-        self.superseded = set(load_superseded())  # old ids hidden after bg-resume
+        self.superseded_map = load_superseded()   # old id -> continuation id (bg-resume)
+        self.superseded = set(self.superseded_map)  # old ids hidden after bg-resume
+        self._autolink_tried = set()  # compact children we've already tried to link
         self._last_move = None     # (id, prev_cat, prev_ts) — for `u` undo
         self._search = ""          # last `/` query, so / repeats find the next hit
         self._chat_cache = {}   # path -> parsed chat dict (title/cwd are stable)
@@ -572,6 +663,12 @@ class App:
         pj = _load_json(PROJECTS_STORE)
         self.projects_added = pj.get("list", {})   # key -> custom display name
         self.project_cwds = pj.get("cwds", {})     # virtual project key -> default cwd
+        # Projects you've hidden ('h' in the P panel): they drop out of the
+        # projects list and their chats drop out of the "All projects" board, so
+        # one-off folders stop cluttering the view. Nothing is deleted: Ctrl+H
+        # in the panel reveals them again, and 'h' unhides the selected one.
+        self.hidden_projects = set(pj.get("hidden", []))
+        self.show_hidden = bool(pj.get("show_hidden", False))
         self.tags = load_project_tags()            # sessionId -> project key override
         if "active" not in pj:                      # first run -> default to home
             self.active_project = str(HOME)
@@ -731,6 +828,61 @@ class App:
         # stop / fork / attach. Only truly-closed sessions resume directly.
         self.live_ids = set(active.keys())
 
+    def _autolink_compacts(self, cache):
+        """When a chat runs out of context Claude continues it in a BRAND-NEW
+        session. That continuation inherits the same ai-title but nothing links it
+        to the chat it came from, so the two sit side by side as duplicates for
+        ever (this is what produced "Add NASA rovers" three times). Link them, so
+        only the newest one shows — the same dedup a normal resume already gets.
+
+        Deliberately narrow, because hiding a chat wrongly is the worst thing this
+        tool can do:
+          * ONLY true compact-continuations (`compact_child`). A fork or a plain
+            full-history copy starts with the ORIGINAL's first message, not a
+            summary, and is indistinguishable from a deliberate second copy — so
+            those are never touched.
+          * The parent must be PROVEN, not guessed: its last message must appear
+            inside the child. Unrelated same-title chats share no messages at all
+            and are correctly left alone.
+          * A child inherits its ancestors' summaries, so several ancestors can
+            match; take the most RECENT one, which is the immediate parent.
+        """
+        smap = getattr(self, "superseded_map", {})
+        tags = getattr(self, "tags", {})
+        chats = list(cache.values())
+        already = set(smap.values())          # something already points at it
+        # Attempt each child at most once per run: a child whose parent can't be
+        # proven would otherwise re-read its (multi-MB) transcript on every ~2s
+        # tick, forever. Its parent always predates it, so one attempt is enough.
+        tried = self._autolink_tried
+        children = [c for c in chats
+                    if c.get("compact_child")
+                    and c["id"] not in already and c["id"] not in tried]
+        if not children:
+            return                            # fast path: nothing to do (the norm)
+        for child in children:
+            tried.add(child["id"])
+            ckey = child.get("ai_title") or child.get("title")
+            cands = [p for p in chats
+                     if p["id"] != child["id"]
+                     and p["id"] not in smap
+                     and (p.get("ai_title") or p.get("title")) == ckey
+                     and project_key_for(p, tags) == project_key_for(child, tags)
+                     and p["mtime"] <= child["mtime"]]
+            if not cands:
+                continue
+            kid_uuids = _all_uuids(child["path"])
+            if not kid_uuids:
+                continue
+            anc = [p for p in cands
+                   if (_tail_last_uuid(p["path"]) or "\0") in kid_uuids]
+            if not anc:
+                continue
+            parent = max(anc, key=lambda p: p["mtime"])   # immediate ancestor
+            self.superseded_map = _json_set(
+                SUPERSEDED_STORE, parent["id"], child["id"])
+            smap = self.superseded_map
+
     def rescan(self):
         """Re-scan ~/.claude/projects for chat files and refresh self.all_chats.
         Incremental: a chat's title/cwd never change once written, so we only
@@ -763,10 +915,66 @@ class App:
         for p in list(cache):  # drop files that were deleted on disk
             if p not in seen:
                 del cache[p]
+        # Link any auto-compact continuation to the chat it came from, so Claude
+        # silently splitting a full chat doesn't leave a duplicate on the board.
+        self._autolink_compacts(cache)
         # Hide chats that were resumed into a fresh background session (their
         # continuation carries the same name/category), so the old pre-resume
         # entry doesn't linger next to it as a duplicate.
-        hidden = getattr(self, "superseded", set())
+        #
+        # THE INVARIANT (learned the hard way, three times): a chat may be hidden
+        # ONLY when a real replacement is actually visible in the SAME project.
+        # Never hide a chat behind something the user can't see in its place.
+        # A `--bg --resume` records `old -> new` immediately, but the new bg
+        # session's .jsonl doesn't exist until the agent emits output, the agent
+        # can die / stay idle forever / mis-parse its id, and the continuation can
+        # even land in a DIFFERENT project (a worktree, another cwd). Hiding `old`
+        # in any of those cases makes it vanish from its project with nothing to
+        # replace it. So we hide `old` only when its supersede chain reaches an
+        # on-disk continuation whose project key equals old's. Everything else
+        # (dangling, still-being-born, cross-project) stays visible.
+        #
+        # SELF-HEAL: separately, permanently prune from superseded.json any entry
+        # whose whole chain is BOTH absent on disk AND not a live agent — it's
+        # never coming back. The locked write-back means even OTHER running
+        # claude-c instances stop honoring the stale pointer within one ~2s tick.
+        smap = getattr(self, "superseded_map", {})
+        tags = getattr(self, "tags", {})
+        live_ids = getattr(self, "live_ids", set())
+        have_live = getattr(self, "_agents_ts", 0) > 0  # queried agents at least once
+        by_id = {c["id"]: c for c in cache.values()}    # only sessions with a file
+
+        def pkey(cid):
+            c = by_id.get(cid)
+            return project_key_for(c, tags) if c else None
+
+        hidden = set()
+        dead = set()
+        for old in smap:
+            chain = set()
+            nxt = smap.get(old)
+            head_file = None       # first continuation in the chain that has a file
+            reached_live = False
+            while nxt and nxt not in chain:
+                chain.add(nxt)
+                if nxt in by_id:
+                    head_file = nxt
+                    break
+                if nxt in live_ids:
+                    reached_live = True
+                nxt = smap.get(nxt)
+            if head_file is not None:
+                # Only hide when old itself is on disk AND its continuation is in
+                # the same project — otherwise old would disappear from its view.
+                if old in by_id and pkey(head_file) == pkey(old):
+                    hidden.add(old)
+            elif have_live and not reached_live:
+                dead.add(old)                    # continuation gone for good -> prune
+        if dead:
+            # Locked write-back; harmless/idempotent if a peer prunes the same keys.
+            self.superseded_map = _json_update(
+                SUPERSEDED_STORE, lambda d: [d.pop(k, None) for k in dead])
+        self.superseded = hidden
         self.all_chats = sorted(
             (c for c in cache.values() if c["id"] not in hidden),
             key=lambda c: c["mtime"], reverse=True)
@@ -895,11 +1103,22 @@ class App:
         return [(None, "All projects (no filter)")] + [(k, self.project_name(k))
                                                        for k in ordered]
 
+    def panel_project_list(self):
+        """project_list() minus the hidden projects: what the P panel shows.
+        Ctrl+H (self.show_hidden) reveals them; the ACTIVE project is always
+        listed even when hidden, so the ● marker never goes missing."""
+        if self.show_hidden or not self.hidden_projects:
+            return self.project_list()
+        return [(k, nm) for k, nm in self.project_list()
+                if k not in self.hidden_projects or k == self.active_project]
+
     def _save_projects(self):
         def fn(d):
             d["active"] = self.active_project or "__all__"  # None = explicit "All"
             d["list"] = self.projects_added
             d["cwds"] = self.project_cwds
+            d["hidden"] = sorted(self.hidden_projects)
+            d["show_hidden"] = self.show_hidden
         _json_update(PROJECTS_STORE, fn)
 
     def _add_project(self):
@@ -923,9 +1142,13 @@ class App:
     def _draw_projects(self, items, sel):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
-        self.stdscr.addstr(0, 0, " Projects "[: w - 1], curses.A_BOLD)
+        head = " Projects "
+        if self.hidden_projects:
+            head += (f" ({len(self.hidden_projects)} hidden"
+                     + (", shown" if self.show_hidden else "") + ") ")
+        self.stdscr.addstr(0, 0, head[: w - 1], curses.A_BOLD)
         help_ = ("↑/↓ move   Enter switch-to   n new folder   r rename   "
-                 "o mode   d remove   Esc/q/p back")
+                 "o mode   h hide/unhide   ^H show hidden   d remove   Esc/q/p back")
         self.stdscr.addstr(1, 0, help_[: w - 1], curses.color_pair(8) | curses.A_DIM)
         top = 3
         view_h = max(1, h - top - 1)
@@ -935,7 +1158,12 @@ class App:
             path, name = items[i]
             is_sel = (i == sel)
             active = (path == self.active_project) if path else (not self.active_project)
-            mark = "● " if active else "  "
+            if active:
+                mark = "● "
+            elif path in self.hidden_projects:
+                mark = "◌ "        # hidden: visible only while ^H is on
+            else:
+                mark = "  "
             if path is None:
                 detail = "show every chat"
             else:
@@ -949,9 +1177,13 @@ class App:
                 md = self.read_default_mode(path)
                 if md:
                     detail += f"   ⚙ {md}"
+                if path in self.hidden_projects:
+                    detail += "   (hidden)"
             line = f"{mark}{name:<26.26}  {detail}"
             if is_sel:
                 attr = curses.color_pair(7)
+            elif path in self.hidden_projects:
+                attr = curses.A_DIM
             elif active:
                 attr = curses.color_pair(9) | curses.A_BOLD
             else:
@@ -969,7 +1201,7 @@ class App:
         try:
             while True:
                 self.stdscr.timeout(-1)
-                items = self.project_list()
+                items = self.panel_project_list()
                 sel = max(0, min(sel, len(items) - 1))
                 self._draw_projects(items, sel)
                 k = self.stdscr.getch()
@@ -1012,6 +1244,29 @@ class App:
                         self.message = "Pick a project first to set its mode"
                     else:
                         self.choose_default_mode(path)
+                elif k in (ord("h"), ord("H")):
+                    # Toggle: hide the selected project (it and its chats drop
+                    # out of the board), or unhide it if it's already hidden.
+                    path = items[sel][0]
+                    if path is None:
+                        self.message = "Can't hide 'All projects'"
+                    elif path in self.hidden_projects:
+                        self.hidden_projects.discard(path)
+                        self._save_projects()
+                        self.message = f"Unhidden “{self.project_name(path)}”"
+                    else:
+                        self.hidden_projects.add(path)
+                        self._save_projects()
+                        self.message = (f"Hidden “{self.project_name(path)}” "
+                                        "(^H to show hidden)")
+                        if not self.show_hidden and path != self.active_project:
+                            sel = max(0, sel - 1)  # the row just went away
+                elif k == 8:  # Ctrl+H: show / stop showing hidden projects
+                    self.show_hidden = not self.show_hidden
+                    self._save_projects()
+                    self.message = ("Showing hidden projects"
+                                    if self.show_hidden else "Hiding hidden projects")
+                    sel = 0
                 elif k in (ord("r"), ord("R")):
                     path = items[sel][0]
                     if not path:
@@ -1037,6 +1292,7 @@ class App:
                         if path in self.projects_added:
                             del self.projects_added[path]
                             self.project_cwds.pop(path, None)
+                            self.hidden_projects.discard(path)
                             self._save_projects()
                             removed = True
                         if self.active_project == path:
@@ -1078,6 +1334,11 @@ class App:
         if self.active_project:
             cs = [c for c in cs
                   if project_key_for(c, self.tags) == self.active_project]
+        elif self.hidden_projects and not self.show_hidden:
+            # "All projects" means all the projects you still care about:
+            # chats from hidden ones stay out until Ctrl+H (P panel) shows them.
+            cs = [c for c in cs
+                  if project_key_for(c, self.tags) not in self.hidden_projects]
         return cs
 
     def grouped(self):
@@ -1259,7 +1520,7 @@ class App:
                 self.names = load_names()
                 self.moved = load_moved()
                 self.tags = load_project_tags()
-                self.superseded = set(load_superseded())
+                self.superseded_map = load_superseded()  # rescan() resolves & sets self.superseded
                 new_ids = self.rescan()
                 if sel_chat:  # keep the cursor on the same chat as rows shift
                     self._reselect_id = sel_chat["id"]
@@ -1418,7 +1679,16 @@ class App:
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
         title = " Claude Chats "
-        scope = self.project_name(self.active_project) if self.active_project else "all projects"
+        if self.active_project:
+            scope = self.project_name(self.active_project)
+            if self.active_project in self.hidden_projects:
+                scope += " (hidden)"
+        else:
+            scope = "all projects"
+            if self.hidden_projects:
+                n = len(self.hidden_projects)
+                scope += (f" (incl. {n} hidden)" if self.show_hidden
+                          else f" ({n} hidden)")
         # Header: plain "Claude Chats — N chats  " then the active project drawn
         # in a reverse-video chip so the current project is unmistakable.
         prefix = f"{title}— {len(self.visible_chats())} chats   "
@@ -1432,8 +1702,8 @@ class App:
             except curses.error:
                 pass
         help1 = ("Enter open   / find   Space fold   n new   r rename   m move   "
-                 "o mode   f fork   x stop   1-6 file   u undo   d delete   "
-                 "P projects   ^R reload   q quit")
+                 "o mode   f fork   x stop   1-6 file   u undo   "
+                 "d delete   P projects   ^R reload   q quit")
         self.stdscr.addstr(1, 0, help1[: w - 1], curses.color_pair(8) | curses.A_DIM)
         legend = "  ".join(f"{i+1}:{CATEGORIES[i]}" for i in range(6))
         self.stdscr.addstr(2, 0, legend[: w - 1], curses.A_DIM)
@@ -1532,26 +1802,59 @@ class App:
 EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max", "ultracode"]
 
 
-def prompt_effort(default="high"):
+def load_effort_default():
+    """The persisted default thinking level for new chats. Falls back to
+    'xhigh' when unset or if the stored value is no longer a known level."""
+    d = _load_json(SETTINGS_STORE).get("effort_default")
+    return d if d in EFFORT_LEVELS else "xhigh"
+
+
+def save_effort_default(level):
+    """Persist `level` as the new default thinking level (shared, locked)."""
+    _json_set(SETTINGS_STORE, "effort_default", level)
+
+
+def prompt_effort(default=None):
     """Ask which thinking (reasoning effort) level the new chat should use.
     Returns one of EFFORT_LEVELS. Pressing Enter (or typing anything invalid)
-    picks the default, which is 'high'. Runs after curses has ended, so plain
-    print/input is fine here."""
-    print("\n  Thinking level for this chat:")
-    for i, lv in enumerate(EFFORT_LEVELS, 1):
-        mark = "   ← default" if lv == default else ""
-        print(f"    {i}) {lv}{mark}")
-    try:
-        raw = input(f"  Choose 1-{len(EFFORT_LEVELS)} [Enter = {default}]: ").strip().lower()
-    except EOFError:
+    picks the current default (persisted; initially 'xhigh'). Type 'd<n>'
+    (e.g. d4) or 'd<name>' to make that level the new persisted default and use
+    it for this chat too. Runs after curses has ended, so plain print/input is
+    fine here."""
+    if default is None:
+        default = load_effort_default()
+    while True:
+        print("\n  Thinking level for this chat:")
+        for i, lv in enumerate(EFFORT_LEVELS, 1):
+            mark = "   ← default" if lv == default else ""
+            print(f"    {i}) {lv}{mark}")
+        prompt = (f"  Choose 1-{len(EFFORT_LEVELS)} [Enter = {default}]"
+                  f", or d<n> to set the default: ")
+        try:
+            raw = input(prompt).strip().lower()
+        except EOFError:
+            return default
+        if not raw:
+            return default
+        # 'd<n>' / 'd <n>' / 'd<name>' — persist a new default and use it now.
+        if raw.startswith("d"):
+            arg = raw[1:].strip()
+            new = None
+            if arg.isdigit() and 1 <= int(arg) <= len(EFFORT_LEVELS):
+                new = EFFORT_LEVELS[int(arg) - 1]
+            elif arg in EFFORT_LEVELS:
+                new = arg
+            if new:
+                save_effort_default(new)
+                print(f"  ✓ default is now '{new}'.")
+                return new
+            print(f"  ? use d1-d{len(EFFORT_LEVELS)} or a level name (e.g. d4).")
+            continue
+        if raw.isdigit() and 1 <= int(raw) <= len(EFFORT_LEVELS):
+            return EFFORT_LEVELS[int(raw) - 1]
+        if raw in EFFORT_LEVELS:
+            return raw
         return default
-    if not raw:
-        return default
-    if raw.isdigit() and 1 <= int(raw) <= len(EFFORT_LEVELS):
-        return EFFORT_LEVELS[int(raw) - 1]
-    if raw in EFFORT_LEVELS:
-        return raw
-    return default
 
 
 def create_bg_agent(cwd=None, effort=None):
@@ -1877,6 +2180,10 @@ def main():
 
         title = app.display_title(c)
         run_id = c["id"]  # the session actually run below (bg-resume mints a new one)
+        # If this is a resume, we DON'T hide the original yet — we wait until the
+        # session actually gets a real user turn. pending_resume carries what we'd
+        # need to finalize (hide old) or undo (drop the empty phantom) on return.
+        pending_resume = None  # (old_id, new_full, new_short)
         if action == "attach":
             # Direct attach to the LIVE agent. It keeps running; detach with
             # Ctrl+Z (claude attach handles the keystroke itself) to come back.
@@ -1915,8 +2222,16 @@ def main():
                     old_name = app.names.get(c["id"])
                     if old_name:
                         _json_set(NAMES_STORE, new_full, old_name)
-                    # Continuation replaces the old chat; hide the stale entry.
+                    # Record the link NOW so the original folds away the moment
+                    # the continuation has real content — otherwise the two sit
+                    # side by side as a duplicate for the whole session. This is
+                    # SAFE because rescan()'s guard only actually hides the
+                    # original once the continuation exists on disk: a resume you
+                    # open and never type into writes no file, so it can't hide
+                    # anything. pending_resume lets us undo this on return if the
+                    # resume turned out empty.
                     _json_set(SUPERSEDED_STORE, c["id"], new_full)
+                    pending_resume = (c["id"], new_full, new_short)
                 run_id = new_full
                 last_id = new_full
                 short = new_short
@@ -1965,6 +2280,28 @@ def main():
             print("Could not find the `claude` command on PATH.")
             print(f"Run manually:  cd {cwd} && {' '.join(cmd)}")
             input("Press Enter to return to the menu …")
+
+        # Finalize a resume now that the chat has closed. THE FIX for "I opened a
+        # past chat, wrote nothing, went back, and it vanished": if the resume
+        # never got a real user turn it produced nothing, so tear the whole thing
+        # down — drop the supersede link, stop the empty phantom agent, and clear
+        # its copied metadata — leaving the original exactly as it was, as if it
+        # had never been opened. (rescan()'s guard already keeps the original
+        # visible meanwhile, since an empty resume writes no file to hide it
+        # behind; this just stops the debris from piling up.)
+        if pending_resume:
+            old_id, cont_full, cont_short = pending_resume
+            has_turn = session_has_user_turn(cont_full)
+            if not has_turn:
+                time.sleep(0.4)  # let a just-submitted turn's file land, then re-check
+                has_turn = session_has_user_turn(cont_full)
+            if not has_turn:
+                _json_set(SUPERSEDED_STORE, old_id, None)  # un-link: nothing replaced it
+                stop_agent(cont_short)                     # kill the empty phantom agent
+                _json_set(STORE, cont_full, None)          # drop its copied metadata
+                _json_set(PROJECT_TAGS_STORE, cont_full, None)
+                _json_set(NAMES_STORE, cont_full, None)
+                last_id = old_id  # keep the cursor on the original, not the phantom
 
         if dbg_on:
             after = _agent_snapshot(run_id)
