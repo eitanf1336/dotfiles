@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# claude-whatsapp-doctor — keeps the "My Claude" WhatsApp bot alive.
+#
+# Why this exists: on 2026-07-21 the bot had been dead for hours. The project
+# directory was moved (~/code/claude-whatsapp-bot -> ~/code/claude-stuff/...),
+# which left the systemd unit symlink dangling. Because the *unit file itself*
+# was gone, Restart=always could not help: systemd logged
+# "Failed to schedule restart job: Unit not found" and gave up. The restart
+# counter reached 6619 and nothing ever told the user. Messages sent to the
+# group were silently ignored.
+#
+# So this script does not trust any hardcoded path. It locates bot.py wherever
+# it currently lives, rewrites the unit if it points somewhere stale, repairs
+# the wa-history symlink, and restarts the service. If it cannot fix things it
+# shouts (desktop notification) instead of failing quietly.
+#
+# Run by claude-whatsapp-doctor.timer every 5 minutes, and once at boot.
+
+set -uo pipefail
+
+UNIT=claude-whatsapp.service
+UNIT_DIR="$HOME/.config/systemd/user"
+UNIT_PATH="$UNIT_DIR/$UNIT"
+STATE_DIR="$HOME/.config/claude-whatsapp"
+LOG="$STATE_DIR/doctor.log"
+BRIDGE_UNIT=whatsapp-bridge.service
+
+mkdir -p "$STATE_DIR" "$UNIT_DIR"
+
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+# Keep the log from growing forever.
+if [[ -f "$LOG" ]] && [[ $(stat -c%s "$LOG" 2>/dev/null || echo 0) -gt 1000000 ]]; then
+    tail -n 2000 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+
+notify() {
+    log "NOTIFY: $*"
+    command -v notify-send >/dev/null 2>&1 && \
+        notify-send -u critical "Claude WhatsApp bot" "$*" 2>/dev/null
+}
+
+# --- 1. Find bot.py, wherever it lives now -----------------------------------
+# Ordered guesses first (cheap), then a bounded search under ~/code (robust to
+# any future reorganisation).
+find_bot() {
+    local c
+    for c in \
+        "$HOME/code/claude-stuff/claude-whatsapp-bot/bot.py" \
+        "$HOME/code/claude-whatsapp-bot/bot.py"
+    do
+        [[ -f "$c" ]] && { printf '%s' "$c"; return 0; }
+    done
+    c=$(find "$HOME/code" -maxdepth 4 -type f -path '*claude-whatsapp-bot/bot.py' \
+            -not -path '*/.claude/worktrees/*' -not -path '*/node_modules/*' \
+            2>/dev/null | head -n1)
+    [[ -n "$c" ]] && { printf '%s' "$c"; return 0; }
+    return 1
+}
+
+BOT_PY=$(find_bot) || {
+    notify "Cannot find bot.py anywhere under ~/code. The bot is DOWN and I cannot repair it."
+    exit 1
+}
+BOT_DIR=$(dirname "$BOT_PY")
+
+# --- 2. Make sure the unit exists and points at the real bot.py --------------
+need_reload=0
+
+# A dangling symlink is the exact failure we are guarding against: -f is false
+# for it, so this branch catches both "missing" and "points into the void".
+if [[ ! -f "$UNIT_PATH" ]]; then
+    [[ -L "$UNIT_PATH" ]] && { rm -f "$UNIT_PATH"; log "removed dangling unit symlink"; }
+    src="$BOT_DIR/$UNIT"
+    if [[ -f "$src" ]]; then
+        # Install a real copy, not a symlink. A symlink into the project dir is
+        # what broke last time; a copy survives the directory moving again.
+        install -m 644 "$src" "$UNIT_PATH"
+        log "unit was missing; installed copy from $src"
+    else
+        cat >"$UNIT_PATH" <<EOF
+[Unit]
+Description=Claude WhatsApp bot — replies to the "My Claude" self-group via the whatsapp-mcp bridge
+After=network-online.target $BRIDGE_UNIT
+Wants=network-online.target $BRIDGE_UNIT
+
+[Service]
+Type=simple
+WorkingDirectory=$HOME
+Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 $BOT_PY
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target
+EOF
+        log "unit was missing and no template found; generated one"
+    fi
+    need_reload=1
+fi
+
+# Unit exists but ExecStart may reference a stale bot.py path.
+cur_exec=$(grep -m1 '^ExecStart=' "$UNIT_PATH" 2>/dev/null || true)
+if [[ -n "$cur_exec" && "$cur_exec" != *"$BOT_PY"* ]]; then
+    sed -i "s|^ExecStart=.*|ExecStart=/usr/bin/python3 $BOT_PY|" "$UNIT_PATH"
+    log "ExecStart was stale ($cur_exec) -> now $BOT_PY"
+    need_reload=1
+fi
+
+# Keep the project's own copy of the unit correct too, so a future reinstall
+# from the repo does not reintroduce the stale path.
+proj_unit="$BOT_DIR/$UNIT"
+if [[ -f "$proj_unit" ]] && ! grep -q "ExecStart=.*$BOT_PY" "$proj_unit"; then
+    sed -i "s|^ExecStart=.*|ExecStart=/usr/bin/python3 $BOT_PY|" "$proj_unit"
+    log "fixed stale ExecStart in project unit $proj_unit"
+fi
+
+# --- 3. Repair helper symlinks the bot shells out to -------------------------
+# wa-history broke the same way; a dangling link only degrades the bot (it logs
+# WARN and loses conversation history), so it never announced itself.
+for helper in wa-history; do
+    link="$HOME/.local/bin/$helper"
+    target="$BOT_DIR/$helper"
+    if [[ -f "$target" ]] && [[ ! -e "$link" || "$(readlink -f "$link" 2>/dev/null)" != "$target" ]]; then
+        ln -sfn "$target" "$link"
+        log "repaired $helper symlink -> $target"
+    fi
+done
+
+(( need_reload )) && { systemctl --user daemon-reload; log "daemon-reload"; }
+
+# --- 4. Ensure enabled, and the bridge it depends on is up -------------------
+if ! systemctl --user is-enabled --quiet "$UNIT" 2>/dev/null; then
+    systemctl --user enable "$UNIT" >/dev/null 2>&1 && log "re-enabled $UNIT"
+fi
+
+if ! systemctl --user is-active --quiet "$BRIDGE_UNIT" 2>/dev/null; then
+    log "bridge down; starting $BRIDGE_UNIT"
+    systemctl --user start "$BRIDGE_UNIT" 2>/dev/null
+fi
+
+# --- 5. Ensure the bot is actually running ----------------------------------
+if ! systemctl --user is-active --quiet "$UNIT"; then
+    log "bot not active; starting"
+    systemctl --user reset-failed "$UNIT" 2>/dev/null
+    if systemctl --user start "$UNIT" 2>/dev/null; then
+        sleep 3
+        if systemctl --user is-active --quiet "$UNIT"; then
+            log "bot recovered"
+        else
+            notify "Bot is down and would not start. Run: journalctl --user -u $UNIT -n 50"
+        fi
+    else
+        notify "Bot is down and 'systemctl start' failed. Run: journalctl --user -u $UNIT -n 50"
+    fi
+fi
+
+# --- 6. Flap detection ------------------------------------------------------
+# Active-but-crash-looping looks healthy to is-active. Catch the case where the
+# bot restarts over and over (bad import, bridge schema change) and say so.
+nrestarts=$(systemctl --user show -p NRestarts --value "$UNIT" 2>/dev/null || echo 0)
+mark="$STATE_DIR/.doctor-nrestarts"
+prev=$(cat "$mark" 2>/dev/null || echo 0)
+printf '%s' "$nrestarts" >"$mark"
+if [[ "$nrestarts" =~ ^[0-9]+$ && "$prev" =~ ^[0-9]+$ ]] && (( nrestarts - prev > 5 )); then
+    notify "Bot is crash-looping ($((nrestarts - prev)) restarts since last check). Messages may be missed."
+    log "FLAPPING: $prev -> $nrestarts"
+fi
+
+exit 0

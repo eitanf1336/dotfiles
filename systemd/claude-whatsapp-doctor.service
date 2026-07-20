@@ -1,0 +1,7 @@
+[Unit]
+Description=Health check and self-repair for the Claude WhatsApp bot
+After=whatsapp-bridge.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/code/linux-setup/bin/claude-whatsapp-doctor
