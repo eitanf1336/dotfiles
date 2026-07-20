@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude-whatsapp-doctor — keeps the "My Claude" WhatsApp bot alive.
+# claude-whatsapp-doctor: keeps the "My Claude" WhatsApp bot alive.
 #
 # Why this exists: on 2026-07-21 the bot had been dead for hours. The project
 # directory was moved (~/code/claude-whatsapp-bot -> ~/code/claude-stuff/...),
@@ -80,7 +80,7 @@ if [[ ! -f "$UNIT_PATH" ]]; then
     else
         cat >"$UNIT_PATH" <<EOF
 [Unit]
-Description=Claude WhatsApp bot — replies to the "My Claude" self-group via the whatsapp-mcp bridge
+Description=Claude WhatsApp bot: replies to the "My Claude" self-group via the whatsapp-mcp bridge
 After=network-online.target $BRIDGE_UNIT
 Wants=network-online.target $BRIDGE_UNIT
 
