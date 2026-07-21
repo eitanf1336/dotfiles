@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# HBO Max as a standalone desktop app (Chrome --app mode), detached from the
+# terminal so closing the terminal does not take it down with it.
+#
+# Uses a DEDICATED Chrome profile (--user-data-dir) so HBO Max gets its own
+# standalone window and its own dock icon, instead of being absorbed by a
+# running Chrome and grouped under the Chrome icon. Sign in to HBO Max once in
+# this profile; it persists after that.
+# Google Chrome (not Chromium) ships Widevine, which HBO Max needs for DRM
+# playback, so this launcher deliberately uses /usr/bin/google-chrome.
+URL="https://www.hbomax.com/"
+PROFILE="$HOME/.local/share/hbo-app"
+setsid -f /usr/bin/google-chrome \
+  --app="$URL" \
+  --user-data-dir="$PROFILE" \
+  --class=HBOMax \
+  --name=HBOMax \
+  "$@" \
+  >/dev/null 2>&1

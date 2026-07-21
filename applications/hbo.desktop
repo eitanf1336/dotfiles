@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Name=HBO Max
+Comment=Stream HBO Max series and movies
+Exec=/home/eitan/.local/bin/hbo
+Terminal=false
+Type=Application
+Icon=/home/eitan/.local/share/icons/webapps/hbo.png
+Categories=AudioVideo;Video;Player;Network;
+StartupWMClass=chrome-www.hbomax.com__-Default
+StartupNotify=true
