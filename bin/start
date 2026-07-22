@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# start: launch a program and automatically close it after a duration.
+#
+# Usage:
+#   start <program> <duration>        e.g.  start whatsapp 30s
+#   start <program> [args...] <duration>    start gemini 5m
+#   start <duration> <program>        (duration may come first too)
+#
+# Duration:  30s  5m  2h  90  1m30s   (bare number = seconds; s/m/h/d units)
+#
+# It figures out HOW to close the program on its own, because different app
+# types need different "close" commands:
+#   * flatpak apps (WhatsApp = ZapZap)      -> flatpak kill <app-id>
+#   * Chrome web-apps (gemini/hbo/gmail...) -> kill only that profile's chrome
+#   * any normal binary                     -> kill its whole process group
+#
+# The launch returns your terminal instantly; a detached background worker
+# does the wait-then-close, so it survives the terminal closing.
+#
+# Flags:  --dry-run  show what it would do, change nothing
+#         --force    close even if the app was already running before
+#         -h|--help  this help
+
+set -u
+SELF="$(readlink -f "$0")"
+LOGDIR="$HOME/.cache/start"
+LOG="$LOGDIR/start.log"
+
+# ---------------------------------------------------------------------------
+# helpers shared by parent + worker
+# ---------------------------------------------------------------------------
+chrome_profiles() {
+  # every distinct --user-data-dir=... among running chrome processes
+  pgrep -af -- '--user-data-dir=' 2>/dev/null \
+    | grep -oE -- '--user-data-dir=[^[:space:]]+' | sort -u
+}
+
+kill_by_profile() {  # $1=--user-data-dir=/path   $2=SIG
+  pkill -"$2" -f -- "$1" 2>/dev/null
+}
+
+log() { printf '%s  %s\n' "$(date '+%F %T')" "$*" >>"$LOG" 2>/dev/null; }
+
+# ===========================================================================
+# WORKER MODE  (internal):  start __run <mode> <secs> <killspec> -- <launch...>
+# ===========================================================================
+if [[ "${1:-}" == "__run" ]]; then
+  shift
+  mode="$1"; secs="$2"; killspec="$3"; shift 3
+  [[ "${1:-}" == "--" ]] && shift
+  launch=("$@")
+  mkdir -p "$LOGDIR" 2>/dev/null
+  log "run mode=$mode secs=$secs kill=[$killspec] cmd=[${launch[*]}]"
+
+  case "$mode" in
+    pgid)
+      # We control the launch: own session => own process group we can kill.
+      setsid "${launch[@]}" >>"$LOG" 2>&1 &
+      leader=$!
+      sleep "$secs"
+      kill -TERM -- -"$leader" 2>/dev/null
+      sleep 3
+      kill -KILL -- -"$leader" 2>/dev/null
+      log "closed pgid $leader"
+      ;;
+
+    flatpak)
+      "${launch[@]}" >>"$LOG" 2>&1     # their launcher self-detaches
+      sleep "$secs"
+      flatpak kill "$killspec" >>"$LOG" 2>&1
+      log "closed flatpak $killspec"
+      ;;
+
+    webapp)
+      before="$(chrome_profiles)"
+      "${launch[@]}" >>"$LOG" 2>&1     # their web-app launcher self-detaches
+      start_ts=$SECONDS
+      profile=""
+      for _ in $(seq 1 30); do         # up to ~6s to spot the new window
+        new="$(comm -13 <(printf '%s\n' "$before") <(chrome_profiles))"
+        if [[ -n "$new" ]]; then profile="$(printf '%s\n' "$new" | head -1)"; break; fi
+        sleep 0.2
+      done
+      if [[ -z "$profile" ]]; then
+        log "no new chrome profile appeared (already open?) -> not auto-closing"
+        exit 0
+      fi
+      elapsed=$((SECONDS - start_ts)); remaining=$((secs - elapsed))
+      ((remaining < 0)) && remaining=0
+      sleep "$remaining"
+      kill_by_profile "$profile" TERM; sleep 3; kill_by_profile "$profile" KILL
+      log "closed webapp $profile"
+      ;;
+  esac
+
+  # best-effort desktop notification
+  command -v notify-send >/dev/null 2>&1 && \
+    notify-send -a start "start" "Closed ${launch[0]} after ${DUR_HUMAN:-$secs}" 2>/dev/null
+  exit 0
+fi
+
+# ===========================================================================
+# NORMAL MODE
+# ===========================================================================
+usage() { sed -n '2,25p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+parse_duration() {  # echoes seconds, or returns 1
+  local rest="$1" total=0 num unit
+  [[ -z "$rest" ]] && return 1
+  while [[ "$rest" =~ ^([0-9]+)([smhd]?)(.*)$ ]]; do
+    num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"; rest="${BASH_REMATCH[3]}"
+    case "$unit" in
+      s|'') total=$((total + num)) ;;
+      m)    total=$((total + num*60)) ;;
+      h)    total=$((total + num*3600)) ;;
+      d)    total=$((total + num*86400)) ;;
+    esac
+    [[ -z "$rest" ]] && { echo "$total"; return 0; }
+  done
+  return 1
+}
+
+human_dur() { # $1 seconds -> "1h 5m 30s"
+  local s=$1 out=""
+  (( s>=3600 )) && { out+="$((s/3600))h "; s=$((s%3600)); }
+  (( s>=60 ))   && { out+="$((s/60))m ";   s=$((s%60)); }
+  (( s>0 )) && out+="${s}s"
+  [[ -z "$out" ]] && out="0s"
+  echo "${out% }"
+}
+
+is_text() { grep -Iq . "$1" 2>/dev/null; }
+
+flatpak_installed() { flatpak info "$1" >/dev/null 2>&1; }
+
+extract_flatpak_id() {  # from a launcher script -> installed flatpak app-id
+  # Skip comment lines (prose may say "flatpak run ..."), and accept the first
+  # candidate that is actually an installed flatpak.
+  local id
+  while read -r id; do
+    [[ -n "$id" ]] && flatpak_installed "$id" && { echo "$id"; return 0; }
+  done < <(grep -v -E '^[[:space:]]*#' "$1" 2>/dev/null \
+           | grep -oE -- '(flatpak run|gtk-launch)[[:space:]]+[A-Za-z0-9._-]+' \
+           | awk '{print $2}')
+  return 1
+}
+
+# ---- flags ----------------------------------------------------------------
+DRYRUN=0; FORCE=0; ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRYRUN=1 ;;
+    --force)   FORCE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *)         ARGS+=("$a") ;;
+  esac
+done
+
+if (( ${#ARGS[@]} < 2 )); then
+  echo "start: need a program and a duration, e.g.  start whatsapp 30s" >&2
+  echo "try 'start --help'" >&2
+  exit 2
+fi
+
+# ---- split program vs duration (duration may be first or last) ------------
+if secs="$(parse_duration "${ARGS[-1]}")"; then
+  DUR_RAW="${ARGS[-1]}"; CMD=("${ARGS[@]:0:${#ARGS[@]}-1}")
+elif secs="$(parse_duration "${ARGS[0]}")"; then
+  DUR_RAW="${ARGS[0]}"; CMD=("${ARGS[@]:1}")
+else
+  echo "start: no valid duration found (use e.g. 30s, 5m, 2h, 90)" >&2
+  exit 2
+fi
+(( ${#CMD[@]} >= 1 )) || { echo "start: no program given" >&2; exit 2; }
+(( secs > 0 ))        || { echo "start: duration must be > 0" >&2; exit 2; }
+
+NAME="${CMD[0]}"
+DUR_HUMAN="$(human_dur "$secs")"
+
+# ---- classify: how do we launch and close this thing? ---------------------
+res="$(command -v "$NAME" 2>/dev/null || true)"
+MODE=""; KILLSPEC="-"; LAUNCH=()
+
+if flatpak_installed "$NAME"; then
+  MODE=flatpak; KILLSPEC="$NAME"; LAUNCH=(flatpak run "$NAME")
+elif [[ -n "$res" ]]; then
+  if is_text "$res" && appid="$(extract_flatpak_id "$res")"; then
+    MODE=flatpak; KILLSPEC="$appid"; LAUNCH=("$NAME")
+  elif is_text "$res" && grep -q -- '--app=' "$res"; then
+    MODE=webapp; LAUNCH=("$NAME")
+  else
+    MODE=pgid; LAUNCH=("$NAME")
+  fi
+else
+  echo "start: don't know how to launch '$NAME' (not a command or flatpak app)" >&2
+  exit 127
+fi
+LAUNCH+=("${CMD[@]:1}")   # pass through any extra args
+
+# ---- safety: is it already open? (don't nuke a pre-existing session) ------
+already=0
+if [[ "$MODE" == flatpak ]]; then
+  flatpak ps --columns=application 2>/dev/null | grep -Fxq "$KILLSPEC" && already=1
+fi
+
+# ---- dry run --------------------------------------------------------------
+CLOSE_AT="$(date -d "+$secs seconds" '+%H:%M:%S' 2>/dev/null || echo '?')"
+if (( DRYRUN )); then
+  echo "program : $NAME  (extra args: ${CMD[*]:1:99})"
+  echo "duration: $DUR_HUMAN  ($secs s)  -> close at $CLOSE_AT"
+  echo "mode    : $MODE"
+  echo "launch  : ${LAUNCH[*]}"
+  case "$MODE" in
+    flatpak) echo "close   : flatpak kill $KILLSPEC" ;;
+    webapp)  echo "close   : kill the chrome profile that appears when it starts" ;;
+    pgid)    echo "close   : kill the launched process group" ;;
+  esac
+  (( already )) && echo "note    : already running -> real run needs --force"
+  exit 0
+fi
+
+# ---- guard: refuse to auto-close something you already had open -----------
+if (( already )) && (( ! FORCE )); then
+  echo "start: '$NAME' ($KILLSPEC) is already running." >&2
+  echo "       Not auto-closing a session you were already using." >&2
+  echo "       Re-run with --force to open+close it anyway." >&2
+  exit 3
+fi
+
+# ---- go: spawn the detached wait-then-close worker ------------------------
+mkdir -p "$LOGDIR" 2>/dev/null
+DUR_HUMAN="$DUR_HUMAN" setsid -f "$SELF" __run "$MODE" "$secs" "$KILLSPEC" -- "${LAUNCH[@]}" \
+  >/dev/null 2>&1 < /dev/null
+
+echo "▶ $NAME launched, auto-closing in $DUR_HUMAN (at $CLOSE_AT)"
