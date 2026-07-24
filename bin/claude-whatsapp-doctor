@@ -170,4 +170,19 @@ if [[ "$nrestarts" =~ ^[0-9]+$ && "$prev" =~ ^[0-9]+$ ]] && (( nrestarts - prev 
     log "FLAPPING: $prev -> $nrestarts"
 fi
 
+# --- 7. Keep the full-tools assist timer armed ------------------------------
+# wa-assist promises someone "he answers you every 5 minutes". A timer that
+# quietly stopped looks, from their side, exactly like being ignored. So while
+# the registry still lists an enabled chat, the timer has to be running.
+ASSIST_REG="$STATE_DIR/assist.json"
+ASSIST_TIMER=claude-wa-assist.timer
+if [[ -s "$ASSIST_REG" ]] && grep -q '"enabled"[[:space:]]*:[[:space:]]*true' "$ASSIST_REG"; then
+    if ! systemctl --user is-active --quiet "$ASSIST_TIMER" 2>/dev/null; then
+        log "assist timer down while chats are armed; starting"
+        systemctl --user enable --now "$ASSIST_TIMER" >/dev/null 2>&1 \
+            && log "assist timer recovered" \
+            || notify "wa-assist chats are armed but $ASSIST_TIMER will not start."
+    fi
+fi
+
 exit 0

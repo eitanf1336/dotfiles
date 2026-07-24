@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""
+wa-assist — arm / disarm chats for the FULL-TOOLS WhatsApp assistant (assist.py).
+
+Difference from wa-monitor, and it is the whole reason this exists:
+
+  wa-monitor   replies with NO tools. Safe for anyone, but it can only talk.
+               Someone who sends a broken notebook gets "I don't have access".
+  wa-assist    replies with the FULL tool set: it downloads what they sent,
+               reads and edits real files, runs code, and can send files back.
+               Only for people you actually trust with that.
+
+A timer fires every 5 minutes and answers anything new since the last run.
+A chat can be on ONE of the two lists, never both, or the person gets two
+different answers to the same message.
+
+Usage:
+  wa-assist on <name|number|jid> [--name "Nice Name"]   # arm full-tools help
+  wa-assist off <name|number|jid>                       # disarm
+  wa-assist off-all                                     # kill switch
+  wa-assist list                                        # armed chats + timer state
+  wa-assist run                                         # answer anything pending now
+  wa-assist log [n]                                     # recent runs
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+
+HOME        = os.path.expanduser("~")
+MESSAGES_DB = os.path.join(HOME, "code/whatsapp-mcp/whatsapp-bridge/store/messages.db")
+CFG_DIR     = os.path.join(HOME, ".config/claude-whatsapp")
+REGISTRY    = os.path.join(CFG_DIR, "assist.json")
+MONITOR_REG = os.path.join(CFG_DIR, "monitored.json")
+ASSIST_PY   = os.path.join(HOME, "code/claude-stuff/claude-whatsapp-bot/assist.py")
+UNIT        = "claude-wa-assist"
+
+
+def load(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception:
+        return default
+
+
+def save(reg):
+    os.makedirs(CFG_DIR, exist_ok=True)
+    tmp = REGISTRY + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(reg, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, REGISTRY)
+
+
+def db():
+    return sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=10)
+
+
+def resolve(query):
+    """name / number / jid -> (jid, name). Exact JIDs win; otherwise match the
+    bridge's chat list. WhatsApp often files a contact under an opaque @lid, so
+    an ambiguous name is an error rather than a guess at who gets tool access."""
+    conn = db()
+    try:
+        if "@" in query:
+            row = conn.execute("SELECT jid, name FROM chats WHERE jid=?",
+                               (query,)).fetchone()
+            return (row[0], row[1] or query) if row else (query, query)
+        rows = conn.execute(
+            "SELECT jid, name FROM chats WHERE name LIKE ? OR jid LIKE ? "
+            "ORDER BY last_message_time DESC",
+            (f"%{query}%", f"%{query}%")).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        sys.exit(f"No chat matches {query!r}. Try: wa-monitor find {query}")
+    if len(rows) > 1:
+        exact = [r for r in rows if (r[1] or "").strip() == query.strip()]
+        if len(exact) == 1:
+            rows = exact
+        else:
+            print(f"{query!r} is ambiguous, pass the exact JID:")
+            for jid, name in rows[:10]:
+                print(f"  {name or '(no name)':<28} {jid}")
+            sys.exit(1)
+    return rows[0][0], rows[0][1] or rows[0][0]
+
+
+def max_rowid(jid):
+    conn = db()
+    try:
+        r = conn.execute("SELECT COALESCE(MAX(rowid),0) FROM messages "
+                         "WHERE chat_jid=?", (jid,)).fetchone()
+        return r[0] if r else 0
+    finally:
+        conn.close()
+
+
+def timer_state():
+    r = subprocess.run(["systemctl", "--user", "is-active", f"{UNIT}.timer"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() or "unknown"
+
+
+def cmd_on(a):
+    jid, name = resolve(a.chat)
+    name = a.name or name
+    mon = load(MONITOR_REG, {}).get("chats", {})
+    if jid in mon:
+        sys.exit(f"{name} is already armed on wa-monitor (no-tools replies).\n"
+                 f"Two answers to every message is worse than one — run\n"
+                 f"  wa-monitor stop {jid}\nfirst, then arm here.")
+    reg = load(REGISTRY, {"chats": {}})
+    # Start the cursor at the newest message so arming never replays old history.
+    reg.setdefault("chats", {})[jid] = {
+        "name": name, "enabled": True, "since_rowid": max_rowid(jid), "runs": [],
+    }
+    save(reg)
+    subprocess.run(["systemctl", "--user", "enable", "--now", f"{UNIT}.timer"],
+                   capture_output=True)
+    print(f"Armed (full tools): {name}  [{jid}]")
+    print(f"Timer: {timer_state()} — answers anything new every 5 minutes.")
+    print("This chat now gets replies that can read files, run code and send files.")
+
+
+def cmd_off(a):
+    reg = load(REGISTRY, {"chats": {}})
+    chats = reg.get("chats", {})
+    jid, name = resolve(a.chat)
+    if jid not in chats:
+        hit = [j for j, c in chats.items() if a.chat in (c.get("name") or "")]
+        if not hit:
+            sys.exit(f"{name} is not armed here. `wa-assist list` shows who is.")
+        jid = hit[0]
+        name = chats[jid].get("name", jid)
+    chats.pop(jid, None)
+    save(reg)
+    print(f"Disarmed: {name}")
+    if not chats:
+        subprocess.run(["systemctl", "--user", "disable", "--now", f"{UNIT}.timer"],
+                       capture_output=True)
+        print("No chats left, timer stopped.")
+
+
+def cmd_off_all(a):
+    reg = load(REGISTRY, {"chats": {}})
+    n = len(reg.get("chats", {}))
+    save({"chats": {}})
+    subprocess.run(["systemctl", "--user", "disable", "--now", f"{UNIT}.timer"],
+                   capture_output=True)
+    print(f"Disarmed {n} chat(s). Timer stopped.")
+
+
+def cmd_list(a):
+    reg = load(REGISTRY, {"chats": {}})
+    chats = reg.get("chats", {})
+    print(f"Timer: {timer_state()}  (every 5 min)")
+    if not chats:
+        print("No chats armed for full-tools assist.")
+        return
+    print(f"Full-tools chats ({len(chats)}):")
+    for jid, c in chats.items():
+        pending = max_rowid(jid) - c.get("since_rowid", 0)
+        flag = "" if c.get("enabled") else "  [disabled]"
+        print(f"  • {c.get('name', jid)}{flag}")
+        print(f"      jid: {jid}")
+        print(f"      last run: {c.get('last_run', 'never')}"
+              f"      pending rows: {max(pending, 0)}")
+
+
+def cmd_run(a):
+    os.execv(sys.executable, [sys.executable, ASSIST_PY])
+
+
+def cmd_log(a):
+    subprocess.run(["journalctl", "--user", "-u", UNIT, "-n", str(a.n), "--no-pager"])
+
+
+p = argparse.ArgumentParser(description=__doc__,
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
+sub = p.add_subparsers(dest="cmd", required=True)
+s = sub.add_parser("on", help="arm a chat for full-tools help")
+s.add_argument("chat"); s.add_argument("--name"); s.set_defaults(f=cmd_on)
+s = sub.add_parser("off", help="disarm a chat"); s.add_argument("chat")
+s.set_defaults(f=cmd_off)
+sub.add_parser("off-all", help="disarm everything").set_defaults(f=cmd_off_all)
+sub.add_parser("list", help="show armed chats").set_defaults(f=cmd_list)
+sub.add_parser("run", help="answer anything pending right now").set_defaults(f=cmd_run)
+s = sub.add_parser("log", help="recent runs")
+s.add_argument("n", nargs="?", type=int, default=40); s.set_defaults(f=cmd_log)
+
+a = p.parse_args()
+a.f(a)

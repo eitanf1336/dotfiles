@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude WhatsApp assist — full-tools help for explicitly trusted chats (see wa-assist)
+After=network-online.target whatsapp-bridge.service
+# Wants, not Requires: a bridge restart must not kill a claude run mid-answer.
+Wants=network-online.target whatsapp-bridge.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/eitan
+Environment=PATH=/home/eitan/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /home/eitan/code/claude-stuff/claude-whatsapp-bot/assist.py
+# A run is allowed to do real work (open his notebook, fix it, send it back), so
+# it gets far longer than the 5-minute tick. assist.py holds a flock, so a slow
+# run makes the next ticks no-op instead of stacking up.
+TimeoutStartSec=1200
