@@ -1,0 +1,12 @@
+[Unit]
+Description=Recover Intel AX201 WiFi after firmware death
+After=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/wifi-recover
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

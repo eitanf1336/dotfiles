@@ -1,0 +1,34 @@
+#!/bin/bash
+# Recover the Intel AX201 when its firmware dies and takes the netdev with it.
+# Symptom: "Failed to run INIT ucode: -110" / "Hardware became unavailable
+# during restart." -> wlo1 disappears -> desktop reports no WiFi adapter.
+# A module reload brings it back, so a reboot is never needed.
+PCI=0000:00:14.3
+have_wifi(){ ls /sys/class/net 2>/dev/null | grep -qE '^wl'; }
+
+while :; do
+  if ! have_wifi; then
+    logger -t wifi-recover "wifi interface gone, reloading iwlwifi"
+    timeout 30 modprobe -r iwlwifi 2>/dev/null
+    sleep 3
+    timeout 30 modprobe iwlwifi 2>/dev/null
+    sleep 8
+
+    if ! have_wifi; then
+      logger -t wifi-recover "reload failed, trying PCI remove+rescan"
+      [ -e /sys/bus/pci/devices/$PCI/remove ] && echo 1 > /sys/bus/pci/devices/$PCI/remove
+      sleep 2
+      echo 1 > /sys/bus/pci/rescan
+      sleep 8
+    fi
+
+    if have_wifi; then
+      systemctl restart NetworkManager
+      logger -t wifi-recover "recovered without reboot"
+    else
+      logger -t wifi-recover "RECOVERY FAILED, reboot required"
+    fi
+    sleep 30
+  fi
+  sleep 10
+done
