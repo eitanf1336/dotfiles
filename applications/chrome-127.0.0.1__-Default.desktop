@@ -1,0 +1,18 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Read Aloud
+Comment=Read the selected text aloud with a local neural voice
+Exec=/home/eitan/code/Technion/Research/read-aloud/speak-selection.sh
+Icon=/home/eitan/.local/share/icons/webapps/read-aloud.png
+Terminal=false
+Categories=AudioVideo;Audio;Accessibility;
+Keywords=tts;speech;speak;voice;read;aloud;piper;
+StartupNotify=true
+# The player is a Chrome --app window, so GNOME identifies it by the app_id
+# Chrome derives from the URL (host + "_" + path, non-alphanumerics to "_"),
+# never by --class. Without a match the dock falls back to the generic cog.
+# Chrome's host() drops the port, giving chrome-127.0.0.1__-Default -- this
+# file's own name, which GNOME matches by basename. The line below covers the
+# other possibility, a port kept in the app_id; only one of them can bind.
+StartupWMClass=chrome-127.0.0.1_8765__-Default
