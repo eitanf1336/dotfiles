@@ -22,3 +22,4 @@ These are GNOME `media-keys` custom shortcuts. Restore them with `keybindings/re
 | DLNL Night Light Down | `<Super><Shift>KP_Subtract` | `/home/eitan/.local/bin/nightlight down` |
 | DLNL Clean/Capture Mode | `<Super><Shift>0` | `/home/eitan/.local/bin/present toggle` |
 | Sunrise Alarm | `<Control><Shift>a` | `/home/eitan/.local/bin/sunrise-alarm` |
+| Read Aloud selection | `<Control><Shift>l` | `/home/eitan/code/Technion/Research/read-aloud/speak-selection.sh` |

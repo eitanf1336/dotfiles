@@ -122,6 +122,12 @@ gsettings set "$k" name 'Portfolio + surf desktop panels'
 gsettings set "$k" binding '<Control><Shift>m'
 gsettings set "$k" command '/home/eitan/.local/bin/panels'
 
+paths+=("/read-aloud/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/read-aloud/"
+gsettings set "$k" name 'Read Aloud selection'
+gsettings set "$k" binding '<Control><Shift>l'
+gsettings set "$k" command '/home/eitan/code/Technion/Research/read-aloud/speak-selection.sh'
+
 # Spotify transport on Ctrl+Super+arrows. These drive spotify-skip over MPRIS
 # and are deliberately NOT the XF86Audio* media keys, which the laptop lacks.
 paths+=("/spotify-next/")
@@ -160,6 +166,22 @@ while read -r p; do
     for have in "${paths[@]}"; do [ "$have" = "$p" ] && continue 2; done
     paths+=("$p")
 done < <(echo "$existing" | tr ',' '\n' | sed "s|.*/custom-keybindings||; s|[]['\" ]||g" | grep -v '^$')
+
+# Then ADOPT orphans: entries that exist under the dconf directory but are
+# absent from the registered list. Merging the list alone cannot recover these
+# -- once a shortcut falls off the list it is invisible to every later run, so
+# it stays dead forever (this is how Ctrl+Shift+L / Read Aloud was lost, and it
+# survived several runs of this script afterwards). Deliberate removals delete
+# the dconf entry itself, so nothing intentionally dropped comes back here.
+if command -v dconf >/dev/null 2>&1; then
+    while read -r child; do
+        [ -n "$child" ] || continue
+        p="/$child"                       # dconf list prints 'name/'
+        for have in "${paths[@]}"; do [ "$have" = "$p" ] && continue 2; done
+        paths+=("$p")
+        echo "Adopted orphaned shortcut: $p"
+    done < <(dconf list "$PREFIX/" 2>/dev/null | grep '/$')
+fi
 
 # Emit FULL dconf paths, the canonical form GNOME Settings itself writes.
 # gsd-media-keys happens to tolerate the bare '/rotate-bg/' form this script
