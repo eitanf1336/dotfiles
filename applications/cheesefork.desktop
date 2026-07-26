@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=CheeseFork
+Comment=Class schedule maker for Technion students
+Exec=/home/eitan/bin/cheesefork
+Icon=/home/eitan/.local/share/icons/webapps/cheesefork.png
+Terminal=false
+StartupWMClass=chrome-cheesefork.cf__-Default
+Categories=Education;
+Keywords=technion;schedule;courses;timetable;semester;
+StartupNotify=true

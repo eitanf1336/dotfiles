@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# CheeseFork (Technion schedule builder) as a standalone desktop app
+# (Chrome --app mode), detached from the terminal so closing the terminal does
+# not take it down with it.
+#
+# Uses a DEDICATED Chrome profile (--user-data-dir) rather than the default one.
+# That's what guarantees a real standalone window with its own dock icon: with
+# the default profile, when Chrome is already running the new --app window is
+# absorbed by the running browser and gets grouped under the Chrome icon (and
+# --class is ignored). A separate profile forces its own instance + app_id.
+# CheeseFork keeps the built schedule in this profile's local storage.
+URL="https://cheesefork.cf/"
+PROFILE="$HOME/.local/share/cheesefork-app"
+setsid -f /usr/bin/google-chrome \
+  --app="$URL" \
+  --user-data-dir="$PROFILE" \
+  --class=CheeseFork \
+  --name=CheeseFork \
+  "$@" \
+  >/dev/null 2>&1
