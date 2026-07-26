@@ -128,6 +128,12 @@ gsettings set "$k" name 'Read Aloud selection'
 gsettings set "$k" binding '<Control><Shift>l'
 gsettings set "$k" command '/home/eitan/code/Technion/Research/read-aloud/speak-selection.sh'
 
+paths+=("/calc/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/calc/"
+gsettings set "$k" name 'Calculate selection (popup)'
+gsettings set "$k" binding '<Control><Alt>c'
+gsettings set "$k" command '/home/eitan/.local/bin/calc'
+
 # Spotify transport on Ctrl+Super+arrows. These drive spotify-skip over MPRIS
 # and are deliberately NOT the XF86Audio* media keys, which the laptop lacks.
 paths+=("/spotify-next/")

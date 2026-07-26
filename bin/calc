@@ -1,0 +1,931 @@
+#!/usr/bin/env python3
+"""calc — evaluate the highlighted math and show the answer in a popup.
+
+Select any expression anywhere on screen (multi-line is fine, so are sloppy
+parentheses, LaTeX-ish text, percentages and 1,234-style separators) and press
+Ctrl+Alt+C. A small dark popup shows the result; Enter copies it, Esc closes.
+
+Usage:
+  calc                    evaluate the current selection, show the popup
+  calc '2^10 + 5%'        evaluate on the command line, print the result
+  calc -g '(1+sqrt(5))/2' evaluate the given expression in the popup
+  calc --selftest         run the parser test suite
+"""
+
+import ast
+import math
+import os
+import re
+import subprocess
+import sys
+from fractions import Fraction
+
+# --- environment: GNOME can hand a hotkey a stripped env --------------------
+_UID = str(os.getuid())
+os.environ.setdefault('XDG_RUNTIME_DIR', '/run/user/%s' % _UID)
+os.environ.setdefault('WAYLAND_DISPLAY', 'wayland-0')
+os.environ.setdefault('DISPLAY', ':0')
+os.environ.setdefault('DBUS_SESSION_BUS_ADDRESS',
+                      'unix:path=%s/bus' % os.environ['XDG_RUNTIME_DIR'])
+os.environ.setdefault('YDOTOOL_SOCKET',
+                      '%s/.ydotool_socket' % os.environ['XDG_RUNTIME_DIR'])
+
+MAX_SIG = 12          # significant digits shown
+FRACTION_MAX = 26     # only show the exact fraction if it's this short
+
+# --- theme: borrow the current wallpaper-rotation accent --------------------
+ORDER = ['green', 'blue', 'purple', 'red', 'gold', 'brown', 'wood']
+ACCENTS = {'green': '#4ade80', 'blue': '#60a5fa', 'purple': '#c084fc',
+           'red': '#f87171', 'gold': '#fbbf24', 'brown': '#d2a679',
+           'wood': '#deb887'}
+
+
+def current_accent():
+    try:
+        p = os.path.expanduser('~/.local/state/desktop-rotation/index')
+        return ACCENTS[ORDER[int(open(p).read().strip()) % len(ORDER)]]
+    except Exception:
+        return '#c084fc'
+
+
+def hex_rgba(h, a):
+    h = h.lstrip('#')
+    return 'rgba(%d,%d,%d,%s)' % (int(h[0:2], 16), int(h[2:4], 16),
+                                  int(h[4:6], 16), a)
+
+
+# ===========================================================================
+# 1. normalising whatever was highlighted into something Python can parse
+# ===========================================================================
+
+UNICODE_MAP = {
+    '×': '*', '·': '*', '∗': '*', '⋅': '*', '✕': '*', '✖': '*',
+    '÷': '/', '∕': '/', '⁄': '/', '−': '-', '–': '-', '—': '-', '‒': '-',
+    '≈': '=', '≃': '=', '＝': '=', '＋': '+', '（': '(', '）': ')',
+    'π': 'pi', 'τ': 'tau', 'φ': 'phi', '∞': 'inf', '√': 'sqrt',
+    '\u00a0': ' ', '\u202f': ' ', '\u2009': ' ', '\u200b': '',
+    '\u200e': '', '\u200f': '', '\u202a': '', '\u202b': '', '\u202c': '',
+    '\u202d': '', '\u202e': '',
+}
+SUPERS = {'⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4', '⁵': '5',
+          '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9', '⁺': '+', '⁻': '-'}
+VULGAR = {'½': '(1/2)', '⅓': '(1/3)', '⅔': '(2/3)', '¼': '(1/4)',
+          '¾': '(3/4)', '⅕': '(1/5)', '⅖': '(2/5)', '⅗': '(3/5)',
+          '⅘': '(4/5)', '⅙': '(1/6)', '⅚': '(5/6)', '⅛': '(1/8)',
+          '⅜': '(3/8)', '⅝': '(5/8)', '⅞': '(7/8)'}
+
+LATEX = [
+    (r'\\left|\\right|\\!|\\,|\\;|\\:|\\ ', ' '),
+    (r'\\cdot|\\times', '*'), (r'\\div', '/'),
+    (r'\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}', r'((\1)/(\2))'),
+    (r'\\sqrt\s*\{([^{}]*)\}', r'sqrt(\1)'),
+    (r'\\(pi|tau|phi|sqrt|log|ln|sin|cos|tan|exp|min|max)\b', r'\1'),
+    (r'\{', '('), (r'\}', ')'),
+]
+
+
+def clean_text(text):
+    """Unicode / LaTeX / prose -> plain ASCII math, one physical line each."""
+    s = text
+    for a, b in VULGAR.items():
+        s = s.replace(a, b)
+    for a, b in UNICODE_MAP.items():
+        s = s.replace(a, b)
+    # x² -> x**2   (a run of superscript digits becomes an exponent)
+    s = re.sub(r'[⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻]+',
+               lambda m: '**(' + ''.join(SUPERS[c] for c in m.group()) + ')', s)
+    for pat, rep in LATEX:
+        s = re.sub(pat, rep, s)
+    s = s.replace('$', ' ').replace('\\[', ' ').replace('\\]', ' ')
+    s = s.replace('\\(', '(').replace('\\)', ')')
+
+    out = []
+    for line in s.splitlines():
+        line = re.sub(r'(#|//).*$', '', line)          # trailing comments
+        line = re.sub(r'^\s*[\u2022\u2013\-\*]\s+(?=[\d(A-Za-z])', '', line) \
+            if re.match(r'^\s*[\u2022]\s', line) else line
+        line = line.strip()
+        if line:
+            out.append(line)
+    return out
+
+
+# "20% of 80", "1,234,567", "3 x 4", "5!" ...
+def normalise_line(s):
+    s = re.sub(r'(\d(?:[\d.]*\d)?)\s*%\s*of\s+', r'(\1/100)*', s, flags=re.I)
+    s = re.sub(r'\b\d{1,3}(?:,\d{3})+\b', lambda m: m.group().replace(',', ''), s)
+    # '%' that isn't followed by an operand is a percentage, not a modulo
+    s = re.sub(r'%(?=\s*(?:[-+*/^)\],]|$))', '/100', s)
+    s = re.sub(r'(?<=[\d)])\s+[xX]\s+(?=[\d(])', '*', s)     # 1920 x 1080
+    s = re.sub(r'(\d+)\s*!(?!=)', r'factorial(\1)', s)       # 5! -> factorial(5)
+    s = s.replace('^', '**')
+    return s
+
+
+FUNC_NAMES = ('sqrt|cbrt|sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|log|ln|'
+              'log2|log10|lg|exp|abs|floor|ceil|round|trunc|sign|min|max|sum|'
+              'avg|mean|gcd|lcm|factorial|fact|comb|perm|hypot|pow|mod|'
+              'deg|degrees|rad|radians')
+
+
+def implicit_mult(s):
+    """2(3+4) -> 2*(3+4), )( -> )*(, 2pi -> 2*pi, (a)(b) -> (a)*(b).
+
+    The lookbehinds keep digits that are part of a name (log10, log2) out of
+    it, and the lookahead protects scientific notation (1e5, 2.5e-3).
+    """
+    s = re.sub(r'(?<![A-Za-z_0-9.])(\d[\d.]*)\s*\(', r'\1*(', s)
+    s = re.sub(r'\)\s*\(', r')*(', s)
+    s = re.sub(r'\)\s*(?=[A-Za-z_])', r')*', s)
+    s = re.sub(r'(?<![A-Za-z_0-9.])(\d[\d.]*)\s*(?![eE]\s*[-+]?\d)(?=[A-Za-z_])',
+               r'\1*', s)
+    s = re.sub(r'\b(pi|tau|phi|e)\s*\(', r'\1*(', s)
+    return s
+
+
+CONT_END = ('+', '-', '*', '/', '%', '^', ',', '(', '=', '<', '>', '&', '|')
+CONT_START = set('+*/%^)&|')     # '-' handled separately (could be a new term)
+
+
+def depth_of(s, start=0):
+    d = start
+    for c in s:
+        if c == '(':
+            d += 1
+        elif c == ')':
+            d = max(0, d - 1)
+    return d
+
+
+def split_statements(lines):
+    """Group physical lines into statements, keeping the line structure.
+
+    A line continues the previous one when it (or the previous line) is
+    obviously mid-expression: a dangling operator, an open parenthesis, or a
+    leading operator on this line.
+    """
+    stmts = []
+    for line in lines:
+        prev = stmts[-1] if stmts else None
+        cont = False
+        if prev:
+            joined = ' '.join(prev)
+            tail = joined.rstrip()
+            if tail.endswith(CONT_END) or depth_of(joined) > 0:
+                cont = True
+            elif line[:1] in CONT_START or line[:1] == '-':
+                cont = True
+        if cont:
+            stmts[-1].append(line)
+        else:
+            stmts.append([line])
+    return stmts
+
+
+TRAIL_OP = re.compile(r'(?:[-+*/%^,]|\*\*)\s*$')
+
+
+def assemble(stmt_lines, close='term'):
+    """Join a statement's lines, repairing unbalanced parentheses.
+
+    close='term': parentheses left open at a term boundary (a line ending in
+                  '+' or '-') are closed there — each line of a sum is a term,
+                  so an unclosed paren almost certainly ends with the term.
+    close='end':  everything is closed at the very end instead.
+    Returns (text, number_of_parens_inserted).
+    """
+    parts, depth, added = [], 0, 0
+    for i, raw in enumerate(stmt_lines):
+        line = raw
+        last = i == len(stmt_lines) - 1
+        body, op = line, ''
+        m = TRAIL_OP.search(line)
+        if m and not last:
+            body, op = line[:m.start()], m.group().strip()
+        d = depth_of(body, depth)
+        boundary = last or (close == 'term' and op in ('+', '-'))
+        if boundary and d > 0:
+            body += ')' * d
+            added += d
+            d = 0
+        parts.append(body + (' ' + op if op else ''))
+        depth = d
+    text = ' '.join(p.strip() for p in parts if p.strip())
+    text = re.sub(r'\s{2,}', ' ', TRAIL_OP.sub('', text)).strip()
+    # drop ')' that close nothing, then close whatever is still open
+    kept, depth = [], 0
+    for c in text:
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            if depth == 0:
+                added += 1
+                continue
+            depth -= 1
+        kept.append(c)
+    text = ''.join(kept).strip()
+    if depth > 0:
+        text += ')' * depth
+        added += depth
+    return text, added
+
+
+EQ_SPLIT = re.compile(r'(?<![=!<>])=(?!=)')
+IDENT = re.compile(r'^[A-Za-z_]\w*$')
+
+
+def handle_equals(stmt):
+    """'2+2 =' -> '2+2';  'x = 3*4' -> assignment;  'P(A) = 0.5' -> '0.5'."""
+    parts = EQ_SPLIT.split(stmt)
+    if len(parts) == 1:
+        return stmt
+    parts = [p.strip() for p in parts]
+    while len(parts) > 1 and not parts[-1]:
+        parts.pop()
+    if len(parts) == 1:
+        return parts[0]
+    if IDENT.match(parts[0]):
+        return '%s = %s' % (parts[0], parts[-1])
+    return parts[-1]
+
+
+def build_program(text, close='term'):
+    """Selection text -> (python source, parens_added)."""
+    lines = [normalise_line(l) for l in clean_text(text)]
+    lines = [l for l in lines if l.strip()]
+    src, added = [], 0
+    for stmt in split_statements(lines):
+        body, n = assemble(stmt, close)
+        body = handle_equals(body)
+        body = implicit_mult(body)
+        if body.strip():
+            src.append(body)
+            added += n
+    return '\n'.join(src), added
+
+
+# ===========================================================================
+# 2. safe evaluation, exact where possible
+# ===========================================================================
+
+class CalcError(Exception):
+    pass
+
+
+def _f(x):
+    return float(x)
+
+
+def _int(x, name):
+    v = Fraction(x) if not isinstance(x, float) else Fraction(x).limit_denominator()
+    if isinstance(x, float) and not float(x).is_integer():
+        raise CalcError('%s() needs a whole number' % name)
+    if isinstance(v, Fraction) and v.denominator != 1:
+        raise CalcError('%s() needs a whole number' % name)
+    return int(v)
+
+
+def _flatten(args):
+    out = []
+    for a in args:
+        if isinstance(a, (list, tuple)):
+            out.extend(_flatten(a))
+        else:
+            out.append(a)
+    return out
+
+
+def _log(x, base=None):
+    return math.log(_f(x)) if base is None else math.log(_f(x), _f(base))
+
+
+def _round(x, n=None):
+    if n is None:
+        return Fraction(round(Fraction(x)))
+    q = Fraction(10) ** _int(n, 'round')
+    return Fraction(round(Fraction(x) * q)) / q
+
+
+FUNCS = {
+    'sqrt': lambda x: math.sqrt(_f(x)),
+    'cbrt': lambda x: math.copysign(abs(_f(x)) ** (1 / 3), _f(x)),
+    'sin': lambda x: math.sin(_f(x)), 'cos': lambda x: math.cos(_f(x)),
+    'tan': lambda x: math.tan(_f(x)), 'asin': lambda x: math.asin(_f(x)),
+    'acos': lambda x: math.acos(_f(x)), 'atan': lambda x: math.atan(_f(x)),
+    'sinh': lambda x: math.sinh(_f(x)), 'cosh': lambda x: math.cosh(_f(x)),
+    'tanh': lambda x: math.tanh(_f(x)),
+    'log': _log, 'ln': lambda x: math.log(_f(x)),
+    'log2': lambda x: math.log2(_f(x)), 'log10': lambda x: math.log10(_f(x)),
+    'lg': lambda x: math.log10(_f(x)), 'exp': lambda x: math.exp(_f(x)),
+    'abs': abs, 'floor': lambda x: Fraction(math.floor(Fraction(x))),
+    'ceil': lambda x: Fraction(math.ceil(Fraction(x))),
+    'trunc': lambda x: Fraction(math.trunc(Fraction(x))),
+    'round': _round,
+    'sign': lambda x: Fraction((x > 0) - (x < 0)),
+    'min': lambda *a: min(_flatten(a)), 'max': lambda *a: max(_flatten(a)),
+    'sum': lambda *a: sum(_flatten(a), Fraction(0)),
+    'avg': lambda *a: sum(_flatten(a), Fraction(0)) / len(_flatten(a)),
+    'mean': lambda *a: sum(_flatten(a), Fraction(0)) / len(_flatten(a)),
+    'gcd': lambda *a: Fraction(math.gcd(*[_int(x, 'gcd') for x in _flatten(a)])),
+    'lcm': lambda *a: Fraction(math.lcm(*[_int(x, 'lcm') for x in _flatten(a)])),
+    'factorial': lambda x: Fraction(math.factorial(_int(x, 'factorial'))),
+    'fact': lambda x: Fraction(math.factorial(_int(x, 'fact'))),
+    'comb': lambda n, k: Fraction(math.comb(_int(n, 'comb'), _int(k, 'comb'))),
+    'perm': lambda n, k: Fraction(math.perm(_int(n, 'perm'), _int(k, 'perm'))),
+    'hypot': lambda *a: math.hypot(*[_f(x) for x in _flatten(a)]),
+    'pow': lambda a, b: _pow(a, b), 'mod': lambda a, b: Fraction(a) % Fraction(b),
+    'deg': lambda x: math.degrees(_f(x)), 'degrees': lambda x: math.degrees(_f(x)),
+    'rad': lambda x: math.radians(_f(x)), 'radians': lambda x: math.radians(_f(x)),
+}
+CONSTS = {'pi': math.pi, 'e': math.e, 'tau': math.tau,
+          'phi': (1 + 5 ** 0.5) / 2, 'inf': math.inf}
+
+
+def _pow(a, b):
+    try:
+        fb = Fraction(b) if not isinstance(b, float) else None
+        if fb is not None and fb.denominator == 1:
+            n = int(fb)
+            if abs(n) > 4096:
+                raise CalcError('exponent too large')
+            return Fraction(a) ** n
+        if _f(a) < 0:
+            raise CalcError('complex result')
+        return _f(a) ** _f(b)
+    except OverflowError:
+        raise CalcError('number too large')
+
+
+BINOPS = {
+    ast.Add: lambda a, b: a + b,
+    ast.Sub: lambda a, b: a - b,
+    ast.Mult: lambda a, b: a * b,
+    ast.Div: lambda a, b: a / b,
+    ast.FloorDiv: lambda a, b: Fraction(math.floor(Fraction(a) / Fraction(b))),
+    ast.Mod: lambda a, b: Fraction(a) % Fraction(b),
+    ast.Pow: _pow,
+}
+
+
+def ev(node, env):
+    if isinstance(node, ast.Constant):
+        v = node.value
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise CalcError('not a number: %r' % (v,))
+        return Fraction(str(v)) if isinstance(v, float) else Fraction(v)
+    if isinstance(node, ast.Name):
+        k = node.id
+        if k in env:
+            return env[k]
+        if k in CONSTS:
+            return CONSTS[k]
+        if k in FUNCS:
+            raise CalcError("'%s' needs arguments, e.g. %s(2)" % (k, k))
+        raise CalcError("unknown name '%s'" % k)
+    if isinstance(node, ast.BinOp):
+        op = BINOPS.get(type(node.op))
+        if op is None:
+            raise CalcError('unsupported operator')
+        a, b = ev(node.left, env), ev(node.right, env)
+        try:
+            return op(a, b)
+        except ZeroDivisionError:
+            raise CalcError('division by zero')
+    if isinstance(node, ast.UnaryOp):
+        if isinstance(node.op, ast.USub):
+            return -ev(node.operand, env)
+        if isinstance(node.op, ast.UAdd):
+            return ev(node.operand, env)
+        raise CalcError('unsupported unary operator')
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id not in FUNCS:
+            name = getattr(node.func, 'id', '?')
+            raise CalcError("unknown function '%s'" % name)
+        if node.keywords:
+            raise CalcError('keyword arguments not supported')
+        args = [ev(a, env) for a in node.args]
+        try:
+            return FUNCS[node.func.id](*args)
+        except CalcError:
+            raise
+        except ZeroDivisionError:
+            raise CalcError('division by zero')
+        except (ValueError, OverflowError) as e:
+            raise CalcError('%s(): %s' % (node.func.id, e))
+        except TypeError:
+            raise CalcError('wrong number of arguments to %s()' % node.func.id)
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return [ev(e, env) for e in node.elts]
+    raise CalcError('unsupported expression')
+
+
+def run_program(src):
+    """Execute the normalised source. Returns (values, env).
+
+    values is every top-level expression result, in order (assignments feed
+    the environment instead of producing a value).
+    """
+    try:
+        tree = ast.parse(src, mode='exec')
+    except SyntaxError as e:
+        raise CalcError("can't parse: %s" % (e.msg,))
+    env, values, last_assigned = {}, [], None
+    for st in tree.body:
+        if isinstance(st, ast.Assign):
+            if len(st.targets) != 1 or not isinstance(st.targets[0], ast.Name):
+                raise CalcError('only simple assignments are supported')
+            last_assigned = env[st.targets[0].id] = ev(st.value, env)
+        elif isinstance(st, ast.Expr):
+            values.append(ev(st.value, env))
+        else:
+            raise CalcError('unsupported statement')
+    if not values:
+        # the whole selection was 'name = expression' — show what it evaluates to
+        if last_assigned is not None:
+            return [last_assigned], env
+        raise CalcError('nothing to evaluate')
+    return values, env
+
+
+# ===========================================================================
+# 3. formatting
+# ===========================================================================
+
+def group(int_str):
+    neg = int_str.startswith('-')
+    d = int_str.lstrip('-')
+    return ('-' if neg else '') + '{:,}'.format(int(d)) if d.isdigit() else int_str
+
+
+def fmt_num(v, sig=MAX_SIG, sep=True):
+    if isinstance(v, Fraction) and v.denominator == 1:
+        s = str(v.numerator)
+        return group(s) if sep else s
+    f = float(v)
+    if math.isnan(f):
+        return 'nan'
+    if math.isinf(f):
+        return '∞' if f > 0 else '-∞'
+    if f == 0:
+        return '0'
+    a = abs(f)
+    if not isinstance(v, Fraction) and abs(f - round(f)) < 1e-11 * max(1.0, a):
+        s = str(int(round(f)))
+        return group(s) if sep else s
+    if a >= 1e15 or a < 1e-9:
+        mant, ex = ('%.*e' % (sig - 1, f)).split('e')
+        return '%s×10^%d' % (mant.rstrip('0').rstrip('.'), int(ex))
+    dec = min(15, max(0, sig - 1 - int(math.floor(math.log10(a)))))
+    s = ('%.*f' % (dec, f)).rstrip('0').rstrip('.')
+    if not sep or '.' not in s:
+        return group(s) if sep else s
+    i, frac = s.split('.')
+    return group(i) + '.' + frac
+
+
+def exact_fraction(v):
+    if not isinstance(v, Fraction) or v.denominator == 1:
+        return None
+    s = '%d/%d' % (v.numerator, v.denominator)
+    return s if len(s) <= FRACTION_MAX else None
+
+
+def extras_for(v):
+    """Small secondary readings: exact fraction, percent, scientific."""
+    out = []
+    fr = exact_fraction(v)
+    if fr:
+        out.append('= ' + fr)
+    try:
+        f = float(v)
+    except (OverflowError, ValueError):
+        return out
+    if f and abs(f) <= 10 and abs(f) >= 1e-6 and not (
+            isinstance(v, Fraction) and v.denominator == 1):
+        out.append('≈ ' + fmt_num(f * 100, 8) + '%')
+    if abs(f) >= 1e6:
+        mant, ex = ('%.6e' % f).split('e')
+        out.append('≈ %s×10^%d' % (mant.rstrip('0').rstrip('.'), int(ex)))
+    return out
+
+
+# ===========================================================================
+# 4. the one call that does everything
+# ===========================================================================
+
+class Result:
+    def __init__(self):
+        self.expr = ''          # normalised source actually evaluated
+        self.values = []        # one entry per top-level expression
+        self.total = None       # the headline number
+        self.is_sum = False
+        self.added = 0          # parentheses inserted to repair the input
+        self.alt = None         # alternative reading when parens were repaired
+        self.error = None
+
+
+def evaluate(text):
+    r = Result()
+    src, added = build_program(text, close='term')
+    r.expr, r.added = src, added
+    if not src.strip():
+        r.error = 'nothing to calculate'
+        return r
+    try:
+        values, _ = run_program(src)
+    except CalcError as e:
+        # fall back to one statement per line (a plain column of numbers)
+        alt_src = '\n'.join(l for l in
+                            (normalise_line(x) for x in clean_text(text)) if l)
+        try:
+            values, _ = run_program(implicit_mult(alt_src))
+            r.expr = alt_src
+        except CalcError:
+            r.error = str(e)
+            return r
+    r.values = values
+    if len(values) == 1:
+        r.total = values[0]
+    else:
+        r.is_sum = True
+        try:
+            r.total = sum(values, Fraction(0))
+        except TypeError:
+            r.total = sum(float(v) for v in values)
+    if added:
+        alt_src, _ = build_program(text, close='end')
+        if alt_src != src:
+            try:
+                alt_vals, _ = run_program(alt_src)
+                alt = alt_vals[0] if len(alt_vals) == 1 else sum(alt_vals)
+                if fmt_num(alt) != fmt_num(r.total):
+                    r.alt = (alt_src, alt)
+            except CalcError:
+                pass
+    return r
+
+
+# ===========================================================================
+# 5. grabbing whatever is selected on screen
+# ===========================================================================
+
+def _run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def get_selection():
+    """Primary selection first; fall back to a synthesised Ctrl+C."""
+    try:
+        p = _run(['wl-paste', '-p', '-n'], timeout=2)
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout
+    except Exception:
+        pass
+    before = ''
+    try:
+        p = _run(['wl-paste', '-n'], timeout=2)
+        before = p.stdout if p.returncode == 0 else ''
+    except Exception:
+        pass
+    if _ensure_ydotoold():
+        try:
+            subprocess.run(['ydotool', 'key', '42:0', '54:0', '125:0',
+                            '56:0', '100:0'], capture_output=True, timeout=2)
+            subprocess.run(['ydotool', 'key', '29:1', '46:1', '46:0', '29:0'],
+                           capture_output=True, timeout=2)
+        except Exception:
+            pass
+        import time
+        time.sleep(0.3)
+        try:
+            p = _run(['wl-paste', '-n'], timeout=2)
+            new = p.stdout if p.returncode == 0 else ''
+        except Exception:
+            new = ''
+        if new.strip() and new != before:
+            if before.strip():
+                subprocess.Popen(['wl-copy'], stdin=subprocess.PIPE).communicate(
+                    before.encode())
+            return new
+    return before if before.strip() else ''
+
+
+def _ensure_ydotoold():
+    if not _which('ydotool'):
+        return False
+    if _run(['pgrep', '-x', 'ydotoold']).returncode == 0:
+        return True
+    try:
+        subprocess.Popen(['ydotoold', '--socket-path',
+                          os.environ['YDOTOOL_SOCKET'],
+                          '--socket-own', '%s:%s' % (os.getuid(), os.getgid())],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        import time
+        time.sleep(0.6)
+        return True
+    except Exception:
+        return False
+
+
+def _which(x):
+    from shutil import which
+    return which(x)
+
+
+def copy_out(text):
+    try:
+        subprocess.Popen(['wl-copy'], stdin=subprocess.PIPE).communicate(
+            text.encode())
+        return True
+    except Exception:
+        return False
+
+
+def notify(msg):
+    if _which('notify-send'):
+        subprocess.run(['notify-send', '-t', '2500', 'calc', msg],
+                       capture_output=True)
+
+
+# ===========================================================================
+# 6. the popup
+# ===========================================================================
+
+PIDFILE = '%s/calc-popup.pid' % os.environ['XDG_RUNTIME_DIR']
+
+
+def claim_popup():
+    """Only one popup at a time: a second press replaces the first."""
+    try:
+        old = int(open(PIDFILE).read().strip())
+        if old != os.getpid():
+            os.kill(old, 15)
+    except Exception:
+        pass
+    try:
+        with open(PIDFILE, 'w') as fh:
+            fh.write(str(os.getpid()))
+    except Exception:
+        pass
+
+
+def show_popup(res, source_text):
+    claim_popup()
+    import gi
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gtk, Gdk, GLib, Pango
+
+    accent = current_accent()
+    ok = res.error is None
+    raw = fmt_num(res.total, sep=False) if ok else ''
+    big = fmt_num(res.total) if ok else 'no result'
+
+    win = Gtk.Window(title='calc')
+    win.set_decorated(False)
+    win.set_resizable(False)
+    win.set_keep_above(True)
+    win.set_skip_taskbar_hint(True)
+    win.set_skip_pager_hint(True)
+    win.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+    win.set_position(Gtk.WindowPosition.CENTER)
+    win.set_app_paintable(True)
+    vis = win.get_screen().get_rgba_visual()
+    if vis:
+        win.set_visual(vis)
+
+    css = ('''
+    window { background-color: transparent; }
+    .root { background-color: #0c0c11; border: 1px solid %(border)s;
+        border-radius: 16px; padding: 14px 18px; }
+    .tag { color: %(a)s; font-family: monospace; font-size: 12px;
+        letter-spacing: 3px; }
+    .expr { color: #7d7d8c; font-family: monospace; font-size: 13px; }
+    .big { color: %(a)s; font-weight: bold; }
+    .err { color: #ff6b6b; font-size: 17px; }
+    .chip { color: #b8b8c6; font-family: monospace; font-size: 14px; }
+    .warn { color: #fbbf24; font-family: monospace; font-size: 12px; }
+    .hint { color: #55555f; font-family: monospace; font-size: 11px;
+        letter-spacing: 1px; }
+    .rule { background-color: #23232e; }
+    scrolledwindow { background: transparent; }
+    ''' % {'a': accent, 'border': hex_rgba(accent, '0.55')})
+    prov = Gtk.CssProvider()
+    prov.load_from_data(css.encode())
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    root.get_style_context().add_class('root')
+    win.add(root)
+
+    tag = Gtk.Label(xalign=0)
+    tag.set_markup('<span>= C A L C</span>')
+    tag.get_style_context().add_class('tag')
+    root.pack_start(tag, False, False, 0)
+
+    shown = res.expr if (ok and res.expr) else source_text.strip()
+    expr = Gtk.Label(xalign=0)
+    expr.set_text(shown[:600] + ('…' if len(shown) > 600 else ''))
+    expr.set_line_wrap(True)
+    expr.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+    expr.set_max_width_chars(56)
+    expr.set_selectable(True)
+    expr.get_style_context().add_class('expr')
+    sc = Gtk.ScrolledWindow()
+    sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    sc.set_max_content_height(110)
+    sc.set_propagate_natural_height(True)
+    sc.add(expr)
+    root.pack_start(sc, False, False, 0)
+
+    rule = Gtk.Box()
+    rule.get_style_context().add_class('rule')
+    rule.set_size_request(-1, 1)
+    root.pack_start(rule, False, False, 2)
+
+    if ok:
+        size = 34 if len(big) <= 13 else (26 if len(big) <= 22 else 19)
+        lbl = Gtk.Label(xalign=0)
+        lbl.set_markup('<span size="%d">%s</span>'
+                       % (size * 1024, GLib.markup_escape_text(big)))
+        lbl.set_line_wrap(True)
+        lbl.set_max_width_chars(40)
+        lbl.set_selectable(True)
+        lbl.get_style_context().add_class('big')
+        root.pack_start(lbl, False, False, 0)
+
+        chips = extras_for(res.total)
+        if chips:
+            c = Gtk.Label(xalign=0)
+            c.set_text('   '.join(chips))
+            c.set_selectable(True)
+            c.get_style_context().add_class('chip')
+            root.pack_start(c, False, False, 0)
+
+        if res.is_sum:
+            parts = '  ·  '.join(fmt_num(v) for v in res.values[:8])
+            if len(res.values) > 8:
+                parts += '  · …'
+            s = Gtk.Label(xalign=0)
+            s.set_text('Σ of %d values:  %s' % (len(res.values), parts))
+            s.set_line_wrap(True)
+            s.set_max_width_chars(56)
+            s.get_style_context().add_class('warn')
+            root.pack_start(s, False, False, 0)
+
+        if res.added:
+            msg = '⚠ auto-closed %d parenthes%s' % (
+                res.added, 'is' if res.added == 1 else 'es')
+            if res.alt:
+                msg += '   ·   closed at the end instead: %s' % fmt_num(res.alt[1])
+            w = Gtk.Label(xalign=0)
+            w.set_text(msg)
+            w.set_line_wrap(True)
+            w.set_max_width_chars(56)
+            w.get_style_context().add_class('warn')
+            root.pack_start(w, False, False, 0)
+    else:
+        e = Gtk.Label(xalign=0)
+        e.set_text('⚠ ' + res.error)
+        e.set_line_wrap(True)
+        e.set_max_width_chars(48)
+        e.get_style_context().add_class('err')
+        root.pack_start(e, False, False, 0)
+
+    hint = Gtk.Label(xalign=0)
+    hint.get_style_context().add_class('hint')
+    hint.set_text('Enter / C  copy      Esc  close' if ok else 'Esc  close')
+    root.pack_start(hint, False, False, 2)
+
+    state = {'armed': False}
+
+    def close(*_):
+        Gtk.main_quit()
+
+    def do_copy():
+        if ok and copy_out(raw):
+            hint.set_text('copied  %s' % raw)
+            GLib.timeout_add(450, close)
+        else:
+            close()
+
+    def on_key(_w, ev):
+        k = ev.keyval
+        if k in (Gdk.KEY_Escape, Gdk.KEY_q):
+            close()
+        elif k in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_c, Gdk.KEY_C):
+            do_copy()
+        return True
+
+    win.connect('key-press-event', on_key)
+    win.connect('destroy', close)
+    win.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+    win.connect('button-press-event', lambda *a: close())
+    win.connect('focus-out-event',
+                lambda *a: close() if state['armed'] else None)
+    GLib.timeout_add(900, lambda: state.update(armed=True) or False)
+
+    win.show_all()
+    win.present()
+    Gtk.main()
+
+
+# ===========================================================================
+# 7. self-test
+# ===========================================================================
+
+TESTS = [
+    ('2+2', '4'),
+    ('1/3', '0.333333333333'),
+    ('2^10', '1,024'),
+    ('50% of 80', '40'),
+    ('1,234,567 + 1', '1,234,568'),
+    ('sqrt(2)', '1.41421356237'),
+    ('2(3+4)', '14'),
+    ('2pi', '6.28318530718'),
+    ('1920 x 1080', '2,073,600'),
+    ('10 % 3', '1'),
+    ('15%', '0.15'),
+    ('  3 × 4 ÷ 2  ', '6'),
+    ('2+2 =', '4'),
+    ('total = 5*3', '15'),
+    ('x = 5\ny = x*2\nx+y', '15'),
+    ('½ + ¼', '0.75'),
+    ('3²', '9'),
+    ('\\frac{3}{4} + 1', '1.75'),
+    ('(1+2', '3'),
+    ('12\n7\n5', '24'),
+    ('1 +\n2 +\n3', '6'),
+    ('log10(1000)', '3'),
+    ('factorial(5)', '120'),
+    ('max(3, 9, 4)', '9'),
+    ('avg(2,4,6)', '4'),
+    ('$1 + 1$', '2'),
+]
+
+EXAMPLE = """1 * 15/16 +
+1/2 * (1-(15/16)) * 1/16 +
+1/3 * ((1-(15/16)*(1/16)) * 1/16 +
+1/5 * ((1-(15/16)*(1/16)*(1/16)) * 7/16"""
+
+
+def selftest():
+    bad = 0
+    for src, want in TESTS:
+        r = evaluate(src)
+        got = ('ERR: ' + r.error) if r.error else fmt_num(r.total)
+        flag = 'ok  ' if got == want else 'FAIL'
+        if got != want:
+            bad += 1
+        print('%s %-26r -> %-18s (want %s)' % (flag, src, got, want))
+    r = evaluate(EXAMPLE)
+    print('\nmulti-line example:')
+    print('  normalised: %s' % r.expr)
+    print('  result:     %s   %s' % (fmt_num(r.total), '  '.join(extras_for(r.total))))
+    print('  repaired:   %d parens; alt reading: %s'
+          % (r.added, fmt_num(r.alt[1]) if r.alt else '-'))
+    if r.error:
+        bad += 1
+        print('  ERROR: %s' % r.error)
+    print('\n%d failed' % bad)
+    return 1 if bad else 0
+
+
+# ===========================================================================
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ('-h', '--help'):
+        print(__doc__.strip())
+        return 0
+    if args and args[0] == '--selftest':
+        return selftest()
+
+    gui = not args
+    if args and args[0] in ('-g', '--gui'):
+        gui, args = True, args[1:]
+
+    text = ' '.join(args) if args else get_selection()
+    if not text.strip():
+        notify('Nothing selected. Highlight an expression, then press the key.')
+        return 0
+
+    res = evaluate(text)
+    if gui:
+        show_popup(res, text)
+        return 0
+    if res.error:
+        print('calc: %s' % res.error, file=sys.stderr)
+        print('      %s' % res.expr, file=sys.stderr)
+        return 1
+    print(fmt_num(res.total, sep=False))
+    for x in extras_for(res.total):
+        print('  %s' % x, file=sys.stderr)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
