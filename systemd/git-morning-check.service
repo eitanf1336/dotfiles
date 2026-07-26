@@ -4,3 +4,6 @@ Description=Daily check for git projects with uncommitted/unpushed work
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/git-morning-check scan
+# Clicking the notification launches the review window; without this, systemd
+# kills it along with the rest of the cgroup as soon as scan exits.
+KillMode=process

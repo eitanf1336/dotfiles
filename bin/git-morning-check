@@ -162,8 +162,28 @@ def short(repo):
 
 
 def _open_window_detached():
-    """Launch the review window so it outlives this short-lived helper."""
-    subprocess.Popen(['setsid', '-f', sys.executable, SELF, 'window'],
+    """Launch the review window so it outlives this short-lived helper.
+
+    Under the timer, scan runs inside the service cgroup, and a plain `setsid`
+    child stays in that cgroup: the moment scan exits (right after the click)
+    systemd tears the cgroup down and SIGTERMs the window before it ever maps.
+    So when we're running as a unit, hand the launch to the user manager --
+    the window gets its own transient unit and survives. The unit also carries
+    KillMode=process as a second line of defence. Outside systemd (`checkgit`
+    from a terminal) setsid is fine, and keeps the shell's env.
+    """
+    cmd = [sys.executable, SELF, 'window']
+    if os.environ.get('INVOCATION_ID'):          # started by systemd
+        try:
+            p = subprocess.run(
+                ['systemd-run', '--user', '--quiet', '--collect',
+                 f'--unit=git-morning-check-window-{os.getpid()}', *cmd],
+                timeout=15)
+            if p.returncode == 0:
+                return
+        except Exception:
+            pass                                  # fall through to setsid
+    subprocess.Popen(['setsid', '-f', *cmd],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      stdin=subprocess.DEVNULL)
 
