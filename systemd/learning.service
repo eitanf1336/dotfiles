@@ -1,0 +1,14 @@
+[Unit]
+Description=Learning — study desk server (calendar, materials, practice tests)
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/learning
+ExecStart=/usr/bin/python3 -m app.server
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

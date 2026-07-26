@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Learning — the study desk (calendar, course material, practice tests).
+#
+# Starts the local server (systemd user service, so it survives this terminal)
+# and opens it as a standalone Chrome app window with its own dock icon.
+# A dedicated Chrome profile is what guarantees a separate window/icon rather
+# than a tab absorbed by the running browser.
+
+set -euo pipefail
+
+ROOT="$HOME/code/learning"
+PORT="${LEARNING_PORT:-8777}"
+URL="http://127.0.0.1:$PORT/"
+PROFILE="$HOME/.local/share/learning-app"
+
+usage() {
+  cat <<'EOF'
+learning            open the app
+learning sync       refresh from Moodle + WhatsApp, then open
+learning add FILE   add your own file/link to the library
+      [--course 00960262] [--category summary|exam|lecture|...] [--star] [--title "..."]
+learning server     run the server in the foreground (debugging)
+learning stop       stop the background server
+learning status     is it running?
+EOF
+}
+
+start_server() {
+  if curl -sf -o /dev/null --max-time 2 "$URL/api/state" 2>/dev/null; then return 0; fi
+  if systemctl --user list-unit-files learning.service >/dev/null 2>&1 &&
+     systemctl --user cat learning.service >/dev/null 2>&1; then
+    systemctl --user start learning.service
+  else
+    (cd "$ROOT" && setsid -f python3 -m app.server >/dev/null 2>&1)
+  fi
+  for _ in $(seq 1 40); do
+    curl -sf -o /dev/null --max-time 1 "$URL/api/state" 2>/dev/null && return 0
+    sleep 0.25
+  done
+  echo "learning: server did not come up on $PORT" >&2
+  return 1
+}
+
+case "${1:-open}" in
+  server)  cd "$ROOT" && exec python3 -m app.server ;;
+  stop)    systemctl --user stop learning.service 2>/dev/null || pkill -f "app.server" || true
+           echo "stopped"; exit 0 ;;
+  status)  if curl -sf -o /dev/null --max-time 2 "$URL/api/state"; then echo "running on $PORT"
+           else echo "not running"; fi; exit 0 ;;
+  add)     shift; cd "$ROOT" && exec python3 -m app.add "$@" ;;
+  sync)    start_server
+           curl -sf -X POST -H 'Content-Type: application/json' -d '{"what":"all"}' \
+                "$URL/api/sync" >/dev/null && echo "syncing in the background…" ;;
+  -h|--help|help) usage; exit 0 ;;
+  open)    ;;
+  *)       usage; exit 1 ;;
+esac
+
+start_server
+setsid -f /usr/bin/google-chrome \
+  --app="$URL" \
+  --user-data-dir="$PROFILE" \
+  --class=Learning \
+  --name=Learning \
+  --window-size=1500,1000 \
+  >/dev/null 2>&1

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Learning
+Comment=Study desk — exams calendar, course material, practice tests
+Exec=/home/eitan/bin/learning
+Icon=accessories-dictionary
+Terminal=false
+Categories=Education;Office;
+StartupWMClass=chrome-127.0.0.1_8777__-Default
