@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=SurfStatus
+Comment=An honest, ad-free surf forecast that tells you if it's worth the paddle
+Exec=/home/eitan/bin/surfstatus
+Icon=/home/eitan/.local/share/icons/webapps/surfstatus.png
+Terminal=false
+StartupWMClass=chrome-surfstatus.live__-Default
+Categories=Network;Utility;
+Keywords=surf;waves;forecast;beach;swell;
+StartupNotify=true
