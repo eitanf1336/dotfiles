@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=LastPass
+Comment=LastPass web vault - passwords, notes and addresses
+Exec=/home/eitan/bin/lastpass
+Icon=/home/eitan/.local/share/icons/webapps/lastpass.png
+Terminal=false
+StartupWMClass=chrome-lastpass.com__vault_-Default
+Categories=Utility;Security;
+Keywords=password;vault;passwords;credentials;lastpass;
+StartupNotify=true

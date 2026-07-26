@@ -1,0 +1,13 @@
+<!-- LastPass mark, traced from the official 64x64 favicon at lastpass.com so it
+     stays sharp at dock/app-grid sizes. Geometry and colour measured from the
+     original: bg #D32D27, three dots r=6.19 at y=31.82 spaced 16.92 apart,
+     cursor bar 2.56 wide x 26 tall. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 64 64">
+  <rect width="64" height="64" fill="#D32D27"/>
+  <g fill="#FFFFFF">
+    <circle cx="11.76" cy="31.82" r="6.19"/>
+    <circle cx="28.68" cy="31.82" r="6.19"/>
+    <circle cx="45.61" cy="31.82" r="6.19"/>
+    <rect x="56.42" y="18.82" width="2.56" height="26"/>
+  </g>
+</svg>
