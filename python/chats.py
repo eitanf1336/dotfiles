@@ -40,6 +40,7 @@ Keys:
   q            quit
 """
 
+import contextlib
 import curses
 import fcntl
 import json
@@ -1899,6 +1900,82 @@ def create_bg_resume(full_id, fork=False, cwd=None):
     return mt.group(1) if mt else None
 
 
+# ── terminal-resize (SIGWINCH) relay ───────────────────────────────────────
+# THE "resizing the window garbles the chat" BUG. The kernel delivers a
+# terminal's SIGWINCH only to the FOREGROUND process group of that terminal's
+# session, and every chat we open runs in its OWN session (run_child uses
+# start_new_session=True so a stray Ctrl+Z can't tear down the board;
+# run_child_relay gives claude a private pty). So the resize signal lands on
+# the board, never on claude: claude keeps rendering at the width it read when
+# it started, every line wraps at the wrong column, and the screen turns to
+# soup until you Ctrl+Z out and reopen the chat, which only "fixes" it because
+# a fresh process reads the size again on startup.
+#
+# Measured on the real thing (`claude attach` in a pty, 100 -> 55 cols):
+# resizing produced ZERO bytes of output from claude; a single forwarded
+# SIGWINCH made it repaint the whole frame (ESC[2J + full redraw) at the new
+# width. So all we have to do is pass the signal on.
+WINCH_SETTLE = 0.18   # quiet gap that means the resize/drag has finished
+WINCH_MIN_GAP = 0.12  # mid-drag relay rate limit (~8 repaints/sec, not 60)
+
+
+@contextlib.contextmanager
+def winch_relay(nudge):
+    """Relay terminal resizes to a child that can't get them itself.
+
+    Calls nudge() on each SIGWINCH (rate-limited, so a slow window drag still
+    tracks live without making claude repaint on every one of VTE's dozens of
+    events), and then ONCE more WINCH_SETTLE seconds after the last one. That
+    last call is the settle repaint, and it's what actually wipes the garbage a
+    drag leaves behind, since only the final frame is drawn at the final size.
+
+    The debounce rides on SIGALRM because the caller is parked in waitpid() /
+    select() the whole time: signal handlers still run there, and PEP 475 makes
+    Python resume the interrupted call afterwards, so nothing else has to
+    change."""
+    last = [0.0]
+
+    def _fire():
+        last[0] = time.monotonic()
+        try:
+            nudge()
+        except Exception:
+            pass  # child already gone / tty vanished, nothing to repaint
+
+    def _on_winch(signum, frame):
+        if time.monotonic() - last[0] >= WINCH_MIN_GAP:
+            _fire()
+        signal.setitimer(signal.ITIMER_REAL, WINCH_SETTLE)  # (re)arm the settle
+
+    def _on_alarm(signum, frame):
+        _fire()  # the size stopped changing: final clean repaint
+
+    old = {}
+    try:
+        for sig, handler in ((signal.SIGWINCH, _on_winch),
+                             (signal.SIGALRM, _on_alarm)):
+            try:
+                old[sig] = signal.getsignal(sig)
+                signal.signal(sig, handler)
+            except Exception:
+                pass
+        yield
+    finally:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        except Exception:
+            pass
+        for sig, prev in old.items():
+            try:
+                # getsignal() returns None for a handler installed by C code
+                # (ncurses installs its own SIGWINCH); SIG_DFL for SIGWINCH is
+                # "ignore", and curses reinstalls its handler at the next
+                # initscr(), so the board keeps getting KEY_RESIZE either way.
+                signal.signal(sig, prev if prev is not None else signal.SIG_DFL)
+            except Exception:
+                pass
+
+
 def run_child(cmd, cwd=None):
     """Run an interactive child (claude) and wait for it to truly exit. If a
     stray Ctrl+Z ever suspends it (some claude modes re-enable job control), we
@@ -1912,20 +1989,32 @@ def run_child(cmd, cwd=None):
     terminal (and stops the agent) instead of doing nothing. Giving the child
     its own session contains the signal — the board and terminal always survive.
     Verified: attach still detaches cleanly (agent keeps running) and resume
-    stays fully interactive."""
+    stays fully interactive.
+
+    The price of that separate session is that the terminal's SIGWINCH stops
+    reaching the child, so winch_relay forwards it by hand (see its comment).
+    Without that, resizing the window mid-chat leaves claude drawing at the old
+    width."""
     p = subprocess.Popen(cmd, cwd=cwd, start_new_session=True)
-    while True:
-        try:
-            _, status = os.waitpid(p.pid, os.WUNTRACED)
-        except ChildProcessError:
-            return
-        if os.WIFSTOPPED(status):
+
+    def _nudge():
+        # The child shares our terminal, so its own TIOCGWINSZ already reports
+        # the new size. It just never gets told to look. This is that telling.
+        os.killpg(os.getpgid(p.pid), signal.SIGWINCH)
+
+    with winch_relay(_nudge):
+        while True:
             try:
-                os.kill(p.pid, signal.SIGCONT)  # un-suspend and keep going
-            except Exception:
-                pass
-            continue
-        return  # exited or killed
+                _, status = os.waitpid(p.pid, os.WUNTRACED)
+            except ChildProcessError:
+                return
+            if os.WIFSTOPPED(status):
+                try:
+                    os.kill(p.pid, signal.SIGCONT)  # un-suspend and keep going
+                except Exception:
+                    pass
+                continue
+            return  # exited or killed
 
 
 def reset_tty_modes():
@@ -1984,64 +2073,56 @@ def run_child_relay(cmd, cwd=None):
                          preexec_fn=_pre, close_fds=True)
     os.close(slave)
 
-    def _winch(signum, frame):
-        try:
-            s = fcntl.ioctl(stdin_fd, termios.TIOCGWINSZ, b"\x00" * 8)
-            fcntl.ioctl(master, termios.TIOCSWINSZ, s)
-            os.killpg(os.getpgid(p.pid), signal.SIGWINCH)
-        except Exception:
-            pass
-
-    old_winch = signal.getsignal(signal.SIGWINCH)
-    try:
-        signal.signal(signal.SIGWINCH, _winch)
-    except Exception:
-        pass
+    def _nudge():
+        # Copy the real terminal's size onto claude's pty (which is what its
+        # TIOCGWINSZ reads) and then poke it, so a resize mid-chat repaints at
+        # the new width instead of wrapping into garbage. winch_relay adds the
+        # settle repaint once the drag stops.
+        s = fcntl.ioctl(stdin_fd, termios.TIOCGWINSZ, b"\x00" * 8)
+        fcntl.ioctl(master, termios.TIOCSWINSZ, s)
+        os.killpg(os.getpgid(p.pid), signal.SIGWINCH)
 
     try:
         tty.setraw(stdin_fd)
-        while True:
-            try:
-                rs, _, _ = select.select([stdin_fd, master], [], [], 0.2)
-            except (OSError, select.error):
-                continue
-            if stdin_fd in rs:
+        with winch_relay(_nudge):
+            while True:
                 try:
-                    data = os.read(stdin_fd, 65536)
-                except OSError:
-                    data = b""
-                if data:
-                    if b"\x1a" in data:                  # Ctrl+Z → back to board
-                        pre = data.split(b"\x1a", 1)[0]
-                        if pre:
-                            os.write(master, pre)
-                        break
-                    os.write(master, data)
-            if master in rs:
-                try:
-                    data = os.read(master, 65536)
-                except OSError:
-                    data = b""
-                if not data:
-                    break                                # claude closed the pty
-                os.write(stdout_fd, data)
-            if p.poll() is not None:
-                try:                                     # drain anything left
-                    while True:
-                        d = os.read(master, 65536)
-                        if not d:
+                    rs, _, _ = select.select([stdin_fd, master], [], [], 0.2)
+                except (OSError, select.error):
+                    continue
+                if stdin_fd in rs:
+                    try:
+                        data = os.read(stdin_fd, 65536)
+                    except OSError:
+                        data = b""
+                    if data:
+                        if b"\x1a" in data:              # Ctrl+Z → back to board
+                            pre = data.split(b"\x1a", 1)[0]
+                            if pre:
+                                os.write(master, pre)
                             break
-                        os.write(stdout_fd, d)
-                except OSError:
-                    pass
-                break
+                        os.write(master, data)
+                if master in rs:
+                    try:
+                        data = os.read(master, 65536)
+                    except OSError:
+                        data = b""
+                    if not data:
+                        break                            # claude closed the pty
+                    os.write(stdout_fd, data)
+                if p.poll() is not None:
+                    try:                                 # drain anything left
+                        while True:
+                            d = os.read(master, 65536)
+                            if not d:
+                                break
+                            os.write(stdout_fd, d)
+                    except OSError:
+                        pass
+                    break
     finally:
         try:
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attr)
-        except Exception:
-            pass
-        try:
-            signal.signal(signal.SIGWINCH, old_winch)
         except Exception:
             pass
         if p.poll() is None:
