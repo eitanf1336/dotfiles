@@ -23,6 +23,8 @@ Keys:
                chat's project.
   f            fork a copy of the selected chat
   x            stop the selected live agent
+  s            star/unstar the selected chat — it stays where it is, but its
+               row gets a bright yellow background (and a ★) so it stands out
   1..6         file the selected chat into a category. A freshly-filed chat
                sorts to the TOP of its category, so an accidental move stays in
                plain sight instead of sinking into a big pile.
@@ -592,9 +594,17 @@ def ensure_trusted(cwd):
 
 NAMES_STORE = HOME / ".claude" / "chats" / "names.json"
 
+# sessionId -> True for chats you starred ('s'). A star doesn't move the chat;
+# it just paints the row's background so it jumps out wherever it sits.
+STARRED_STORE = HOME / ".claude" / "chats" / "starred.json"
+
 
 def load_names():
     return _load_json(NAMES_STORE)
+
+
+def load_starred():
+    return _load_json(STARRED_STORE)
 
 
 def claude_names():
@@ -627,6 +637,7 @@ def setup_colors():
     curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_WHITE)  # selection
     curses.init_pair(8, curses.COLOR_WHITE, -1)    # dim/help
     curses.init_pair(9, curses.COLOR_BLUE, -1)     # In Progress / running
+    curses.init_pair(10, curses.COLOR_BLACK, curses.COLOR_YELLOW)  # starred row
 
 
 # Sentinel for App(select_project=...). _KEEP_PROJECT means "this is a fresh
@@ -641,6 +652,7 @@ class App:
         self.stdscr = stdscr
         self.store = load_store()
         self.names = load_names()  # sessionId -> user's custom name
+        self.starred = load_starred()  # sessionId -> True (highlighted row)
         self.moved = load_moved()  # sessionId -> ts it was last (re)filed
         self.superseded_map = load_superseded()   # old id -> continuation id (bg-resume)
         self.superseded = set(self.superseded_map)  # old ids hidden after bg-resume
@@ -1519,6 +1531,7 @@ class App:
                 sel_chat = self.selected_chat(nav)
                 self.store = load_store()
                 self.names = load_names()
+                self.starred = load_starred()
                 self.moved = load_moved()
                 self.tags = load_project_tags()
                 self.superseded_map = load_superseded()  # rescan() resolves & sets self.superseded
@@ -1560,6 +1573,15 @@ class App:
                     self._record_move(c["id"], cur)
                     self.store = _json_set(STORE, c["id"], cat)
                     self.message = f"Moved to “{cat}”  —  u to undo"
+        elif ch in (ord("s"), ord("S")):
+            c = self.selected_chat(nav)
+            if c:
+                if c["id"] in self.starred:
+                    self.starred = _json_set(STARRED_STORE, c["id"], None)
+                    self.message = "Unstarred"
+                else:
+                    self.starred = _json_set(STARRED_STORE, c["id"], True)
+                    self.message = "Starred ★ — s again to unstar"
         elif ch in (ord("u"), ord("U")):
             self._undo_move()
         elif ch in (ord("/"),):
@@ -1669,6 +1691,7 @@ class App:
             try:
                 chat["path"].unlink()
                 self.store = _json_set(STORE, chat["id"], None)
+                self.starred = _json_set(STARRED_STORE, chat["id"], None)
                 self.rescan()
                 self.message = "Chat deleted"
             except Exception as e:
@@ -1703,7 +1726,7 @@ class App:
             except curses.error:
                 pass
         help1 = ("Enter open   / find   Space fold   n new   r rename   m move   "
-                 "o mode   f fork   x stop   1-6 file   u undo   "
+                 "o mode   f fork   x stop   s star   1-6 file   u undo   "
                  "d delete   P projects   ^R reload   q quit")
         self.stdscr.addstr(1, 0, help1[: w - 1], curses.color_pair(8) | curses.A_DIM)
         legend = "  ".join(f"{i+1}:{CATEGORIES[i]}" for i in range(6))
@@ -1767,6 +1790,9 @@ class App:
                 tail = f"  [{proj}]"
                 avail = w - 1 - _dwidth(tail) - len(prefix)
                 t = self.display_title(c)
+                starred = c["id"] in self.starred
+                if starred:
+                    t = "★ " + t
                 if _dwidth(t) > avail:
                     t = _clamp(t, max(0, avail - 1)) + "…"
                 # _bidi() keeps a Hebrew/RTL name from flipping the whole row;
@@ -1775,13 +1801,17 @@ class App:
                 pad = " " * max(0, avail - _dwidth(t))
                 body = _bidi(t) + pad + tail
                 if is_sel:
+                    # The cursor bar stays the usual white so selection always
+                    # looks the same; the ★ prefix still marks a starred chat.
                     self.stdscr.addstr(line_y, 0, _clamp(prefix + body, w - 1),
                                        curses.color_pair(7))
                     self._draw_indicator(line_y, status, sel=True)
                 else:
+                    attr = ((curses.color_pair(10) | curses.A_BOLD)
+                            if starred else curses.A_NORMAL)
                     self.stdscr.addstr(line_y, len(prefix),
                                        _clamp(body, w - 1 - len(prefix)),
-                                       curses.A_NORMAL)
+                                       attr)
                     self._draw_indicator(line_y, status, sel=False)
 
         sep_y = h - footer_h - 1
@@ -2303,6 +2333,8 @@ def main():
                     old_name = app.names.get(c["id"])
                     if old_name:
                         _json_set(NAMES_STORE, new_full, old_name)
+                    if c["id"] in app.starred:
+                        _json_set(STARRED_STORE, new_full, True)
                     # Record the link NOW so the original folds away the moment
                     # the continuation has real content — otherwise the two sit
                     # side by side as a duplicate for the whole session. This is
@@ -2382,6 +2414,7 @@ def main():
                 _json_set(STORE, cont_full, None)          # drop its copied metadata
                 _json_set(PROJECT_TAGS_STORE, cont_full, None)
                 _json_set(NAMES_STORE, cont_full, None)
+                _json_set(STARRED_STORE, cont_full, None)
                 last_id = old_id  # keep the cursor on the original, not the phantom
 
         if dbg_on:
