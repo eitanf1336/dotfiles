@@ -348,8 +348,7 @@ export default class TerminalTilerExtension extends Extension {
     _halfTile(win, delta) {
         if (!win || win.get_window_type() !== Meta.WindowType.NORMAL)
             return;
-        const ws = global.workspace_manager.get_active_workspace();
-        const wa = ws.get_work_area_for_monitor(win.get_monitor());
+        const wa = this._workArea(win.get_monitor());
         if (win.maximizedHorizontally || win.maximizedVertically)
             win.unmaximize(Meta.MaximizeFlags.BOTH);
         const half = Math.round(wa.width / 2);
@@ -578,8 +577,7 @@ export default class TerminalTilerExtension extends Extension {
             return;
         }
 
-        const ws = global.workspace_manager.get_active_workspace();
-        const wa = ws.get_work_area_for_monitor(monitor);
+        const wa = this._workArea(monitor);
         const n = arr.length;
         const cols = this._settings.get_string('orientation') !== 'rows';
 
@@ -636,6 +634,45 @@ export default class TerminalTilerExtension extends Extension {
         }
     }
 
+    // Work area for a monitor, minus any dock mutter failed to carve out.
+    // Mutter only honours a strut whose actor touches an outer edge of the
+    // combined screen, so with side-by-side monitors a fixed Dash-to-Dock on
+    // an inner monitor (multi-monitor docks) overlaps the reported work area
+    // instead of shrinking it, and tiles slide underneath it. Re-do the
+    // subtraction here for every visible strut-requesting chrome actor that
+    // still overlaps the area; honoured struts (leftmost dock, top bar) lie
+    // outside the reported area already, so they skip via the overlap test.
+    _workArea(monitor) {
+        const ws = global.workspace_manager.get_active_workspace();
+        const wa = ws.get_work_area_for_monitor(monitor);
+        let x = wa.x, y = wa.y;
+        let right = wa.x + wa.width, bottom = wa.y + wa.height;
+        for (const data of Main.layoutManager._trackedActors ?? []) {
+            const actor = data.actor;
+            if (!data.affectsStruts || !actor || !actor.visible)
+                continue;
+            const [ax, ay] = actor.get_transformed_position().map(Math.round);
+            const [aw, ah] = actor.get_transformed_size().map(Math.round);
+            const ax2 = ax + aw, ay2 = ay + ah;
+            if (ax >= right || ax2 <= x || ay >= bottom || ay2 <= y)
+                continue;
+            // Trim from whichever edge of the area the actor hugs: a vertical
+            // dock eats width, a horizontal panel eats height. An actor
+            // floating mid-area matches no case and is left alone.
+            if (ax <= x && ax2 < right)
+                x = ax2;
+            else if (ax2 >= right && ax > x)
+                right = ax;
+            else if (ay <= y && ay2 < bottom)
+                y = ay2;
+            else if (ay2 >= bottom && ay > y)
+                bottom = ay;
+        }
+        if (right - x < 100 || bottom - y < 100)
+            return wa;
+        return {x, y, width: right - x, height: bottom - y};
+    }
+
     // Geometry of the i-th of n equal slices of work area `wa` (vertical
     // columns when `cols`, horizontal rows otherwise). Shared by _tile (to
     // place windows) and _onSizeChanged (to tell when one has wandered off).
@@ -677,8 +714,7 @@ export default class TerminalTilerExtension extends Extension {
         if (i < 0)
             return;
 
-        const ws = global.workspace_manager.get_active_workspace();
-        const wa = ws.get_work_area_for_monitor(monitor);
+        const wa = this._workArea(monitor);
         const cols = this._settings.get_string('orientation') !== 'rows';
         const s = this._slotRect(wa, i, live.length, cols);
         const r = win.get_frame_rect();
