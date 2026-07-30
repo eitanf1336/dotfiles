@@ -664,26 +664,39 @@ def _ydo(*args, stdin=None):
         return False
 
 
-def active_layout_is_us():
-    """ydotool types scancodes, so what comes out depends on the live layout.
+def paste_in_place(text):
+    """Insert text through the clipboard, then put the clipboard back.
 
-    Only the plain 'us' layout is guaranteed to render '.' and 'e' correctly —
-    under 'il' a decimal point would come out as a Hebrew letter.
+    This is deliberately how the answer is written: ydotool's `type` sends
+    scancodes, so the glyph depends on the layout that happens to be active —
+    with 'il' selected a decimal point arrives as 'ץ' and the answer is
+    silently wrong. The clipboard carries real characters, so a paste says the
+    same thing under every layout. Ctrl+V itself keeps working under Hebrew
+    because apps resolve that accelerator on the Latin group.
     """
+    import time
+    if not _which('wl-copy'):
+        return False
+    before = ''
     try:
-        import ast as _ast
-        srcs = _ast.literal_eval(_run(
-            ['gsettings', 'get', 'org.gnome.desktop.input-sources', 'sources'],
-            timeout=2).stdout.strip())
-        cur = int(_run(['gsettings', 'get', 'org.gnome.desktop.input-sources',
-                        'current'], timeout=2).stdout.strip().split()[-1])
-        return srcs[cur][1].split('+')[0] in ('us', 'en')
+        p = _run(['wl-paste', '-n'], timeout=2)
+        before = p.stdout if p.returncode == 0 else ''
     except Exception:
-        return True
+        pass
+    if not copy_out(text):
+        return False
+    if not DRY_RUN:
+        time.sleep(0.12)
+    ok = _ydo('key', '%d:1' % K_CTRL, '%d:1' % K_V, '%d:0' % K_V, '%d:0' % K_CTRL)
+    if ok and not DRY_RUN:
+        time.sleep(0.6)          # let the app read it before handing it back
+        if before.strip():
+            copy_out(before)
+    return ok
 
 
 def write_in_place(text):
-    """Type the answer at the end of the selection, as if the user typed it.
+    """Write the answer at the end of the selection, as if typed by hand.
 
     The hotkey's own Ctrl+Alt are still physically held when this runs, so the
     modifiers are released first — otherwise the collapse keystroke would read
@@ -698,26 +711,10 @@ def write_in_place(text):
     # collapse the selection to its right-hand end, so nothing is overwritten
     _ydo('key', '%d:1' % K_RIGHT, '%d:0' % K_RIGHT)
     time.sleep(0.06)
-
-    if active_layout_is_us():
-        # --file - keeps escape processing off and survives a leading '-'
-        return _ydo('type', '--file', '-', stdin=text)
-
-    # non-US layout: scancodes would type the wrong glyphs, so paste instead
-    before = ''
-    try:
-        p = _run(['wl-paste', '-n'], timeout=2)
-        before = p.stdout if p.returncode == 0 else ''
-    except Exception:
-        pass
-    if not DRY_RUN:
-        copy_out(text)
-        time.sleep(0.12)
-    ok = _ydo('key', '%d:1' % K_CTRL, '%d:1' % K_V, '%d:0' % K_V, '%d:0' % K_CTRL)
-    if not DRY_RUN:
-        time.sleep(0.35)
-        copy_out(before) if before.strip() else None
-    return ok
+    if paste_in_place(text):
+        return True
+    # no clipboard tool at all: type it, and accept the layout risk
+    return _ydo('type', '--file', '-', stdin=text)
 
 
 def inline_text(v):
@@ -738,6 +735,9 @@ ENDS_EQUALS = re.compile(r'[=≈≃＝]\s*$')
 
 
 def copy_out(text):
+    if DRY_RUN:
+        print('would run: wl-copy  <<< %r' % text)
+        return True
     try:
         subprocess.Popen(['wl-copy'], stdin=subprocess.PIPE).communicate(
             text.encode())
