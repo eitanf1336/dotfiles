@@ -5,11 +5,19 @@ Select any expression anywhere on screen (multi-line is fine, so are sloppy
 parentheses, LaTeX-ish text, percentages and 1,234-style separators) and press
 Ctrl+Alt+C. A small dark popup shows the result; Enter copies it, Esc closes.
 
+If the selection ENDS WITH '=' there is no popup: the answer is written in
+place, right after the equals sign, as if you had typed it yourself.
+  before:  (0.4 * 0.4 * 0.6 * 3) * (0.4 * 0.6 * 2) =
+  after:   (0.4 * 0.4 * 0.6 * 3) * (0.4 * 0.6 * 2) = 0.13824
+
 Usage:
   calc                    evaluate the current selection, show the popup
   calc '2^10 + 5%'        evaluate on the command line, print the result
   calc -g '(1+sqrt(5))/2' evaluate the given expression in the popup
+  calc -i '2+2 ='         force writing the answer in place
+  calc --dry-run -i '2 =' show what would be typed, without typing it
   calc --selftest         run the parser test suite
+  calc --livetest         prove the in-place write keeps the highlighted text
 """
 
 import ast
@@ -632,6 +640,103 @@ def _which(x):
     return which(x)
 
 
+# --- writing the answer back where the equation is ------------------------
+# Linux input-event codes, for ydotool's key command.
+K_CTRL, K_RCTRL, K_SHIFT, K_RSHIFT = 29, 97, 42, 54
+K_ALT, K_RALT, K_META, K_RMETA = 56, 100, 125, 126
+K_RIGHT, K_V = 106, 47
+MODIFIERS = (K_CTRL, K_RCTRL, K_SHIFT, K_RSHIFT, K_ALT, K_RALT, K_META, K_RMETA)
+
+DRY_RUN = False
+
+
+def _ydo(*args, stdin=None):
+    if DRY_RUN:
+        print('would run: ydotool %s%s' % (' '.join(args),
+                                           '  <<< %r' % stdin if stdin else ''))
+        return True
+    try:
+        p = subprocess.run(['ydotool'] + list(args), timeout=5,
+                           input=stdin.encode() if stdin is not None else None,
+                           capture_output=True)
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
+def active_layout_is_us():
+    """ydotool types scancodes, so what comes out depends on the live layout.
+
+    Only the plain 'us' layout is guaranteed to render '.' and 'e' correctly —
+    under 'il' a decimal point would come out as a Hebrew letter.
+    """
+    try:
+        import ast as _ast
+        srcs = _ast.literal_eval(_run(
+            ['gsettings', 'get', 'org.gnome.desktop.input-sources', 'sources'],
+            timeout=2).stdout.strip())
+        cur = int(_run(['gsettings', 'get', 'org.gnome.desktop.input-sources',
+                        'current'], timeout=2).stdout.strip().split()[-1])
+        return srcs[cur][1].split('+')[0] in ('us', 'en')
+    except Exception:
+        return True
+
+
+def write_in_place(text):
+    """Type the answer at the end of the selection, as if the user typed it.
+
+    The hotkey's own Ctrl+Alt are still physically held when this runs, so the
+    modifiers are released first — otherwise the collapse keystroke would read
+    as Ctrl+Alt+Right and switch workspace.
+    """
+    import time
+    if not DRY_RUN and not _ensure_ydotoold():
+        return False
+    time.sleep(0.25)
+    if not _ydo('key', *['%d:0' % k for k in MODIFIERS]):
+        return False
+    # collapse the selection to its right-hand end, so nothing is overwritten
+    _ydo('key', '%d:1' % K_RIGHT, '%d:0' % K_RIGHT)
+    time.sleep(0.06)
+
+    if active_layout_is_us():
+        # --file - keeps escape processing off and survives a leading '-'
+        return _ydo('type', '--file', '-', stdin=text)
+
+    # non-US layout: scancodes would type the wrong glyphs, so paste instead
+    before = ''
+    try:
+        p = _run(['wl-paste', '-n'], timeout=2)
+        before = p.stdout if p.returncode == 0 else ''
+    except Exception:
+        pass
+    if not DRY_RUN:
+        copy_out(text)
+        time.sleep(0.12)
+    ok = _ydo('key', '%d:1' % K_CTRL, '%d:1' % K_V, '%d:0' % K_V, '%d:0' % K_CTRL)
+    if not DRY_RUN:
+        time.sleep(0.35)
+        copy_out(before) if before.strip() else None
+    return ok
+
+
+def inline_text(v):
+    """Plain-ASCII form for pasting into an equation: no separators, no ×10^."""
+    if isinstance(v, Fraction) and v.denominator == 1:
+        return str(v.numerator)
+    f = float(v)
+    if math.isinf(f) or math.isnan(f):
+        return str(f)
+    a = abs(f)
+    if a and (a >= 1e15 or a < 1e-9):
+        mant, ex = ('%.*e' % (MAX_SIG - 1, f)).split('e')
+        return '%se%d' % (mant.rstrip('0').rstrip('.'), int(ex))
+    return fmt_num(v, sep=False)
+
+
+ENDS_EQUALS = re.compile(r'[=≈≃＝]\s*$')
+
+
 def copy_out(text):
     try:
         subprocess.Popen(['wl-copy'], stdin=subprocess.PIPE).communicate(
@@ -869,6 +974,19 @@ EXAMPLE = """1 * 15/16 +
 1/5 * ((1-(15/16)*(1/16)*(1/16)) * 7/16"""
 
 
+# selections that end in '=' get their answer written in place instead
+INLINE_TESTS = [
+    ('(0.4 * 0.4 * 0.6 * 3) * (0.4 * 0.6 * 2) =', ' 0.13824'),
+    ('2+2 =', ' 4'),
+    ('2+2 = ', '4'),          # the space is already there, don't add another
+    ('5-9 =', ' -4'),
+    ('1/3 =', ' 0.333333333333'),
+    ('sqrt(2) ≈', ' 1.41421356237'),
+    ('2+2', None),            # no '=' -> popup, nothing typed
+    ('1/0 =', None),          # broken -> popup, nothing typed
+]
+
+
 def selftest():
     bad = 0
     for src, want in TESTS:
@@ -878,6 +996,18 @@ def selftest():
         if got != want:
             bad += 1
         print('%s %-26r -> %-18s (want %s)' % (flag, src, got, want))
+
+    print()
+    for src, want in INLINE_TESTS:
+        r = evaluate(src)
+        if not ENDS_EQUALS.search(src) or r.error:
+            got = None
+        else:
+            got = ('' if src != src.rstrip() else ' ') + inline_text(r.total)
+        flag = 'ok  ' if got == want else 'FAIL'
+        if got != want:
+            bad += 1
+        print('%s %-44r types %-18r (want %r)' % (flag, src, got, want))
     r = evaluate(EXAMPLE)
     print('\nmulti-line example:')
     print('  normalised: %s' % r.expr)
@@ -891,19 +1021,83 @@ def selftest():
     return 1 if bad else 0
 
 
+def livetest():
+    """Prove the in-place write keeps the equation instead of replacing it.
+
+    Opens a throwaway entry with the whole equation SELECTED — the case that
+    would lose the text if the selection were typed over — and injects only
+    once this window is confirmed focused, so nothing can leak into whatever
+    the user is actually doing.
+    """
+    import threading
+    import gi
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gtk, GLib
+
+    eq = '(0.4 * 0.4 * 0.6 * 3) * (0.4 * 0.6 * 2) ='
+    want = eq + ' 0.13824'
+    win = Gtk.Window(title='calc: in-place write test')
+    win.set_keep_above(True)
+    win.set_default_size(540, 60)
+    entry = Gtk.Entry()
+    entry.set_text(eq)
+    win.add(entry)
+    win.show_all()
+    win.present()
+    entry.grab_focus()
+    entry.select_region(0, -1)          # the whole equation is highlighted
+    st = {'tries': 0, 'rc': 1}
+
+    def finish(ok):
+        got = entry.get_text()
+        st['rc'] = 0 if got == want else 1
+        print('ydotool ok: %s\nwant: %r\ngot : %r\n%s'
+              % (ok, want, got, 'PASS' if got == want else 'FAIL'))
+        Gtk.main_quit()
+        return False
+
+    def attempt():
+        st['tries'] += 1
+        if not win.is_active():
+            if st['tries'] > 20:
+                print('ABORTED: test window never got focus, injected nothing')
+                Gtk.main_quit()
+                return False
+            return True
+        res = evaluate(eq)
+        threading.Thread(
+            target=lambda: GLib.idle_add(
+                finish, write_in_place(' ' + inline_text(res.total))),
+            daemon=True).start()
+        return False
+
+    GLib.timeout_add(200, attempt)
+    GLib.timeout_add(15000, Gtk.main_quit)
+    Gtk.main()
+    return st['rc']
+
+
 # ===========================================================================
 
 def main():
+    global DRY_RUN
     args = sys.argv[1:]
     if args and args[0] in ('-h', '--help'):
         print(__doc__.strip())
         return 0
     if args and args[0] == '--selftest':
         return selftest()
+    if args and args[0] == '--livetest':
+        return livetest()
+    if args and args[0] == '--dry-run':
+        DRY_RUN, args = True, args[1:]
 
     gui = not args
+    inline = False
     if args and args[0] in ('-g', '--gui'):
         gui, args = True, args[1:]
+    elif args and args[0] in ('-i', '--inline'):
+        inline, gui, args = True, True, args[1:]
 
     text = ' '.join(args) if args else get_selection()
     if not text.strip():
@@ -911,7 +1105,18 @@ def main():
         return 0
 
     res = evaluate(text)
+
+    # An equation left open with '=' wants its answer written in, not a popup.
+    if gui and (inline or ENDS_EQUALS.search(text)) and not res.error:
+        pad = '' if text != text.rstrip() else ' '
+        if write_in_place(pad + inline_text(res.total)):
+            return 0
+        # typing is unavailable — fall back to the popup rather than losing it
+
     if gui:
+        if DRY_RUN:
+            print('would show popup: %s' % (res.error or fmt_num(res.total)))
+            return 0
         show_popup(res, text)
         return 0
     if res.error:
