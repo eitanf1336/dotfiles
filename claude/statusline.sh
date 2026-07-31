@@ -62,7 +62,7 @@ if [ -f "$PROJCOLOR" ]; then
   if PROJ=$(python3 "$PROJCOLOR" --resolve --session "$SID" --cwd "$PDIR" 2>/dev/null); then
     PHEX=${PROJ%%$'\t'*}
     PNAME=${PROJ#*$'\t'}
-    if [ -n "$PNAME" ] && [ -n "$PHEX" ]; then
+    if [ -n "$PNAME" ] && [[ "$PHEX" =~ ^#[0-9A-Fa-f]{6}$ ]]; then
       # #RRGGBB -> a 24-bit SGR color (every modern terminal here does truecolor)
       r=$((16#${PHEX:1:2})); g=$((16#${PHEX:3:2})); b=$((16#${PHEX:5:2}))
       PC="\033[38;2;${r};${g};${b}m"
