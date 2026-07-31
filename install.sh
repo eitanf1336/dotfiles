@@ -29,9 +29,23 @@ if [ -f "$LIVE_CHATS" ] && [ ! -L "$LIVE_CHATS" ] \
 else
     ln -sf "$REPO/python/chats.py" "$LIVE_CHATS"
 fi
+# projcolor.py sits beside chats.py (it imports it by path) and is also called
+# by the status line, so both ends get the same per-project colors.
+ln -sf "$REPO/python/projcolor.py" "$HOME/.claude/chats/projcolor.py"
 ln -sf "$REPO/python/claude-ask" "$BIN/claude-ask"
 ln -sf "$BIN/claude-custom" "$BIN/claude-c"
 ln -sf "$BIN/claude-desktop" "$BIN/claude-d"
+
+echo "==> Claude Code status line -> ~/.claude/statusline.sh"
+# Same care as chats.py: a locally-edited real file is never clobbered.
+LIVE_SL="$HOME/.claude/statusline.sh"
+if [ -f "$LIVE_SL" ] && [ ! -L "$LIVE_SL" ] \
+   && ! cmp -s "$LIVE_SL" "$REPO/claude/statusline.sh"; then
+    echo "    SKIP statusline.sh: $LIVE_SL differs from the repo copy; adopt it with"
+    echo "           cp $LIVE_SL $REPO/claude/statusline.sh && git -C $REPO diff"
+else
+    ln -sf "$REPO/claude/statusline.sh" "$LIVE_SL"
+fi
 
 echo "==> Claude Code slash commands -> ~/.claude/commands"
 mkdir -p "$HOME/.claude/commands"

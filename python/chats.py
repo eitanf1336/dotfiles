@@ -36,7 +36,14 @@ Keys:
                remove. The active project filters the board and is where new
                chats start. Inside the panel: h hides (or unhides) the selected
                project, dropping it from the list and its chats from the "all
-               projects" board; Ctrl+H toggles showing the hidden ones.
+               projects" board; Ctrl+H toggles showing the hidden ones; c gives
+               the project a different color.
+
+Every project also gets its own color (see projcolor.py), so you can tell at a
+glance which one a terminal belongs to: the board's header chip and the rules
+above and below the list are drawn in it, every row's [tag] wears its own
+project's color, and while you're inside a chat the text cursor is tinted with
+it and the status line leads with a matching chip.
   d            delete the selected chat permanently (asks to confirm)
   Ctrl+R       reload this script (pick up edits without restarting)
   q            quit
@@ -59,6 +66,15 @@ import time
 import tty
 import unicodedata
 from pathlib import Path
+
+# Per-project colors (see projcolor.py). It sits next to this file; import it by
+# path so the board works whether it's run from ~/.claude/chats or the repo.
+# If it ever goes missing the board just falls back to its plain old colors.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import projcolor
+except Exception:
+    projcolor = None
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -638,6 +654,99 @@ def setup_colors():
     curses.init_pair(8, curses.COLOR_WHITE, -1)    # dim/help
     curses.init_pair(9, curses.COLOR_BLUE, -1)     # In Progress / running
     curses.init_pair(10, curses.COLOR_BLACK, curses.COLOR_YELLOW)  # starred row
+    _PROJ_PAIRS.clear()          # pair numbers don't survive a new curses screen
+    _NEXT_PROJ_PAIR[0] = _PROJ_PAIR_BASE
+
+
+# --- per-project colors on the board ---------------------------------------
+# Every project gets its own color (projcolor.py). curses addresses colors by
+# palette index and pairs by number, so each project color costs two pairs —
+# one to write text in it, one to fill a chip with it — allocated on first use
+# from 20 up (1-10 are the category/status pairs above).
+_PROJ_PAIR_BASE = 20
+_NEXT_PROJ_PAIR = [_PROJ_PAIR_BASE]
+_PROJ_PAIRS = {}   # '#RRGGBB' -> (text_pair, chip_pair)
+
+
+def _proj_pairs(hexcolor):
+    """(text_pair, chip_pair) for a project color, or None when this terminal
+    can't do 256 colors (or we've run out of pair slots) — callers then fall
+    back to the board's plain styling."""
+    if not hexcolor:
+        return None
+    hit = _PROJ_PAIRS.get(hexcolor)
+    if hit is not None:
+        return hit
+    try:
+        if curses.COLORS < 256 or _NEXT_PROJ_PAIR[0] + 1 >= curses.COLOR_PAIRS:
+            _PROJ_PAIRS[hexcolor] = None
+            return None
+        idx = projcolor.xterm256(hexcolor)
+        text_p = _NEXT_PROJ_PAIR[0]
+        chip_p = text_p + 1
+        _NEXT_PROJ_PAIR[0] += 2
+        curses.init_pair(text_p, idx, -1)
+        curses.init_pair(chip_p, curses.COLOR_BLACK, idx)
+    except Exception:
+        _PROJ_PAIRS[hexcolor] = None
+        return None
+    _PROJ_PAIRS[hexcolor] = (text_p, chip_p)
+    return _PROJ_PAIRS[hexcolor]
+
+
+def proj_attr(hexcolor, chip=False, extra=0):
+    """curses attribute that paints something in a project's color: as text, or
+    (chip=True) as a filled bar with black lettering. A_NORMAL if unavailable."""
+    pairs = _proj_pairs(hexcolor)
+    if not pairs:
+        return (curses.A_REVERSE | extra) if chip else (curses.A_NORMAL | extra)
+    return curses.color_pair(pairs[1] if chip else pairs[0]) | extra
+
+
+# --- terminal accent (the cue you get while you're INSIDE a chat) ----------
+# The board can't draw anything once claude takes over the screen, so instead it
+# tints the terminal itself on the way in and puts it back on the way out: the
+# text cursor takes the project's color (OSC 12), and — only if you opt in via
+# "background": true in project_colors.json — the background shifts a few
+# percent toward it too (OSC 11). Both are ignored harmlessly by terminals that
+# don't support them.
+_ACCENT_ON = {"cursor": False, "background": False}
+
+
+def set_terminal_accent(hexcolor):
+    if not (projcolor and hexcolor):
+        return
+    seq = ""
+    try:
+        if projcolor.option("cursor"):
+            seq += f"\033]12;{hexcolor}\007"
+            _ACCENT_ON["cursor"] = True
+        if projcolor.option("background"):
+            strength = float(projcolor.option("background_strength") or 0.1)
+            seq += f"\033]11;{projcolor.mix('#000000', hexcolor, strength)}\007"
+            _ACCENT_ON["background"] = True
+        if seq:
+            os.write(sys.stdout.fileno(), seq.encode())
+    except Exception:
+        pass
+
+
+def clear_terminal_accent():
+    """Put the cursor (and background) back the way the terminal had them. Run
+    on every return from a chat, so a killed or crashed chat can't leave the
+    terminal wearing some project's color. Undoes exactly what was set, so
+    flipping an option mid-chat can't strand a tint."""
+    try:
+        seq = ""
+        if _ACCENT_ON["cursor"]:
+            seq += "\033]112\007"                  # reset cursor color
+        if _ACCENT_ON["background"]:
+            seq += "\033]111\007"                  # reset background color
+        if seq:
+            os.write(sys.stdout.fileno(), seq.encode())
+    except Exception:
+        pass
+    _ACCENT_ON.update(cursor=False, background=False)
 
 
 # Sentinel for App(select_project=...). _KEEP_PROJECT means "this is a fresh
@@ -1006,6 +1115,17 @@ class App:
             return os.path.basename(key.rstrip("/")) or key
         return key                                   # virtual project: name is the key
 
+    def project_color(self, key):
+        """The project's signature color ('#RRGGBB'), assigned on first sight.
+        None for "All projects" — that view stays deliberately colorless, so a
+        colored board always means you're looking at exactly one project."""
+        if not key or not projcolor:
+            return None
+        try:
+            return projcolor.color_for(key)
+        except Exception:
+            return None
+
     def project_cwd(self, key):
         """Default working directory for new chats started in a project. For a
         folder-based project that's the folder itself; for a virtual project
@@ -1161,8 +1281,11 @@ class App:
                      + (", shown" if self.show_hidden else "") + ") ")
         self.stdscr.addstr(0, 0, head[: w - 1], curses.A_BOLD)
         help_ = ("↑/↓ move   Enter switch-to   n new folder   r rename   "
-                 "o mode   h hide/unhide   ^H show hidden   d remove   Esc/q/p back")
-        self.stdscr.addstr(1, 0, help_[: w - 1], curses.color_pair(8) | curses.A_DIM)
+                 "o mode   c recolor   h hide/unhide   ^H show hidden   "
+                 "d remove   Esc/q/p back")
+        for i, ln in enumerate(_wrap(help_, w - 1)[:2]):
+            self.stdscr.addstr(1 + i, 0, ln[: w - 1],
+                               curses.color_pair(8) | curses.A_DIM)
         top = 3
         view_h = max(1, h - top - 1)
         start = sel - view_h + 1 if sel >= view_h else 0
@@ -1192,7 +1315,11 @@ class App:
                     detail += f"   ⚙ {md}"
                 if path in self.hidden_projects:
                     detail += "   (hidden)"
-            line = f"{mark}{name:<26.26}  {detail}"
+            # A swatch in the project's own color, so this panel doubles as the
+            # legend for what you see on the board and in the status line.
+            pcol = self.project_color(path)
+            swatch = "● " if pcol else "  "
+            line = f"{mark}{swatch}{name:<26.26}  {detail}"
             if is_sel:
                 attr = curses.color_pair(7)
             elif path in self.hidden_projects:
@@ -1202,6 +1329,11 @@ class App:
             else:
                 attr = curses.A_NORMAL
             self.stdscr.addstr(y, 0, line[: w - 1], attr)
+            if pcol and not is_sel:   # repaint just the dot in the real color
+                try:
+                    self.stdscr.addstr(y, len(mark), "●", proj_attr(pcol))
+                except curses.error:
+                    pass
             y += 1
         if self.message:
             self.stdscr.addstr(h - 1, 0, self.message[: w - 1], curses.A_BOLD)
@@ -1257,6 +1389,21 @@ class App:
                         self.message = "Pick a project first to set its mode"
                     else:
                         self.choose_default_mode(path)
+                elif k in (ord("c"), ord("C")):
+                    # Don't like the shade this project drew? Take the next
+                    # free one. It sticks until you press c again.
+                    path = items[sel][0]
+                    if not path:
+                        self.message = "'All projects' has no color"
+                    elif not projcolor:
+                        self.message = "Colors unavailable (projcolor.py missing)"
+                    else:
+                        try:
+                            new = projcolor.reroll(path)
+                            self.message = (f"“{self.project_name(path)}” "
+                                            f"recolored → {new}")
+                        except Exception as e:
+                            self.message = f"Couldn't recolor: {e}"
                 elif k in (ord("h"), ord("H")):
                     # Toggle: hide the selected project (it and its chats drop
                     # out of the board), or unhide it if it's already hidden.
@@ -1714,13 +1861,19 @@ class App:
                 scope += (f" (incl. {n} hidden)" if self.show_hidden
                           else f" ({n} hidden)")
         # Header: plain "Claude Chats — N chats  " then the active project drawn
-        # in a reverse-video chip so the current project is unmistakable.
+        # as a chip filled with THAT project's own color, so a glance at the top
+        # of the screen tells you which project you're in even before you read it.
+        # "All projects" keeps the old black-on-white bar (no single color to use).
         prefix = f"{title}— {len(self.visible_chats())} chats   "
         self.stdscr.addstr(0, 0, prefix[: w - 1], curses.A_BOLD)
+        pcolor = self.project_color(self.active_project)
         x = _dwidth(prefix)
         if x < w - 1:
             chip = _clamp(f" ▶ {_bidi(scope)} ", w - 1 - x)
-            chip_attr = curses.color_pair(7) | curses.A_BOLD  # black-on-white bar
+            if pcolor:
+                chip_attr = proj_attr(pcolor, chip=True, extra=curses.A_BOLD)
+            else:
+                chip_attr = curses.color_pair(7) | curses.A_BOLD  # black-on-white
             try:
                 self.stdscr.addstr(0, x, chip, chip_attr)
             except curses.error:
@@ -1733,6 +1886,14 @@ class App:
         self.stdscr.addstr(2, 0, legend[: w - 1], curses.A_DIM)
         status_legend = "status:  ● running   ◆ needs input   ✓ done   ✗ failed"
         self.stdscr.addstr(3, 0, status_legend[: w - 1], curses.A_DIM)
+        # Row 4 (blank until now) becomes a thin rule in the project's color.
+        # Together with the matching rule above the footer it frames the list in
+        # that color — the ambient "which project is this" cue.
+        try:
+            self.stdscr.addstr(4, 0, "─" * (w - 1),
+                               proj_attr(pcolor) if pcolor else curses.A_DIM)
+        except curses.error:
+            pass
 
         top = 5
         # Footer block: the FULL title of the chat under the cursor, wrapped over
@@ -1783,7 +1944,8 @@ class App:
                 # The [tag] reflects the chat's EFFECTIVE project (its per-chat
                 # override if any, else its folder) — not the raw cwd basename —
                 # so a chat moved into HW shows [HW], not its old folder.
-                proj = self.project_name(project_key_for(c, self.tags))
+                pkey = project_key_for(c, self.tags)
+                proj = self.project_name(pkey)
                 status = self.live.get(c["id"], "unknown")
                 gcolor = STATUS_ICON.get(status, STATUS_ICON["unknown"])[1]
                 prefix = "     "  # 5 cols reserved for the status indicator
@@ -1809,14 +1971,29 @@ class App:
                 else:
                     attr = ((curses.color_pair(10) | curses.A_BOLD)
                             if starred else curses.A_NORMAL)
-                    self.stdscr.addstr(line_y, len(prefix),
-                                       _clamp(body, w - 1 - len(prefix)),
-                                       attr)
+                    # The [project] tag is written in that project's own color —
+                    # the whole point in the "all projects" view, where rows from
+                    # different projects sit side by side. A starred row keeps its
+                    # solid yellow bar (a colored tag would punch a hole in it).
+                    tag_color = None if starred else self.project_color(pkey)
+                    if tag_color:
+                        head = _clamp(_bidi(t) + pad, w - 1 - len(prefix))
+                        self.stdscr.addstr(line_y, len(prefix), head, attr)
+                        tx = len(prefix) + _dwidth(head)
+                        if tx < w - 1:
+                            self.stdscr.addstr(line_y, tx,
+                                               _clamp(tail, w - 1 - tx),
+                                               proj_attr(tag_color))
+                    else:
+                        self.stdscr.addstr(line_y, len(prefix),
+                                           _clamp(body, w - 1 - len(prefix)),
+                                           attr)
                     self._draw_indicator(line_y, status, sel=False)
 
         sep_y = h - footer_h - 1
         try:
-            self.stdscr.addstr(sep_y, 0, "─" * (w - 1), curses.A_DIM)
+            self.stdscr.addstr(sep_y, 0, "─" * (w - 1),
+                               proj_attr(pcolor) if pcolor else curses.A_DIM)
         except curses.error:
             pass
         attr = curses.A_BOLD if self.message else (curses.color_pair(8)
@@ -2243,11 +2420,14 @@ def main():
                 if app.active_project:  # keep new chats inside the active project
                     _json_set(PROJECT_TAGS_STORE, full, app.active_project)
             print("  Attaching — press Ctrl+Z to leave it running and come back.\n")
+            set_terminal_accent(app.project_color(app.active_project))
             try:
                 run_child(["claude", "attach", short], run_cwd)
             except FileNotFoundError:
                 print("Could not find `claude` on PATH.")
                 input("Press Enter to return to the menu …")
+            finally:
+                clear_terminal_accent()
             continue
 
         if not app.resume_target:
@@ -2387,12 +2567,19 @@ def main():
                  f"tty={tty} term={os.environ.get('TERM', '?')} "
                  f"board_pid={os.getpid()}")
 
+        # Tint the terminal's cursor with the project's color for as long as the
+        # chat is up, so the cue stays with you inside the chat and not just on
+        # the board. Always cleared on the way back out (finally), even if the
+        # chat crashes — the terminal never keeps a stale project color.
+        set_terminal_accent(app.project_color(project_key_for(c, app.tags)))
         try:
             runner(cmd, run_cwd)
         except FileNotFoundError:
             print("Could not find the `claude` command on PATH.")
             print(f"Run manually:  cd {cwd} && {' '.join(cmd)}")
             input("Press Enter to return to the menu …")
+        finally:
+            clear_terminal_accent()
 
         # Finalize a resume now that the chat has closed. THE FIX for "I opened a
         # past chat, wrote nothing, went back, and it vanished": if the resume

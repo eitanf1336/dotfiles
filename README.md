@@ -28,6 +28,9 @@ In `python/`:
 ### `chats.py` (launched as `claude-c`)
 A board/TUI for organizing Claude Code chats into categories (In Progress / Later / Done) with live status. State persists to JSON next to the script. Launched via `bin/claude-custom`.
 
+### `projcolor.py`
+Gives every project its own color so you can tell at a glance which one the terminal in front of you belongs to. The pick looks random but is a stable hash of the project, skipping shades other projects already took, and is stored in `~/.claude/chats/project_colors.json` (`c` in the board's projects panel picks a different one). The color shows in the `claude-c` header chip, the rules framing the list, and each row's `[tag]`; inside a chat it tints the text cursor and leads the status line. Optional background tinting is off by default.
+
 ### `claude-ask` (GTK3)
 A quick-prompt bar that slides up from the bottom of the screen on **Ctrl+Alt+A**. Streams Claude's answer live; multiple bars re-tile side-by-side. From an answer you can follow up, start fresh, file the chat to the `claude-c` board, or hand the conversation off to a terminal. Accent color tracks the current wallpaper theme. Bound to a global shortcut (see keybindings).
 
