@@ -70,7 +70,8 @@ UNICODE_MAP = {
     '×': '*', '·': '*', '∗': '*', '⋅': '*', '✕': '*', '✖': '*',
     '÷': '/', '∕': '/', '⁄': '/', '−': '-', '–': '-', '—': '-', '‒': '-',
     '≈': '=', '≃': '=', '＝': '=', '＋': '+', '（': '(', '）': ')',
-    'π': 'pi', 'τ': 'tau', 'φ': 'phi', '∞': 'inf', '√': 'sqrt',
+    'π': 'pi', 'τ': 'tau', 'φ': 'phi', '∞': 'inf',   # '√' needs its argument
+
     '\u00a0': ' ', '\u202f': ' ', '\u2009': ' ', '\u200b': '',
     '\u200e': '', '\u200f': '', '\u202a': '', '\u202b': '', '\u202c': '',
     '\u202d': '', '\u202e': '',
@@ -120,6 +121,14 @@ def clean_text(text):
 
 # "20% of 80", "1,234,567", "3 x 4", "5!" ...
 def normalise_line(s):
+    s = re.sub(r'[₪$€£¥]', '', s)                            # prices
+    s = re.sub(r'\bpercent\b', '%', s, flags=re.I)
+    s = re.sub(r'(\d[\d.]*)\s*°', r'(\1*pi/180)', s)         # sin(30°)
+    s = re.sub(r'√\s*(\d[\d.]*|[A-Za-z_]\w*)', r'sqrt(\1)', s)
+    s = re.sub(r'√\s*(?=\()', 'sqrt', s)
+    # "sqrt 2", "ln 5", "cos pi" -> the function applied to what follows it
+    s = re.sub(r'\b(%s)\b\s+(\d[\d.]*(?:[eE][-+]?\d+)?|[A-Za-z_]\w*)'
+               % FUNC_NAMES, r'\1(\2)', s)
     s = re.sub(r'(\d(?:[\d.]*\d)?)\s*%\s*of\s+', r'(\1/100)*', s, flags=re.I)
     s = re.sub(r'\b\d{1,3}(?:,\d{3})+\b', lambda m: m.group().replace(',', ''), s)
     # '%' that isn't followed by an operand is a percentage, not a modulo
@@ -142,13 +151,175 @@ def implicit_mult(s):
     The lookbehinds keep digits that are part of a name (log10, log2) out of
     it, and the lookahead protects scientific notation (1e5, 2.5e-3).
     """
-    s = re.sub(r'(?<![A-Za-z_0-9.])(\d[\d.]*)\s*\(', r'\1*(', s)
-    s = re.sub(r'\)\s*\(', r')*(', s)
-    s = re.sub(r'\)\s*(?=[A-Za-z_])', r')*', s)
-    s = re.sub(r'(?<![A-Za-z_0-9.])(\d[\d.]*)\s*(?![eE]\s*[-+]?\d)(?=[A-Za-z_])',
-               r'\1*', s)
-    s = re.sub(r'\b(pi|tau|phi|e)\s*\(', r'\1*(', s)
+    s = re.sub(r'(?<![A-Za-z_0-9.])(\d[\d.]*)(\s*)\(', r'\1*\2(', s)
+    s = re.sub(r'\)(\s*)\(', r')*\1(', s)
+    s = re.sub(r'\)(\s*)(?=[A-Za-z_])', r')*\1', s)
+    s = re.sub(r'(?<![A-Za-z_0-9.])(\d[\d.]*)(\s*)(?![eE]\s*[-+]?\d)(?=[A-Za-z_])',
+               r'\1*\2', s)
+    s = re.sub(r'\b(pi|tau|phi|e)(\s*)\(', r'\1*\2(', s)
     return s
+
+
+# --- spacing decides precedence -------------------------------------------
+# Written strictly, "(1 - 1/5) / 1/5" means ((1-1/5)/1)/5. Nobody means that:
+# the spacing says "1/5" is one number, so it is the divisor. The rule is that
+# a * or / with no space around it binds tighter than one with space around it,
+# which is exactly how the expression reads on the page. Where the spacing is
+# consistent nothing changes and plain left-to-right still applies.
+
+TOK_RE = re.compile(r'(\s+)|(\d[\d.]*(?:[eE][-+]?\d+)?)|([A-Za-z_]\w*)'
+                    r'|(\*\*|//|[-+*/%])|(\()|(\))|(.)', re.S)
+MULDIV = ('*', '/', '//', '%')
+
+
+class _T:
+    __slots__ = ('kind', 'text', 'ws')
+
+    def __init__(self, kind, text, ws):
+        self.kind, self.text, self.ws = kind, text, ws
+
+
+def _tokenize(s):
+    toks, ws = [], ''
+    for m in TOK_RE.finditer(s):
+        if m.group(1) is not None:
+            ws += m.group(1)
+            continue
+        for idx, kind in ((2, 'num'), (3, 'name'), (4, 'op'),
+                          (5, 'lp'), (6, 'rp'), (7, 'other')):
+            if m.group(idx) is not None:
+                toks.append(_T(kind, m.group(idx), ws))
+                ws = ''
+                break
+    return toks, ws
+
+
+def _operand(toks, i):
+    """Read one operand (with any unary sign, call or ** chain) at i."""
+    if i >= len(toks):
+        return None, i
+    txt = ''
+    while (i < len(toks) and toks[i].kind == 'op'
+           and toks[i].text in ('+', '-')):
+        txt += toks[i].ws + toks[i].text
+        i += 1
+    if i >= len(toks):
+        return None, i
+    t = toks[i]
+    if t.kind == 'num':
+        txt += t.ws + t.text
+        i += 1
+    elif t.kind == 'name':
+        txt += t.ws + t.text
+        i += 1
+        if i < len(toks) and toks[i].kind == 'lp':
+            g, i = _group(toks, i)
+            txt += g
+    elif t.kind == 'lp':
+        g, i = _group(toks, i)
+        txt += g
+    else:
+        return None, i
+    # '**' outranks * and / under every convention, so keep it inside the
+    # operand rather than letting spacing regroup it
+    while i < len(toks) and toks[i].kind == 'op' and toks[i].text == '**':
+        rhs, j = _operand(toks, i + 1)
+        if rhs is None:
+            break
+        txt += toks[i].ws + toks[i].text + rhs
+        i = j
+    return txt, i
+
+
+def _group(toks, i):
+    lp = toks[i]
+    inner, i = _scope(toks, i + 1)
+    txt = lp.ws + '(' + inner
+    if i < len(toks) and toks[i].kind == 'rp':
+        txt += toks[i].ws + ')'
+        i += 1
+    else:
+        txt += ')'
+    return txt, i
+
+
+def _wrap_runs(pieces):
+    """Parenthesise every maximal run of tightly-spaced * and /."""
+    out = [list(p) for p in pieces]
+    n, k = len(out), 0
+    while k < n:
+        if out[k][0] != 'operand':
+            k += 1
+            continue
+        end, j = k, k + 1
+        while (j + 1 < n and out[j][0] == 'op' and out[j][3]
+               and out[j][2] in MULDIV and out[j + 1][0] == 'operand'):
+            end, j = j + 1, j + 2
+        if end > k:
+            first = out[k][1]
+            lead = first[:len(first) - len(first.lstrip())]
+            out[k][1] = lead + '(' + first[len(lead):]
+            out[end][1] += ')'
+            k = end + 1
+        else:
+            k += 1
+    return ''.join(p[1] for p in out)
+
+
+def _scope(toks, i):
+    pieces = []
+    while i < len(toks) and toks[i].kind != 'rp':
+        txt, j = _operand(toks, i)
+        if txt is None:
+            pieces.append(('raw', toks[i].ws + toks[i].text))
+            i += 1
+            continue
+        pieces.append(('operand', txt))
+        i = j
+        if i < len(toks) and toks[i].kind == 'op':
+            t = toks[i]
+            nxt = toks[i + 1].ws if i + 1 < len(toks) else ' '
+            pieces.append(('op', t.ws + t.text, t.text,
+                           t.ws == '' and nxt == ''))
+            i += 1
+    return _wrap_runs(pieces), i
+
+
+def tidy_parens(s):
+    """Drop '((x))' down to '(x)' — display only, never what gets evaluated."""
+    for _ in range(12):
+        stack, cut = [], None
+        for idx, c in enumerate(s):
+            if c == '(':
+                stack.append(idx)
+            elif c == ')' and stack:
+                o = stack.pop()
+                inner = s[o + 1:idx].strip()
+                if len(inner) > 1 and inner[0] == '(' and inner[-1] == ')':
+                    d = 0
+                    for k, ch in enumerate(inner):
+                        d += (ch == '(') - (ch == ')')
+                        if d == 0 and k < len(inner) - 1:
+                            break
+                    else:
+                        cut = (o, idx, inner)
+                        break
+        if not cut:
+            return s
+        s = s[:cut[0]] + cut[2] + s[cut[1] + 1:]
+    return s
+
+
+def group_tight(s):
+    try:
+        toks, trail = _tokenize(s)
+        text, i = _scope(toks, 0)
+        while i < len(toks):
+            text += toks[i].ws + toks[i].text
+            i += 1
+        return text + trail
+    except Exception:
+        return s
 
 
 CONT_END = ('+', '-', '*', '/', '%', '^', ',', '(', '=', '<', '>', '&', '|')
@@ -265,7 +436,7 @@ def build_program(text, close='term'):
     for stmt in split_statements(lines):
         body, n = assemble(stmt, close)
         body = handle_equals(body)
-        body = implicit_mult(body)
+        body = group_tight(implicit_mult(body))
         if body.strip():
             src.append(body)
             added += n
@@ -546,11 +717,12 @@ def evaluate(text):
         alt_src = '\n'.join(l for l in
                             (normalise_line(x) for x in clean_text(text)) if l)
         try:
-            values, _ = run_program(implicit_mult(alt_src))
+            values, _ = run_program(group_tight(implicit_mult(alt_src)))
             r.expr = alt_src
         except CalcError:
             r.error = str(e)
             return r
+    r.expr = tidy_parens(r.expr)
     r.values = values
     if len(values) == 1:
         r.total = values[0]
@@ -675,8 +847,6 @@ def paste_in_place(text):
     because apps resolve that accelerator on the Latin group.
     """
     import time
-    if not _which('wl-copy'):
-        return False
     before = ''
     try:
         p = _run(['wl-paste', '-n'], timeout=2)
@@ -685,8 +855,18 @@ def paste_in_place(text):
         pass
     if not copy_out(text):
         return False
+    # wl-copy returns before the compositor has handed the selection over, so
+    # confirm the clipboard really holds the answer. Pasting whatever was there
+    # before would put the wrong text into the document — refuse instead, and
+    # let the caller fall back to the popup.
     if not DRY_RUN:
-        time.sleep(0.12)
+        for _ in range(30):
+            time.sleep(0.03)
+            p = _run(['wl-paste', '-n'], timeout=2)
+            if p.returncode == 0 and p.stdout == text:
+                break
+        else:
+            return False
     ok = _ydo('key', '%d:1' % K_CTRL, '%d:1' % K_V, '%d:0' % K_V, '%d:0' % K_CTRL)
     if ok and not DRY_RUN:
         time.sleep(0.6)          # let the app read it before handing it back
@@ -711,8 +891,8 @@ def write_in_place(text):
     # collapse the selection to its right-hand end, so nothing is overwritten
     _ydo('key', '%d:1' % K_RIGHT, '%d:0' % K_RIGHT)
     time.sleep(0.06)
-    if paste_in_place(text):
-        return True
+    if _which('wl-copy'):
+        return paste_in_place(text)
     # no clipboard tool at all: type it, and accept the layout risk
     return _ydo('type', '--file', '-', stdin=text)
 
@@ -963,6 +1143,24 @@ TESTS = [
     ('1 +\n2 +\n3', '6'),
     ('log10(1000)', '3'),
     ('factorial(5)', '120'),
+    # spacing decides precedence: these two have to agree
+    ('(1 - 1/5) / 1/5', '4'),
+    ('(1 - 0.2) / 0.2', '4'),
+    ('3 / 1/2', '6'),
+    ('1/2 / 1/4', '2'),
+    ('1/2/3', '0.166666666667'),      # evenly tight -> plain left to right
+    ('10 / 2 / 5', '1'),              # evenly loose -> plain left to right
+    ('2 * 3/4 * 5', '7.5'),
+    ('4/2 ** 2', '1'),                # ** still outranks the spacing
+    ('8/2(2+2)', '16'),
+    ('100 / 50%', '200'),
+    ('2(3 + 3)', '12'),
+    ('√9 + 1', '4'),
+    ('√(4+5)', '3'),
+    ('sqrt 2', '1.41421356237'),
+    ('log 100', '4.60517018599'),
+    ('sin(30°)', '0.5'),
+    ('₪1,200 * 2', '2,400'),
     ('max(3, 9, 4)', '9'),
     ('avg(2,4,6)', '4'),
     ('$1 + 1$', '2'),
@@ -1044,15 +1242,18 @@ def livetest():
     win.add(entry)
     win.show_all()
     win.present()
-    entry.grab_focus()
-    entry.select_region(0, -1)          # the whole equation is highlighted
     st = {'tries': 0, 'rc': 1}
 
     def finish(ok):
         got = entry.get_text()
-        st['rc'] = 0 if got == want else 1
-        print('ydotool ok: %s\nwant: %r\ngot : %r\n%s'
-              % (ok, want, got, 'PASS' if got == want else 'FAIL'))
+        if got == want:
+            st['rc'], verdict = 0, 'PASS'
+        elif not got.startswith(eq):
+            # this window steals focus, so anything typed meanwhile lands here
+            st['rc'], verdict = 2, 'INCONCLUSIVE: stray input (were you typing?)'
+        else:
+            st['rc'], verdict = 1, 'FAIL'
+        print('ydotool ok: %s\nwant: %r\ngot : %r\n%s' % (ok, want, got, verdict))
         Gtk.main_quit()
         return False
 
@@ -1064,6 +1265,19 @@ def livetest():
                 Gtk.main_quit()
                 return False
             return True
+        # Assert the selection from the main loop and confirm it really took:
+        # setting it before the window is mapped does not survive focus-in, and
+        # a test where nothing is selected proves nothing.
+        entry.grab_focus()
+        entry.select_region(0, -1)
+        if (entry.get_text() != eq
+                or entry.get_selection_bounds() != (0, len(eq))):
+            if st['tries'] > 20:
+                print('ABORTED: could not hold the selection, injected nothing')
+                Gtk.main_quit()
+                return False
+            return True
+        print('selection is live: %r fully highlighted' % eq)
         res = evaluate(eq)
         threading.Thread(
             target=lambda: GLib.idle_add(
