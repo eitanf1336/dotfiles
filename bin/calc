@@ -124,6 +124,13 @@ def normalise_line(s):
     s = re.sub(r'[₪$€£¥]', '', s)                            # prices
     s = re.sub(r'\bpercent\b', '%', s, flags=re.I)
     s = re.sub(r'(\d[\d.]*)\s*°', r'(\1*pi/180)', s)         # sin(30°)
+    # 10C5, 10 c 5, 10 nCr 5, 10 choose 5  ->  comb(10,5); same for P / nPr
+    s = re.sub(r'(?<![\w.])(\d+)\s*n?[Cc][Rr]?\s*(\d+)(?![\w.])',
+               r'comb(\1,\2)', s)
+    s = re.sub(r'(?<![\w.])(\d+)\s*n?[Pp][Rr]?\s*(\d+)(?![\w.])',
+               r'perm(\1,\2)', s)
+    s = re.sub(r'\b(\w+)\s+choose\s+(\w+)\b', r'comb(\1,\2)', s, flags=re.I)
+    s = re.sub(r'\b(\w+)\s+permute\s+(\w+)\b', r'perm(\1,\2)', s, flags=re.I)
     s = re.sub(r'√\s*(\d[\d.]*|[A-Za-z_]\w*)', r'sqrt(\1)', s)
     s = re.sub(r'√\s*(?=\()', 'sqrt', s)
     # "sqrt 2", "ln 5", "cos pi" -> the function applied to what follows it
@@ -511,6 +518,12 @@ FUNCS = {
     'fact': lambda x: Fraction(math.factorial(_int(x, 'fact'))),
     'comb': lambda n, k: Fraction(math.comb(_int(n, 'comb'), _int(k, 'comb'))),
     'perm': lambda n, k: Fraction(math.perm(_int(n, 'perm'), _int(k, 'perm'))),
+    'choose': lambda n, k: Fraction(math.comb(_int(n, 'choose'),
+                                              _int(k, 'choose'))),
+    'nCr': lambda n, k: Fraction(math.comb(_int(n, 'nCr'), _int(k, 'nCr'))),
+    'nPr': lambda n, k: Fraction(math.perm(_int(n, 'nPr'), _int(k, 'nPr'))),
+    'C': lambda n, k: Fraction(math.comb(_int(n, 'C'), _int(k, 'C'))),
+    'P': lambda n, k: Fraction(math.perm(_int(n, 'P'), _int(k, 'P'))),
     'hypot': lambda *a: math.hypot(*[_f(x) for x in _flatten(a)]),
     'pow': lambda a, b: _pow(a, b), 'mod': lambda a, b: Fraction(a) % Fraction(b),
     'deg': lambda x: math.degrees(_f(x)), 'degrees': lambda x: math.degrees(_f(x)),
@@ -1161,6 +1174,20 @@ TESTS = [
     ('log 100', '4.60517018599'),
     ('sin(30°)', '0.5'),
     ('₪1,200 * 2', '2,400'),
+    # combinations and permutations, however they are written
+    ('10C5', '252'),
+    ('10 C 5', '252'),
+    ('10c5', '252'),
+    ('10 choose 5', '252'),
+    ('C(10,5)', '252'),
+    ('nCr(10,5)', '252'),
+    ('52C5', '2,598,960'),
+    ('2 * 10C5', '504'),
+    ('10P5', '30,240'),
+    ('10 nPr 5', '30,240'),
+    ('n = 10\nk = 5\nn choose k', '252'),
+    ('1e5', '100,000'),               # the C/P rules must leave these alone
+    ('2cos(0)', '2'),
     ('max(3, 9, 4)', '9'),
     ('avg(2,4,6)', '4'),
     ('$1 + 1$', '2'),
