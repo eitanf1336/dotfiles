@@ -1,40 +1,47 @@
 #!/usr/bin/env bash
 # await-claude-shut — wait until no Claude agent/chat is actively running,
-# then power off the PC. "Actively running" = a background agent is working
-# or a chat is mid-reply (claude-status exit code 1). Idle chats and paused
-# agents waiting for input do NOT count as running.
+# then power off (or suspend) the PC. "Actively running" = a background agent
+# is working or a chat is mid-reply (claude-status exit code 1). Idle chats
+# and paused agents waiting for input do NOT count as running.
 #
 # Kick off your agents, run this, walk away.
 #
 #   await-claude-shut [options]
-#     -i, --interval S   seconds between checks while waiting   (default 30)
-#     -s, --stable N     consecutive clear checks required      (default 2)
-#     -g, --grace S      cancellable countdown before shutdown  (default 60)
-#     -a, --action A     poweroff | reboot | suspend | halt     (default poweroff)
+#     -i, --interval S   seconds between checks while Claude is busy (default 30)
+#     -c, --confirm S    seconds between the confirming checks       (default 3)
+#     -s, --stable N     consecutive clear checks required           (default 2)
+#     -g, --grace S      cancellable countdown before shutdown       (default 60)
+#     -a, --action A     poweroff | reboot | suspend | halt          (default poweroff)
 #     -n, --dry-run      print what it would do; never shut down
 #     -h, --help
 #
 # During the grace countdown, press Ctrl+C to cancel. If Claude starts
 # working again mid-countdown, the shutdown auto-aborts and it resumes waiting.
+#
+# Everything it does is also appended to ~/.local/state/await-claude-shut.log,
+# so a run that ended in a closed window can still be diagnosed afterwards.
 set -uo pipefail
 
 INTERVAL=30
+CONFIRM=3
 STABLE=2
 GRACE=60
 ACTION=poweroff
 DRYRUN=0
 STATUS_CMD=${CLAUDE_STATUS_CMD:-claude-status}   # overridable for testing
+LOG=${AWAIT_CLAUDE_SHUT_LOG:-$HOME/.local/state/await-claude-shut.log}
 
 die() { echo "await-claude-shut: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     -i|--interval) INTERVAL=${2:?}; shift 2;;
+    -c|--confirm)  CONFIRM=${2:?};  shift 2;;
     -s|--stable)   STABLE=${2:?};   shift 2;;
     -g|--grace)    GRACE=${2:?};    shift 2;;
     -a|--action)   ACTION=${2:?};   shift 2;;
     -n|--dry-run)  DRYRUN=1; shift;;
-    -h|--help)     sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    -h|--help)     sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) die "unknown option: $1 (try --help)";;
   esac
 done
@@ -45,61 +52,109 @@ case "$ACTION" in
 esac
 command -v "$STATUS_CMD" >/dev/null 2>&1 || die "'$STATUS_CMD' not found on PATH"
 
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || LOG=/dev/null
+
+# Print to the window AND to the log, so closing the window doesn't erase the
+# evidence of what happened.
+say() {
+  printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG" 2>/dev/null
+}
+wipe() { printf '\r%*s\r' 64 ''; }   # clear the countdown line
+
 # Return 0 if Claude is actively running (compute in flight), 1 otherwise.
+# NOTE: one call costs a couple of seconds (it queries the agent daemon and
+# samples TUI CPU), which is why every wait below is wall-clock based.
 claude_busy() {
   "$STATUS_CMD" -q >/dev/null 2>&1
   [ "$?" -eq 1 ]
 }
 
 do_shutdown() {
-  echo
   if [ "$DRYRUN" -eq 1 ]; then
-    echo "[dry-run] would run: systemctl $ACTION"
+    say "[dry-run] would run: systemctl $ACTION"
     exit 0
   fi
-  echo ">>> systemctl $ACTION"
-  systemctl "$ACTION"
+  say ">>> systemctl $ACTION"
+  local out rc t0
+  t0=$(date +%s)
+  out=$(systemctl "$ACTION" 2>&1); rc=$?
+  [ -n "$out" ] && say "systemctl said: $out"
+  if [ "$rc" -ne 0 ]; then
+    say "FAILED: 'systemctl $ACTION' exited $rc. The machine is still awake."
+    exit "$rc"
+  fi
+
+  # systemctl returns as soon as logind accepts the request; the machine goes
+  # down a moment later (delay inhibitors get a few seconds first). For sleep
+  # actions, verify it really happened instead of assuming.
+  if [ "$ACTION" = suspend ]; then
+    say "request accepted; waiting for the machine to actually go to sleep…"
+    local waited=0
+    while [ "$waited" -lt 20 ]; do
+      sleep 2
+      waited=$((waited + 2))
+      if journalctl -k --since "@$t0" -o cat 2>/dev/null | grep -q "PM: suspend entry"; then
+        say "confirmed: the system suspended, and has now resumed."
+        exit 0
+      fi
+    done
+    say "WARNING: logind accepted the request but no 'PM: suspend entry' appeared"
+    say "         within 20s. Something vetoed the sleep. Check: systemd-inhibit --list"
+    exit 1
+  fi
+  exit 0
 }
 
 # Wait for STABLE consecutive clear checks, then a re-checking grace countdown.
 # The whole thing loops: if work restarts during the countdown, go back to waiting.
-echo "await-claude-shut: watching for Claude to finish (action: $ACTION, dry-run: $DRYRUN)"
+say "await-claude-shut: watching for Claude to finish (action: $ACTION, grace: ${GRACE}s, dry-run: $DRYRUN)"
+say "each check takes a couple of seconds; log: $LOG"
 while :; do
   clear=0
   while [ "$clear" -lt "$STABLE" ]; do
-    ts=$(date +%H:%M:%S)
     if claude_busy; then
+      [ "$clear" -gt 0 ] && say "Claude woke back up, restarting the count."
       clear=0
-      printf '[%s] Claude still active — waiting…\n' "$ts"
+      say "Claude still active, checking again in ${INTERVAL}s…"
+      sleep "$INTERVAL"
     else
       clear=$((clear + 1))
-      printf '[%s] clear (%d/%d)\n' "$ts" "$clear" "$STABLE"
+      if [ "$clear" -lt "$STABLE" ]; then
+        # Confirming checks are seconds apart, not minutes: the long interval
+        # is for waiting out real work, not for double-checking a quiet machine.
+        say "clear ($clear/$STABLE), confirming in ${CONFIRM}s…"
+        sleep "$CONFIRM"
+      else
+        say "clear ($clear/$STABLE)"
+      fi
     fi
-    [ "$clear" -ge "$STABLE" ] && break
-    sleep "$INTERVAL"
   done
 
-  # Grace countdown, re-checking that nothing woke back up.
-  echo "await-claude-shut: Claude is done. ${ACTION} in ${GRACE}s — press Ctrl+C to cancel."
-  trap 'echo; echo "await-claude-shut: cancelled."; exit 130' INT
+  # Grace countdown against a wall-clock deadline, so the periodic re-checks
+  # cost real time instead of silently stretching the countdown.
+  say "Claude is done. ${ACTION} in ${GRACE}s. Press Ctrl+C (or close this window) to cancel."
+  trap 'wipe; say "cancelled."; exit 130' INT
+  deadline=$(( $(date +%s) + GRACE ))
+  last_check=$(date +%s)
   restarted=0
-  i=$GRACE
-  while [ "$i" -gt 0 ]; do
-    printf '\r  %s in %3ds …   ' "$ACTION" "$i"
-    # cheap re-check every 5s (claude_busy has ~0.7s overhead)
-    if [ $((i % 5)) -eq 0 ] && claude_busy; then
-      restarted=1; break
+  while :; do
+    now=$(date +%s)
+    left=$(( deadline - now ))
+    [ "$left" -le 0 ] && break
+    printf '\r  %s in %3ds …  (Ctrl+C to cancel)   ' "$ACTION" "$left"
+    if [ $(( now - last_check )) -ge 10 ]; then
+      if claude_busy; then restarted=1; break; fi
+      last_check=$(date +%s)
     fi
     sleep 1
-    i=$((i - 1))
   done
   trap - INT
+  wipe
 
   if [ "$restarted" -eq 1 ]; then
-    printf '\r%*s\r' 40 ''
-    echo "await-claude-shut: Claude started working again — resuming wait."
+    say "Claude started working again, resuming the wait."
     continue
   fi
   do_shutdown
-  break
 done
