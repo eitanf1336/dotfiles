@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# wake-diag — find out what wakes this machine from suspend, without root.
+#
+#   wake-diag snap <label>   record interrupt / ACPI-GPE / wakeup counters
+#   wake-diag diff           show what changed since the last snap
+#   wake-diag suspend        snap, suspend, and on resume report what fired
+#
+# The idea: during a 3-second spurious wake almost nothing else happens, so
+# the counter that moved across the sleep is the device that woke us.
+# Everything read here is world-readable, so no sudo is needed.
+set -uo pipefail
+
+DIR=${WAKE_DIAG_DIR:-$HOME/.local/state/wake-diag}
+LOG=$DIR/wake-diag.log
+mkdir -p "$DIR"
+
+snapshot() {   # $1 = file
+  {
+    echo "### time $(date '+%F %T')  uptime $(cut -d' ' -f1 /proc/uptime)"
+    echo "### interrupts"
+    awk 'NR>1{n=$1; s=0; for(i=2;i<=NF;i++) if ($i ~ /^[0-9]+$/) s+=$i;
+              lbl=""; for(i=2;i<=NF;i++) if ($i !~ /^[0-9]+$/) lbl=lbl" "$i;
+              print n, s, lbl}' /proc/interrupts
+    echo "### gpe"
+    for f in /sys/firmware/acpi/interrupts/*; do
+      printf '%s %s\n' "$(basename "$f")" "$(awk '{print $1}' "$f" 2>/dev/null)"
+    done
+    echo "### wakeup"
+    for w in $(find /sys/devices -name wakeup -path "*/power/*" 2>/dev/null); do
+      p=$(dirname "$(dirname "$w")")
+      [ "$(cat "$w" 2>/dev/null)" = enabled ] || continue
+      printf '%s ev=%s wake=%s last=%s\n' "$(basename "$p")" \
+        "$(cat "$p/power/event_count" 2>/dev/null)" \
+        "$(cat "$p/power/wakeup_count" 2>/dev/null)" \
+        "$(cat "$p/power/wakeup_last_time_ms" 2>/dev/null)"
+    done
+  } >"$1" 2>/dev/null
+}
+
+report_diff() {   # $1 = before, $2 = after
+  awk '
+    FNR==NR { if ($1 ~ /^###/) { sec=$2; next } key=sec":"$1; before[key]=$2;
+              if (sec=="interrupts") lbl[$1]=substr($0, index($0,$3)); next }
+    { if ($1 ~ /^###/) { sec=$2; next }
+      key=sec":"$1
+      if (sec=="wakeup") { if ($0 != prev[key]) { } ; next }
+      d = $2 - before[key]
+      if (d > 0) printf "  %-10s %-8s +%-6d %s\n", sec, $1, d, lbl[$1]
+    }' "$1" "$2"
+  echo "  --- wakeup-source counters that moved ---"
+  diff <(sed -n '/### wakeup/,$p' "$1") <(sed -n '/### wakeup/,$p' "$2") \
+    | grep '^>' | sed 's/^>/   /' || echo "   (none)"
+}
+
+case "${1:-suspend}" in
+  snap) snapshot "$DIR/${2:-snap}.txt"; echo "snapped -> $DIR/${2:-snap}.txt";;
+  diff) report_diff "$DIR/before.txt" "$DIR/after.txt";;
+  suspend)
+    snapshot "$DIR/before.txt"
+    t0=$(date +%s)
+    echo "[$(date '+%T')] suspending…" | tee -a "$LOG"
+    systemctl suspend || { echo "systemctl suspend FAILED" | tee -a "$LOG"; exit 1; }
+    # If the machine really sleeps, this process freezes here and only
+    # continues once something wakes it.
+    sleep 12
+    t1=$(date +%s)
+    snapshot "$DIR/after.txt"
+    slept=$(( t1 - t0 ))
+    {
+      echo "==================== $(date '+%F %T') ===================="
+      echo "wall time from 'systemctl suspend' to 12s after resume: ${slept}s"
+      if [ "$slept" -lt 40 ]; then
+        echo "VERDICT: spurious immediate wake (slept only ~$((slept-12))s)"
+      else
+        echo "VERDICT: stayed asleep ${slept}s"
+      fi
+      echo "counters that moved across the sleep:"
+      report_diff "$DIR/before.txt" "$DIR/after.txt"
+      echo "kernel log around the cycle:"
+      journalctl -k --since "@$t0" -o short-iso --no-pager 2>/dev/null \
+        | grep -iE "suspend|resume|wakeup|Restarting tasks" | head -20
+    } | tee -a "$LOG"
+    ;;
+  *) echo "usage: wake-diag [snap <label>|diff|suspend]" >&2; exit 1;;
+esac
