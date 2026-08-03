@@ -1,9 +1,14 @@
 [Desktop Entry]
 Type=Application
 Name=Learning
-Comment=Study desk — exams calendar, course material, practice tests
+Comment=Study desk: exams calendar, course material, practice tests
 Exec=/home/eitan/bin/learning
-Icon=accessories-dictionary
+Icon=learning
 Terminal=false
 Categories=Education;Office;
-StartupWMClass=chrome-127.0.0.1_8777__-Default
+Keywords=study;course;exam;moodle;notes;practice;
+# Chrome derives the app_id from the URL host with the port stripped, so the
+# window shows up as chrome-learning.localhost__-Default. Using 127.0.0.1 here
+# collided with the Read Aloud web app and this window inherited its speaker
+# icon; ~/bin/learning opens learning.localhost to keep the id ours.
+StartupWMClass=chrome-learning.localhost__-Default

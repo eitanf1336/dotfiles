@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Learning — the study desk (calendar, course material, practice tests).
+# Learning: the study desk (calendar, course material, practice tests).
 #
 # Starts the local server (systemd user service, so it survives this terminal)
 # and opens it as a standalone Chrome app window with its own dock icon.
@@ -11,6 +11,13 @@ set -euo pipefail
 ROOT="$HOME/code/learning"
 PORT="${LEARNING_PORT:-8777}"
 URL="http://127.0.0.1:$PORT/"
+# The window is opened on learning.localhost, not 127.0.0.1, purely for the
+# dock icon: Chrome builds the Wayland app_id from the host *without the port*,
+# so every local web app of ours collapsed to chrome-127.0.0.1__-Default and
+# GNOME painted whichever .desktop claimed that id (Read Aloud's speaker) onto
+# this window. A distinct host gives us a private app_id. Chrome resolves any
+# *.localhost name to loopback itself, so no /etc/hosts entry is needed.
+APP_URL="http://learning.localhost:$PORT/"
 PROFILE="$HOME/.local/share/learning-app"
 
 usage() {
@@ -58,7 +65,7 @@ esac
 
 start_server
 setsid -f /usr/bin/google-chrome \
-  --app="$URL" \
+  --app="$APP_URL" \
   --user-data-dir="$PROFILE" \
   --class=Learning \
   --name=Learning \

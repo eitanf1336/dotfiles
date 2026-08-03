@@ -92,6 +92,15 @@ for f in "$REPO"/applications/*.desktop; do
     ln -sf "$f" "$APPS/$(basename "$f")"
 done
 
+echo "==> app icons -> ~/.local/share/icons/hicolor"
+ICONS="$HOME/.local/share/icons/hicolor/scalable/apps"
+mkdir -p "$ICONS"
+for f in "$REPO"/icons/hicolor/scalable/apps/*; do
+    [ -e "$f" ] || continue
+    ln -sf "$f" "$ICONS/$(basename "$f")"
+done
+gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+
 echo "==> wireplumber drop-ins -> ~/.config/wireplumber/wireplumber.conf.d"
 WPCONF="$HOME/.config/wireplumber/wireplumber.conf.d"
 mkdir -p "$WPCONF"

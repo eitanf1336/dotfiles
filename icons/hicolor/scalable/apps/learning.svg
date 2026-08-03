@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0.3" y2="1">
+      <stop offset="0" stop-color="#1a2140"/>
+      <stop offset="1" stop-color="#0b0e17"/>
+    </linearGradient>
+    <linearGradient id="back" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6fe0c0"/>
+      <stop offset="1" stop-color="#33a189"/>
+    </linearGradient>
+    <linearGradient id="cover" x1="0.1" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#9db4ff"/>
+      <stop offset="1" stop-color="#5871dc"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="256" height="256" rx="58" fill="url(#tile)"/>
+
+  <g transform="translate(133 128) scale(0.9) translate(-128 -128)">
+  <!-- book behind, tilted, peeking out top-right -->
+  <g transform="rotate(9 128 128)">
+    <rect x="84" y="52" width="112" height="150" rx="13" fill="url(#back)"/>
+    <rect x="84" y="52" width="20" height="150" rx="10" fill="#000" opacity="0.16"/>
+  </g>
+
+  <!-- spiral notebook in front -->
+  <rect x="60" y="60" width="122" height="148" rx="15" fill="#000" opacity="0.22"/>
+  <rect x="58" y="56" width="122" height="148" rx="15" fill="url(#cover)"/>
+  <rect x="58" y="56" width="26" height="148" rx="13" fill="#000" opacity="0.15"/>
+
+  <!-- ruled lines -->
+  <g stroke="#0b0e17" stroke-width="11" stroke-linecap="round" opacity="0.42">
+    <line x1="104" y1="102" x2="158" y2="102"/>
+    <line x1="104" y1="132" x2="158" y2="132"/>
+    <line x1="104" y1="162" x2="140" y2="162"/>
+  </g>
+
+  <!-- binding wire -->
+  <g stroke="#dfe6f7" stroke-width="9" stroke-linecap="round">
+    <line x1="50" y1="86" x2="92" y2="86"/>
+    <line x1="50" y1="118" x2="92" y2="118"/>
+    <line x1="50" y1="150" x2="92" y2="150"/>
+    <line x1="50" y1="182" x2="92" y2="182"/>
+  </g>
+  </g>
+</svg>
