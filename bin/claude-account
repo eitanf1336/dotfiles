@@ -14,6 +14,7 @@ Usage:
   claude-account add <name>      log in to another account and save it as <name>
   claude-account save <name>     snapshot whoever is logged in right now as <name>
   claude-account whoami          who is logged in right now
+  claude-account rename <a> <b>  rename a saved account
   claude-account rm <name>       forget a saved account
   claude-account restore         undo the last switch
 
@@ -654,6 +655,23 @@ def cmd_rm(args):
     return 0
 
 
+def cmd_rename(args):
+    pos = [a for a in args if not a.startswith("-")]
+    if len(pos) != 2:
+        die(f"Usage: {CYA}claude-account rename <old> <new>{RST}\nSaved: "
+            + (", ".join(profiles()) or "(none)"))
+    old, new = check_name(pos[0]), check_name(pos[1])
+    if old not in profiles():
+        die(f"{RED}No saved account called {old!r}.{RST}")
+    if new in profiles():
+        die(f"{RED}'{new}' already exists.{RST}")
+    os.rename(slot(old), slot(new))
+    if active_name() == old:
+        set_active(new)
+    info(f"{GRN}Renamed {old} -> {BLD}{new}{RST}")
+    return 0
+
+
 def cmd_whoami(args):
     st = live_status()
     cur = active_name()
@@ -706,6 +724,7 @@ COMMANDS = {
     "save": cmd_save,
     "add": cmd_add, "login": cmd_add,
     "rm": cmd_rm, "remove": cmd_rm, "forget": cmd_rm,
+    "rename": cmd_rename, "mv": cmd_rename,
     "whoami": cmd_whoami, "who": cmd_whoami, "status": cmd_whoami,
     "restore": cmd_restore, "undo": cmd_restore,
 }
