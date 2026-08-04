@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 screenshot-claude — take a screenshot via GNOME's native overlay (area/window/
-screen) and copy the resulting file's absolute path to the Wayland clipboard
-(no trailing newline) so it can be pasted straight into the Claude Code
-terminal.
+screen), keep the image on the clipboard as usual, and put the file's absolute
+path (no trailing newline) on the primary selection so it can be middle-click
+pasted straight into the Claude Code terminal.
 
 Uses the XDG desktop portal Screenshot API, the only supported path on modern
 GNOME Wayland (the org.gnome.Shell.Screenshot D-Bus API is access-denied to
@@ -19,6 +19,16 @@ whichever answers first:
   2. a new file appearing in ~/Pictures/Screenshots.
 
 Nothing captured — cancelled, or timed out — exits quietly. No error toast.
+
+You get the image AND the path, on the two different selections:
+
+  * clipboard (Ctrl+V)      the image, exactly as stock GNOME leaves it
+  * primary (middle-click)  the absolute path, for the Claude Code terminal
+
+Pass --path to swap them, when the path is what you actually want on Ctrl+V.
+(One offer carrying both is not possible: Wayland allows a single clipboard
+owner, and Mutter refuses ownership to a client with no mapped, focused window,
+so advertising image/png + text/plain together would mean stealing focus.)
 """
 
 import os
@@ -44,6 +54,13 @@ LOG = os.path.expanduser("~/.cache/screenshot-claude.log")
 # check the save directory for a freshly written screenshot.
 TIMEOUT_SEC = 120
 POLL_MS = 200
+
+MIME_BY_EXT = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
 
 
 def log(msg):
@@ -109,6 +126,73 @@ def newest_new_file(before):
     except OSError:
         return None
     return newest
+
+
+def clipboard_types():
+    try:
+        out = subprocess.run(
+            ["wl-paste", "--list-types"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return [t.strip() for t in out.stdout.splitlines() if t.strip()]
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return []
+
+
+def wl_copy(payload, primary=False, mime=None):
+    """wl-copy a string, or the bytes of a file when mime is given."""
+    args = ["wl-copy"]
+    if primary:
+        args.append("--primary")
+    try:
+        if mime:
+            with open(payload, "rb") as f:
+                subprocess.run(args + ["--type", mime], stdin=f, check=True)
+        else:
+            subprocess.run(args + ["--trim-newline", "--", payload], check=True)
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError, OSError) as e:
+        log(f"wl-copy failed ({e})")
+        return False
+
+
+def deliver(path, path_to_clipboard):
+    """Hand the screenshot off to the user.
+
+    Wayland only lets one client own the clipboard, and Mutter refuses that
+    ownership to a client with no mapped, focused window — so a single copy
+    carrying both the image and its path is not possible here without stealing
+    focus. Hence two selections:
+
+      * clipboard (Ctrl+V) — the image, exactly as stock GNOME leaves it
+      * primary (middle-click) — the path, for pasting into the Claude terminal
+
+    With path_to_clipboard the two swap, for when the path is what you're after.
+    """
+    if path_to_clipboard:
+        if not wl_copy(path):
+            notify("Path not copied", "wl-copy failed", icon="dialog-error", urgent=True)
+            return False
+        wl_copy(path, primary=True)
+        log(f"delivered: path on clipboard -> {path}")
+        notify("Path copied — paste into Claude", path, icon=path)
+        return True
+
+    # GNOME's screenshot UI already puts the image on the clipboard; leave its
+    # copy alone rather than round-tripping the bytes. Only step in if it didn't.
+    if any(t.startswith("image/") for t in clipboard_types()):
+        log("clipboard: GNOME's image left in place")
+    else:
+        mime = MIME_BY_EXT.get(os.path.splitext(path)[1].lower(), "image/png")
+        log(f"clipboard: no image found, copying {mime} ourselves")
+        wl_copy(path, mime=mime)
+
+    if not wl_copy(path, primary=True):
+        notify("Path not copied", "wl-copy failed", icon="dialog-error", urgent=True)
+        return False
+    log(f"delivered: image on clipboard, path on primary -> {path}")
+    notify("Image copied — path on middle-click", path, icon=path)
+    return True
 
 
 def main():
@@ -222,15 +306,11 @@ def main():
             log(f"copy failed ({e}) — using portal path")
             dest = src
 
-    try:
-        subprocess.run(["wl-copy", "--trim-newline", "--", dest], check=True)
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        notify("Path not copied", "wl-copy failed", icon="dialog-error", urgent=True)
+    log(f"ok via {result['how']}: {dest}")
+
+    if not deliver(dest, path_to_clipboard="--path" in sys.argv):
         print(dest)
         sys.exit(1)
-
-    log(f"ok via {result['how']}: {dest}")
-    notify("Path copied — paste into Claude", dest, icon=dest)
     print(dest)
 
 
