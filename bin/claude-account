@@ -1,0 +1,744 @@
+#!/usr/bin/env python3
+"""claude-account - keep several Claude logins side by side and switch in one command.
+
+Claude Code stores exactly one login per machine (~/.claude/.credentials.json plus
+the account identity inside ~/.claude.json). This parks each account in its own
+slot under ~/.claude/accounts/ and swaps the live one in and out, so every chat,
+skill, MCP server and setting stays exactly where it is - only the billing
+account changes.
+
+Usage:
+  claude-account                 list saved accounts, mark the live one
+  claude-account use <name>      switch the whole machine to <name>
+  claude-account swap            flip between the two most recent accounts
+  claude-account add <name>      log in to another account and save it as <name>
+  claude-account save <name>     snapshot whoever is logged in right now as <name>
+  claude-account whoami          who is logged in right now
+  claude-account rm <name>       forget a saved account
+  claude-account restore         undo the last switch
+
+Options:
+  -f, --force    don't ask for confirmation when sessions are running
+  -q, --quiet    one short line (for scripts / status bars)
+      --json     machine-readable output for the listing
+  -h, --help
+
+Switching only affects sessions started afterwards. A chat that is already open
+keeps the old account until you restart it - reopen it with `claude -c` (same
+directory) or `claude --resume` and it continues on the new account.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+CLAUDE_DIR = os.path.join(HOME, ".claude")
+CRED = os.path.join(CLAUDE_DIR, ".credentials.json")
+CONFIG = os.path.join(HOME, ".claude.json")
+STORE = os.path.join(CLAUDE_DIR, "accounts")
+ACTIVE = os.path.join(STORE, "active")
+BACKUPS = os.path.join(STORE, "backups")
+KEEP_BACKUPS = 10
+
+# The keys in ~/.claude.json that describe *who* is logged in. Everything else
+# in that file (projects, mcpServers, prompt history, ...) is shared and must
+# survive a switch untouched.
+IDENTITY_KEYS = ("oauthAccount", "userID")
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+UA = "claude-cli/2.1.221 (claude-account)"
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+use_color = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+if use_color:
+    RED, YEL, GRN, CYA, GRY, BLD, DIM, RST = (
+        "\033[31m", "\033[33m", "\033[32m", "\033[36m",
+        "\033[90m", "\033[1m", "\033[2m", "\033[0m")
+else:
+    RED = YEL = GRN = CYA = GRY = BLD = DIM = RST = ""
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+def info(msg):
+    print(msg)
+
+
+# ---------------------------------------------------------------- file helpers
+
+def atomic_write(path, data, mode=None):
+    """Write bytes/str to path via a temp file in the same dir, then rename."""
+    if mode is None:
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except OSError:
+            mode = 0o600
+    tmp = f"{path}.tmp-{os.getpid()}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(tmp, flags, mode)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def write_json(path, obj, mode=None):
+    atomic_write(path, json.dumps(obj, indent=2) + "\n", mode)
+
+
+def slot(name):
+    return os.path.join(STORE, name)
+
+
+def slot_cred(name):
+    return os.path.join(slot(name), "credentials.json")
+
+
+def slot_identity(name):
+    return os.path.join(slot(name), "identity.json")
+
+
+def slot_meta(name):
+    return os.path.join(slot(name), "meta.json")
+
+
+def profiles():
+    if not os.path.isdir(STORE):
+        return []
+    out = []
+    for entry in sorted(os.listdir(STORE)):
+        if entry in ("active", "backups") or entry.startswith("."):
+            continue
+        if os.path.isfile(slot_cred(entry)):
+            out.append(entry)
+    return out
+
+
+def active_name():
+    try:
+        with open(ACTIVE) as fh:
+            n = fh.read().strip()
+        return n or None
+    except OSError:
+        return None
+
+
+def set_active(name):
+    atomic_write(ACTIVE, name + "\n", 0o600)
+
+
+def check_name(name):
+    if not NAME_RE.match(name or ""):
+        die(f"{RED}Bad account name {name!r}.{RST} Use letters, digits, dot, dash, underscore.")
+    return name
+
+
+# ------------------------------------------------------------- live account io
+
+def live_status(timeout=20):
+    """Ask the CLI who is logged in. Returns dict or None. Never returns tokens."""
+    try:
+        p = subprocess.run(["claude", "auth", "status", "--json"],
+                           capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    d = read_json_str(p.stdout)
+    if not isinstance(d, dict) or not d.get("loggedIn"):
+        return d if isinstance(d, dict) else None
+    return {k: d.get(k) for k in
+            ("loggedIn", "email", "subscriptionType", "authMethod", "orgName")}
+
+
+def read_json_str(s):
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def live_identity():
+    cfg = read_json(CONFIG, {}) or {}
+    return {k: cfg[k] for k in IDENTITY_KEYS if k in cfg}
+
+
+def identity_email(identity):
+    oa = (identity or {}).get("oauthAccount") or {}
+    return oa.get("emailAddress")
+
+
+def have_live_creds():
+    return os.path.isfile(CRED) and os.path.getsize(CRED) > 0
+
+
+def token_of(path):
+    d = read_json(path, {}) or {}
+    oauth = d.get("claudeAiOauth") or {}
+    return oauth.get("accessToken"), oauth.get("expiresAt", 0) / 1000.0
+
+
+def fetch_usage(token, timeout=15):
+    """Top utilisation percent + reset time, or None. Same endpoint as /usage."""
+    if not token:
+        return None
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": "Bearer " + token,
+        "anthropic-beta": "oauth-2025-04-20",
+        "Content-Type": "application/json",
+        "User-Agent": UA,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+        return None
+    rows = []
+    for lim in data.get("limits") or []:
+        pct = lim.get("percent")
+        if pct is not None:
+            rows.append((float(pct), lim.get("kind") or "", lim.get("resets_at")))
+    if not rows:
+        for key in ("five_hour", "seven_day"):
+            blk = data.get(key)
+            if isinstance(blk, dict) and blk.get("utilization") is not None:
+                rows.append((float(blk["utilization"]), key, blk.get("resets_at")))
+    if not rows:
+        return None
+    pct, kind, resets = max(rows, key=lambda r: r[0])
+    return {"percent": pct, "kind": kind, "resets_at": resets, "at": time.time()}
+
+
+def fmt_rel(ts):
+    if not ts:
+        return ""
+    delta = time.time() - ts
+    if delta < 90:
+        return "just now"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h ago"
+    return f"{int(delta // 86400)}d ago"
+
+
+def fmt_reset(iso):
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return ""
+    delta = (dt - datetime.now(timezone.utc)).total_seconds()
+    if delta <= 0:
+        return "resets now"
+    if delta < 3600:
+        return f"resets in {int(delta // 60)}m"
+    if delta < 86400:
+        return f"resets in {int(delta // 3600)}h{int((delta % 3600) // 60):02d}m"
+    return f"resets in {int(delta // 86400)}d"
+
+
+def pct_color(pct):
+    if pct >= 90:
+        return RED
+    if pct >= 75:
+        return YEL
+    return GRN
+
+
+# --------------------------------------------------------------- running check
+
+def running_sessions():
+    """PIDs of live Claude Code processes, excluding this tool's own ancestry."""
+    try:
+        p = subprocess.run(["ps", "-eo", "pid,ppid,args"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    mine = set()
+    pid = os.getpid()
+    for _ in range(12):  # walk up our own parents so we never flag ourselves
+        mine.add(pid)
+        try:
+            with open(f"/proc/{pid}/stat") as fh:
+                pid = int(fh.read().split(") ", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+        if pid <= 1:
+            break
+    found = []
+    for line in p.stdout.splitlines()[1:]:
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            cpid = int(parts[0])
+        except ValueError:
+            continue
+        args = parts[2]
+        if cpid in mine or "claude-account" in args:
+            continue
+        if "/.local/share/claude/versions/" in args or re.search(
+                r"(^|/)claude(\s|$)", args):
+            found.append((cpid, args[:70]))
+    return found
+
+
+# ------------------------------------------------------------------ core moves
+
+def snapshot(name, with_usage=True):
+    """Copy the live login into slot <name>."""
+    if not have_live_creds():
+        die(f"{RED}Nobody is logged in{RST} (no {CRED}).\n"
+            "Run `claude auth login` first, then `claude-account save <name>`.")
+    os.makedirs(slot(name), mode=0o700, exist_ok=True)
+    os.chmod(slot(name), 0o700)
+    shutil.copyfile(CRED, slot_cred(name))
+    os.chmod(slot_cred(name), 0o600)
+    write_json(slot_identity(name), live_identity(), 0o600)
+
+    meta = read_json(slot_meta(name), {}) or {}
+    st = live_status() or {}
+    meta["email"] = st.get("email") or identity_email(live_identity()) or meta.get("email")
+    meta["plan"] = st.get("subscriptionType") or meta.get("plan")
+    meta["savedAt"] = time.time()
+    if with_usage:
+        tok, _ = token_of(CRED)
+        u = fetch_usage(tok)
+        if u:
+            meta["usage"] = u
+    write_json(slot_meta(name), meta, 0o600)
+    return meta
+
+
+def backup_current():
+    os.makedirs(BACKUPS, mode=0o700, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    d = os.path.join(BACKUPS, stamp)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    if have_live_creds():
+        shutil.copyfile(CRED, os.path.join(d, "credentials.json"))
+        os.chmod(os.path.join(d, "credentials.json"), 0o600)
+    write_json(os.path.join(d, "identity.json"), live_identity(), 0o600)
+    write_json(os.path.join(d, "meta.json"),
+               {"was": active_name(), "at": time.time()}, 0o600)
+    old = sorted(x for x in os.listdir(BACKUPS)
+                 if os.path.isdir(os.path.join(BACKUPS, x)))
+    for x in old[:-KEEP_BACKUPS]:
+        shutil.rmtree(os.path.join(BACKUPS, x), ignore_errors=True)
+    return d
+
+
+def apply_identity(identity):
+    """Replace only the identity keys inside ~/.claude.json, keep the rest."""
+    cfg = read_json(CONFIG)
+    if cfg is None:
+        cfg = {}
+    for k in IDENTITY_KEYS:
+        if k in (identity or {}):
+            cfg[k] = identity[k]
+        else:
+            cfg.pop(k, None)
+    write_json(CONFIG, cfg)
+
+
+def activate(name):
+    src = slot_cred(name)
+    if not os.path.isfile(src):
+        die(f"{RED}No saved account called {name!r}.{RST} Run `claude-account` to list them.")
+    shutil.copyfile(src, CRED)
+    os.chmod(CRED, 0o600)
+    apply_identity(read_json(slot_identity(name), {}) or {})
+    set_active(name)
+
+
+# --------------------------------------------------------------------- actions
+
+def cmd_list(args):
+    names = profiles()
+    cur = active_name()
+    live = live_status()
+    live_email = (live or {}).get("email")
+
+    if "--json" in args:
+        out = {"active": cur, "liveEmail": live_email, "accounts": []}
+        for n in names:
+            m = read_json(slot_meta(n), {}) or {}
+            out["accounts"].append({
+                "name": n, "email": m.get("email"), "plan": m.get("plan"),
+                "savedAt": m.get("savedAt"), "usage": m.get("usage"),
+                "active": n == cur})
+        print(json.dumps(out, indent=2))
+        return 0
+
+    quiet = "-q" in args or "--quiet" in args
+    if quiet:
+        tag = cur or "unsaved"
+        if live_email:
+            print(f"{tag} ({live_email})")
+        else:
+            print(tag)
+        return 0
+
+    if not names:
+        info(f"{YEL}No accounts saved yet.{RST}\n")
+        if live_email:
+            info(f"You are logged in as {BLD}{live_email}{RST}.")
+            info(f"Save it, then add the other one:\n"
+                 f"  {CYA}claude-account save me{RST}\n"
+                 f"  {CYA}claude-account add dad{RST}")
+        else:
+            info(f"Log in first: {CYA}claude auth login{RST}")
+        return 0
+
+    info(f"{BLD}Saved Claude accounts{RST}  {DIM}(~/.claude/accounts){RST}")
+    for n in names:
+        m = read_json(slot_meta(n), {}) or {}
+        is_active = (n == cur)
+        mark = f"{GRN}*{RST}" if is_active else " "
+        label = f"{BLD}{n}{RST}" if is_active else n
+        email = m.get("email") or "?"
+        plan = m.get("plan") or ""
+        line = f" {mark} {label:<22} {DIM}{email}{RST}"
+        if plan:
+            line += f" {CYA}[{plan}]{RST}"
+        info(line)
+
+        u = m.get("usage") or {}
+        if is_active:
+            tok, _ = token_of(CRED)
+            fresh = fetch_usage(tok)
+            if fresh:
+                u = fresh
+                m["usage"] = fresh
+                write_json(slot_meta(n), m, 0o600)
+        if u.get("percent") is not None:
+            pct = u["percent"]
+            when = "live" if is_active else fmt_rel(u.get("at"))
+            reset = fmt_reset(u.get("resets_at"))
+            bits = " ".join(x for x in (reset, f"{DIM}{when}{RST}") if x)
+            info(f"     {pct_color(pct)}{pct:5.1f}% used{RST}  {DIM}{bits}{RST}")
+        elif not is_active:
+            info(f"     {DIM}usage unknown - last checked {fmt_rel(u.get('at')) or 'never'}{RST}")
+
+    if live_email and cur:
+        cur_meta = read_json(slot_meta(cur), {}) or {}
+        if cur_meta.get("email") and cur_meta["email"] != live_email:
+            info(f"\n{YEL}Heads up:{RST} live login is {BLD}{live_email}{RST} but the active "
+                 f"slot says {cur_meta['email']}.\n"
+                 f"Run {CYA}claude-account save {cur}{RST} to re-sync it.")
+    elif live_email and not cur:
+        info(f"\n{YEL}Live login {BLD}{live_email}{RST}{YEL} is not saved in any slot.{RST}\n"
+             f"Save it with {CYA}claude-account save <name>{RST} before switching away.")
+
+    other = [n for n in names if n != cur]
+    if other:
+        info(f"\n{DIM}Switch:{RST} {CYA}claude-account use {other[0]}{RST}"
+             + (f"   {DIM}or just{RST} {CYA}claude-account swap{RST}" if len(names) == 2 else ""))
+    return 0
+
+
+def warn_running(force):
+    procs = running_sessions()
+    if not procs:
+        return True
+    info(f"{YEL}{len(procs)} Claude session(s) still running.{RST}")
+    for pid, args in procs[:6]:
+        info(f"  {DIM}{pid}  {args}{RST}")
+    if len(procs) > 6:
+        info(f"  {DIM}... and {len(procs) - 6} more{RST}")
+    info(f"{DIM}They keep using the old account until restarted, and one of them can"
+         f"\nwrite its old token back over the new one. Close them, switch, reopen"
+         f"\nwith `claude -c` to land back in the same chat.{RST}")
+    if force:
+        return True
+    if not sys.stdin.isatty():
+        die(f"{RED}Refusing to switch while sessions are running.{RST} "
+            f"Re-run with {CYA}--force{RST} if you mean it.", 2)
+    try:
+        ans = input(f"Switch anyway? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return ans in ("y", "yes")
+
+
+def cmd_use(args):
+    force = "-f" in args or "--force" in args
+    pos = [a for a in args if not a.startswith("-")]
+    if not pos:
+        die(f"Usage: {CYA}claude-account use <name>{RST}\nSaved: "
+            + (", ".join(profiles()) or "(none)"))
+    name = check_name(pos[0])
+    if name not in profiles():
+        die(f"{RED}No saved account called {name!r}.{RST}\nSaved: "
+            + (", ".join(profiles()) or "(none)"))
+
+    cur = active_name()
+    if cur == name:
+        st = live_status() or {}
+        info(f"{GRN}Already on {BLD}{name}{RST}{GRN}{RST}"
+             + (f" {DIM}({st.get('email')}){RST}" if st.get("email") else ""))
+        return 0
+
+    if not warn_running(force):
+        info("Cancelled.")
+        return 1
+
+    # Tokens rotate as they refresh, so fold the live ones back into the slot
+    # we're leaving. Skip it if the live login isn't the one we think it is.
+    if cur and have_live_creds():
+        cur_meta = read_json(slot_meta(cur), {}) or {}
+        st = live_status() or {}
+        if not st.get("email") or not cur_meta.get("email") or \
+                st["email"] == cur_meta["email"]:
+            info(f"{DIM}Saving current tokens back into '{cur}'...{RST}")
+            try:
+                snapshot(cur)
+            except SystemExit:
+                raise
+            except Exception as e:  # never block a switch on bookkeeping
+                info(f"{YEL}Could not re-save '{cur}': {e}{RST}")
+        else:
+            info(f"{YEL}Live login ({st['email']}) doesn't match slot '{cur}' "
+                 f"({cur_meta['email']}) - not overwriting it.{RST}")
+    elif have_live_creds() and not cur:
+        info(f"{YEL}Current login isn't saved in any slot - backing it up only.{RST}")
+
+    backup_current()
+    activate(name)
+
+    m = read_json(slot_meta(name), {}) or {}
+    who = m.get("email") or "?"
+    plan = f" [{m['plan']}]" if m.get("plan") else ""
+    info(f"{GRN}Switched to {BLD}{name}{RST}{GRN} - {who}{plan}{RST}")
+    info(f"{DIM}New sessions use it right away. For a chat that's already open, "
+         f"restart it and run `claude -c` to pick it back up.{RST}")
+    return 0
+
+
+def cmd_swap(args):
+    names = profiles()
+    if len(names) < 2:
+        die(f"{RED}Need at least two saved accounts to swap.{RST}\nSaved: "
+            + (", ".join(names) or "(none)"))
+    cur = active_name()
+    if len(names) > 2 and cur:
+        # most recently saved account that isn't the current one
+        ranked = sorted((n for n in names if n != cur),
+                        key=lambda n: (read_json(slot_meta(n), {}) or {}).get("savedAt", 0),
+                        reverse=True)
+        target = ranked[0]
+    else:
+        target = next((n for n in names if n != cur), names[0])
+    return cmd_use([target] + [a for a in args if a.startswith("-")])
+
+
+def cmd_save(args):
+    pos = [a for a in args if not a.startswith("-")]
+    if not pos:
+        die(f"Usage: {CYA}claude-account save <name>{RST}")
+    name = check_name(pos[0])
+    meta = snapshot(name)
+    set_active(name)
+    info(f"{GRN}Saved current login as {BLD}{name}{RST}{GRN}"
+         + (f" - {meta.get('email')}" if meta.get("email") else "") + f"{RST}")
+    return 0
+
+
+def cmd_add(args):
+    pos = [a for a in args if not a.startswith("-")]
+    if not pos:
+        die(f"Usage: {CYA}claude-account add <name>{RST}   "
+            f"{DIM}(logs in to another account and saves it){RST}")
+    name = check_name(pos[0])
+    if name in profiles():
+        die(f"{RED}'{name}' already exists.{RST} Use "
+            f"{CYA}claude-account save {name}{RST} to overwrite it, or pick another name.")
+
+    cur = active_name()
+    if have_live_creds():
+        if not cur:
+            info(f"{YEL}The account you're logged in as isn't saved yet.{RST}")
+            if sys.stdin.isatty():
+                try:
+                    keep = input("Name to save it under (blank = don't save): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return 1
+                if keep:
+                    snapshot(check_name(keep))
+                    set_active(keep)
+                    cur = keep
+                    info(f"{GRN}Saved as {keep}.{RST}")
+        else:
+            snapshot(cur)
+            info(f"{DIM}Current account '{cur}' saved.{RST}")
+
+    backup_current()
+    info(f"\n{BLD}Logging out, then opening the login page for the new account.{RST}")
+    info(f"{DIM}Sign in as the OTHER account in the browser window.{RST}\n")
+    subprocess.run(["claude", "auth", "logout"], check=False)
+    rc = subprocess.run(["claude", "auth", "login"], check=False).returncode
+    if rc != 0:
+        info(f"\n{RED}Login didn't complete.{RST}")
+        if cur:
+            info(f"Putting '{cur}' back.")
+            activate(cur)
+        return 1
+
+    st = live_status() or {}
+    if cur:
+        prev = (read_json(slot_meta(cur), {}) or {}).get("email")
+        if st.get("email") and prev and st["email"] == prev:
+            info(f"\n{YEL}That's the same account as '{cur}' ({prev}).{RST} Nothing saved.")
+            return 1
+    meta = snapshot(name)
+    set_active(name)
+    info(f"\n{GRN}Added {BLD}{name}{RST}{GRN}"
+         + (f" - {meta.get('email')}" if meta.get("email") else "") + f"{RST}")
+    info(f"{DIM}You are on '{name}' now. Go back with "
+         f"`claude-account use {cur}`.{RST}" if cur else "")
+    return 0
+
+
+def cmd_rm(args):
+    pos = [a for a in args if not a.startswith("-")]
+    if not pos:
+        die(f"Usage: {CYA}claude-account rm <name>{RST}")
+    name = check_name(pos[0])
+    if name not in profiles():
+        die(f"{RED}No saved account called {name!r}.{RST}")
+    if name == active_name() and sys.stdin.isatty():
+        try:
+            ans = input(f"'{name}' is the active one. Forget it anyway? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 1
+        if ans not in ("y", "yes"):
+            return 1
+    shutil.rmtree(slot(name), ignore_errors=True)
+    if name == active_name():
+        try:
+            os.unlink(ACTIVE)
+        except OSError:
+            pass
+    info(f"{GRN}Forgot '{name}'.{RST} {DIM}(the live login is untouched){RST}")
+    return 0
+
+
+def cmd_whoami(args):
+    st = live_status()
+    cur = active_name()
+    if not st or not st.get("loggedIn"):
+        info(f"{YEL}Not logged in.{RST} Run {CYA}claude auth login{RST}.")
+        return 1
+    if "-q" in args or "--quiet" in args:
+        print(st.get("email") or "?")
+        return 0
+    info(f"{BLD}{st.get('email')}{RST}"
+         + (f"  {CYA}[{st.get('subscriptionType')}]{RST}" if st.get("subscriptionType") else "")
+         + (f"  {DIM}slot: {cur}{RST}" if cur else f"  {DIM}(not saved in any slot){RST}"))
+    tok, _ = token_of(CRED)
+    u = fetch_usage(tok)
+    if u:
+        info(f"{pct_color(u['percent'])}{u['percent']:.1f}% used{RST} "
+             f"{DIM}{fmt_reset(u.get('resets_at'))}{RST}")
+    return 0
+
+
+def cmd_restore(args):
+    if not os.path.isdir(BACKUPS):
+        die(f"{RED}No backups yet.{RST}")
+    stamps = sorted(x for x in os.listdir(BACKUPS)
+                    if os.path.isdir(os.path.join(BACKUPS, x)))
+    if not stamps:
+        die(f"{RED}No backups yet.{RST}")
+    d = os.path.join(BACKUPS, stamps[-1])
+    meta = read_json(os.path.join(d, "meta.json"), {}) or {}
+    src = os.path.join(d, "credentials.json")
+    if not os.path.isfile(src):
+        die(f"{RED}Backup {stamps[-1]} has no credentials in it.{RST}")
+    if not warn_running("-f" in args or "--force" in args):
+        info("Cancelled.")
+        return 1
+    shutil.copyfile(src, CRED)
+    os.chmod(CRED, 0o600)
+    apply_identity(read_json(os.path.join(d, "identity.json"), {}) or {})
+    was = meta.get("was")
+    if was:
+        set_active(was)
+    info(f"{GRN}Restored the login from {stamps[-1]}{RST}"
+         + (f" {DIM}(slot '{was}'){RST}" if was else ""))
+    return 0
+
+
+COMMANDS = {
+    "list": cmd_list, "ls": cmd_list,
+    "use": cmd_use, "switch": cmd_use,
+    "swap": cmd_swap, "toggle": cmd_swap,
+    "save": cmd_save,
+    "add": cmd_add, "login": cmd_add,
+    "rm": cmd_rm, "remove": cmd_rm, "forget": cmd_rm,
+    "whoami": cmd_whoami, "who": cmd_whoami, "status": cmd_whoami,
+    "restore": cmd_restore, "undo": cmd_restore,
+}
+
+
+def main():
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv or (argv and argv[0] == "help"):
+        print(__doc__.strip())
+        return 0
+    os.makedirs(STORE, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(STORE, 0o700)
+    except OSError:
+        pass
+
+    if not argv or argv[0].startswith("-"):
+        return cmd_list(argv)
+    cmd, rest = argv[0], argv[1:]
+    fn = COMMANDS.get(cmd)
+    if not fn:
+        # bare `claude-account dad` means `use dad`
+        if cmd in profiles():
+            return cmd_use(argv)
+        die(f"{RED}Unknown command {cmd!r}.{RST} Try {CYA}claude-account --help{RST}")
+    return fn(rest)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main() or 0)
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
