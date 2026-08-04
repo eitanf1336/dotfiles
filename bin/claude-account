@@ -18,14 +18,18 @@ Usage:
   claude-account restore         undo the last switch
 
 Options:
-  -f, --force    don't ask for confirmation when sessions are running
+  -f, --force    switch even while Claude is mid-task
   -q, --quiet    one short line (for scripts / status bars)
       --json     machine-readable output for the listing
   -h, --help
 
-Switching only affects sessions started afterwards. A chat that is already open
-keeps the old account until you restart it - reopen it with `claude -c` (same
-directory) or `claude --resume` and it continues on the new account.
+Switching is live. Claude Code re-reads the credentials file on every turn
+(verified), so chats you already have open move to the new account on their
+next message - nothing to restart, nothing to reopen.
+
+The one case that isn't seamless is a chat or agent that is working *right now*:
+switching under it would move the rest of that task onto the other account, so
+the switch refuses unless you pass --force. Idle open chats are never in the way.
 """
 import json
 import os
@@ -274,42 +278,38 @@ def pct_color(pct):
     return GRN
 
 
-# --------------------------------------------------------------- running check
+# ----------------------------------------------------------------- busy check
 
-def running_sessions():
-    """PIDs of live Claude Code processes, excluding this tool's own ancestry."""
+def claude_busy(timeout=30):
+    """Is Claude mid-task? Delegates to claude-status, which already knows how
+    to tell a thinking chat from an idle one (it CPU-samples the TUIs).
+
+    Returns (code, detail): 1 = actively working, 0/2 = nothing working,
+    None = couldn't tell (then we don't block)."""
     try:
-        p = subprocess.run(["ps", "-eo", "pid,ppid,args"],
-                           capture_output=True, text=True, timeout=10)
+        p = subprocess.run(["claude-status", "-q"], capture_output=True,
+                           text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
-        return []
-    mine = set()
-    pid = os.getpid()
-    for _ in range(12):  # walk up our own parents so we never flag ourselves
-        mine.add(pid)
-        try:
-            with open(f"/proc/{pid}/stat") as fh:
-                pid = int(fh.read().split(") ", 1)[1].split()[1])
-        except (OSError, ValueError, IndexError):
-            break
-        if pid <= 1:
-            break
-    found = []
-    for line in p.stdout.splitlines()[1:]:
-        parts = line.strip().split(None, 2)
-        if len(parts) < 3:
-            continue
-        try:
-            cpid = int(parts[0])
-        except ValueError:
-            continue
-        args = parts[2]
-        if cpid in mine or "claude-account" in args:
-            continue
-        if "/.local/share/claude/versions/" in args or re.search(
-                r"(^|/)claude(\s|$)", args):
-            found.append((cpid, args[:70]))
-    return found
+        return None, ""
+    return p.returncode, (p.stdout or "").strip().splitlines()[0] if p.stdout.strip() else ""
+
+
+def busy_guard(force):
+    """True if it's safe to swap the credentials out from under Claude."""
+    code, detail = claude_busy()
+    if code != 1:
+        return True
+    info(f"{RED}{BLD}Claude is working right now.{RST}"
+         + (f"\n  {DIM}{detail}{RST}" if detail else ""))
+    if force:
+        info(f"{YEL}--force given - switching anyway. "
+             f"The rest of that task bills to the new account.{RST}")
+        return True
+    info(f"{DIM}Switching now would move the rest of that task onto the other "
+         f"account.\nWait for it to finish, or re-run with {RST}{CYA}--force{RST}"
+         f"{DIM}.{RST}\n{DIM}(Idle chats are fine - they pick up the new account "
+         f"on their next message.){RST}")
+    return False
 
 
 # ------------------------------------------------------------------ core moves
@@ -509,9 +509,8 @@ def cmd_use(args):
              + (f" {DIM}({st.get('email')}){RST}" if st.get("email") else ""))
         return 0
 
-    if not warn_running(force):
-        info("Cancelled.")
-        return 1
+    if not busy_guard(force):
+        return 2
 
     # Tokens rotate as they refresh, so fold the live ones back into the slot
     # we're leaving. Skip it if the live login isn't the one we think it is.
@@ -540,8 +539,8 @@ def cmd_use(args):
     who = m.get("email") or "?"
     plan = f" [{m['plan']}]" if m.get("plan") else ""
     info(f"{GRN}Switched to {BLD}{name}{RST}{GRN} - {who}{plan}{RST}")
-    info(f"{DIM}New sessions use it right away. For a chat that's already open, "
-         f"restart it and run `claude -c` to pick it back up.{RST}")
+    info(f"{DIM}Every open chat moves over on its next message. "
+         f"Nothing to restart.{RST}")
     return 0
 
 
@@ -687,9 +686,8 @@ def cmd_restore(args):
     src = os.path.join(d, "credentials.json")
     if not os.path.isfile(src):
         die(f"{RED}Backup {stamps[-1]} has no credentials in it.{RST}")
-    if not warn_running("-f" in args or "--force" in args):
-        info("Cancelled.")
-        return 1
+    if not busy_guard("-f" in args or "--force" in args):
+        return 2
     shutil.copyfile(src, CRED)
     os.chmod(CRED, 0o600)
     apply_identity(read_json(os.path.join(d, "identity.json"), {}) or {})
