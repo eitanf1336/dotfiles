@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
 """
 screenshot-claude — take a screenshot via GNOME's native overlay (area/window/
-screen), save it to ~/Pictures/Screenshots, and copy its absolute path to the
-Wayland clipboard (no trailing newline) so it can be pasted straight into the
-Claude Code terminal.
+screen) and copy the resulting file's absolute path to the Wayland clipboard
+(no trailing newline) so it can be pasted straight into the Claude Code
+terminal.
 
 Uses the XDG desktop portal Screenshot API, the only supported path on modern
 GNOME Wayland (the org.gnome.Shell.Screenshot D-Bus API is access-denied to
 external callers since GNOME 42).
+
+The portal is not trustworthy about handing back a URI: on GNOME 50 the Shell
+captures and saves the image to ~/Pictures/Screenshots but the portal Response
+can arrive with no uri, or never arrive at all. So we race two sources and take
+whichever answers first:
+
+  1. the portal Response signal (subscribed on both the predicted request path
+     and the one the call actually returns), and
+  2. a new file appearing in ~/Pictures/Screenshots.
+
+Nothing captured — cancelled, or timed out — exits quietly. No error toast.
 """
 
 import os
@@ -27,6 +38,27 @@ PATH = "/org/freedesktop/portal/desktop"
 IFACE = "org.freedesktop.portal.Screenshot"
 
 SAVE_DIR = os.path.expanduser("~/Pictures/Screenshots")
+LOG = os.path.expanduser("~/.cache/screenshot-claude.log")
+
+# How long to leave the capture overlay open before giving up, and how often to
+# check the save directory for a freshly written screenshot.
+TIMEOUT_SEC = 120
+POLL_MS = 200
+
+
+def log(msg):
+    """Append a diagnostic line; keep the file small. Never fatal."""
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 64 * 1024:
+            with open(LOG, "r") as f:
+                tail = f.readlines()[-200:]
+            with open(LOG, "w") as f:
+                f.writelines(tail)
+        with open(LOG, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
 
 
 def notify(summary, body="", icon="camera-photo", urgent=False):
@@ -44,80 +76,152 @@ def uri_to_path(uri):
     return unquote(urlparse(uri).path)
 
 
+def snapshot_dir():
+    """Names of the image files currently in SAVE_DIR."""
+    try:
+        return {
+            n for n in os.listdir(SAVE_DIR)
+            if n.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+        }
+    except OSError:
+        return set()
+
+
+def newest_new_file(before):
+    """Newest image in SAVE_DIR that wasn't there before, once fully written."""
+    added = snapshot_dir() - before
+    if not added:
+        return None
+    paths = [os.path.join(SAVE_DIR, n) for n in added]
+    try:
+        newest = max(paths, key=os.path.getmtime)
+    except OSError:
+        return None
+    # The Shell may still be writing the PNG — only accept a stable, non-empty
+    # file so we never hand Claude a truncated image.
+    try:
+        size = os.path.getsize(newest)
+        if size == 0:
+            return None
+        time.sleep(0.15)
+        if os.path.getsize(newest) != size:
+            return None
+    except OSError:
+        return None
+    return newest
+
+
 def main():
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     loop = GLib.MainLoop()
-    result = {"uri": None, "response": None}
+    result = {"uri": None, "response": None, "file": None, "how": None}
+
+    before = snapshot_dir()
 
     token = "screenshotclaude" + str(int(time.time() * 1000))
     sender = bus.get_unique_name().lstrip(":").replace(".", "_")
-    request_path = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+    predicted_path = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
 
     def on_response(conn, s, obj, iface, signal, params):
         response, results = params.unpack()
         result["response"] = response
-        if response == 0:
-            result["uri"] = results.get("uri")
-        loop.quit()
+        result["uri"] = results.get("uri")
+        log(f"response={response} keys={sorted(results)} uri={result['uri']!r}")
+        if result["uri"]:
+            result["how"] = "portal"
+            loop.quit()
+        else:
+            # Cancelled, or answered without a uri (GNOME 50 does this even for a
+            # successful capture). Either way the portal has nothing more to give
+            # us, so just let the directory watcher have a short grace period in
+            # case the Shell saved the image itself.
+            GLib.timeout_add(1500, lambda: (loop.quit(), False)[1])
 
-    bus.signal_subscribe(
-        DEST,
-        "org.freedesktop.portal.Request",
-        "Response",
-        request_path,
-        None,
-        Gio.DBusSignalFlags.NONE,
-        on_response,
-        None,
-    )
+    def subscribe(path):
+        return bus.signal_subscribe(
+            DEST,
+            "org.freedesktop.portal.Request",
+            "Response",
+            path,
+            None,
+            Gio.DBusSignalFlags.NONE,
+            on_response,
+            None,
+        )
 
-    options = {
-        "interactive": GLib.Variant("b", True),
-        "handle_token": GLib.Variant("s", token),
-    }
+    # Subscribe before the call so a fast response can't race past us.
+    subscribe(predicted_path)
+
     try:
-        bus.call_sync(
+        ret = bus.call_sync(
             DEST,
             PATH,
             IFACE,
             "Screenshot",
-            GLib.Variant("(sa{sv})", ("", options)),
+            GLib.Variant("(sa{sv})", ("", {
+                "interactive": GLib.Variant("b", True),
+                "handle_token": GLib.Variant("s", token),
+            })),
             GLib.VariantType("(o)"),
             Gio.DBusCallFlags.NONE,
             -1,
             None,
         )
     except GLib.Error as e:
+        log(f"call failed: {e}")
         notify("Screenshot failed", str(e), icon="dialog-error", urgent=True)
         sys.exit(1)
 
-    # Safety timeout so the process can't hang forever.
-    GLib.timeout_add_seconds(120, loop.quit)
+    # The portal is free to hand back a request path other than the one we
+    # predicted; the old code ignored it, so its Response never matched.
+    actual_path = ret.unpack()[0]
+    if actual_path != predicted_path:
+        log(f"request path differs: predicted={predicted_path} actual={actual_path}")
+        subscribe(actual_path)
+
+    def poll_dir():
+        found = newest_new_file(before)
+        if found:
+            result["file"] = found
+            result["how"] = "watch"
+            log(f"picked up new file: {found}")
+            loop.quit()
+            return False
+        return True
+
+    GLib.timeout_add(POLL_MS, poll_dir)
+    GLib.timeout_add_seconds(TIMEOUT_SEC, lambda: (loop.quit(), False)[1])
     loop.run()
 
-    if result["response"] == 1:
-        # user cancelled — stay quiet
+    src = None
+    if result["uri"]:
+        src = uri_to_path(result["uri"])
+        if not os.path.isfile(src):
+            log(f"portal uri missing on disk: {src}")
+            src = None
+    if src is None:
+        src = result["file"] or newest_new_file(before)
+
+    if src is None:
+        # Cancelled, or nothing was ever captured. Say nothing — an error toast
+        # here is exactly the noise this tool used to generate on every shot.
+        log(f"no image (response={result['response']}) — quiet exit")
         sys.exit(0)
-    if not result["uri"]:
-        notify("Screenshot failed", "No image returned", icon="dialog-error", urgent=True)
-        sys.exit(1)
 
-    src = uri_to_path(result["uri"])
-    if not os.path.isfile(src):
-        notify("Screenshot failed", f"Missing file: {src}", icon="dialog-error", urgent=True)
-        sys.exit(1)
+    # Keep it in a stable, English-named location so the path can't be swept out
+    # from under Claude by a temp-dir cleanup. Files the Shell already saved
+    # into SAVE_DIR are permanent, so leave those where they are.
+    dest = src
+    if os.path.dirname(os.path.abspath(src)) != os.path.abspath(SAVE_DIR):
+        try:
+            os.makedirs(SAVE_DIR, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            dest = os.path.join(SAVE_DIR, f"claude-{stamp}.png")
+            shutil.copyfile(src, dest)
+        except OSError as e:
+            log(f"copy failed ({e}) — using portal path")
+            dest = src
 
-    # Copy into a stable, English-named location so the path never gets swept
-    # out from under Claude by a temp-dir cleanup.
-    os.makedirs(SAVE_DIR, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    dest = os.path.join(SAVE_DIR, f"claude-{stamp}.png")
-    try:
-        shutil.copyfile(src, dest)
-    except OSError:
-        dest = src  # fall back to the portal's own file
-
-    # Copy the absolute path (no trailing newline) to the clipboard.
     try:
         subprocess.run(["wl-copy", "--trim-newline", "--", dest], check=True)
     except (FileNotFoundError, subprocess.CalledProcessError):
@@ -125,6 +229,7 @@ def main():
         print(dest)
         sys.exit(1)
 
+    log(f"ok via {result['how']}: {dest}")
     notify("Path copied — paste into Claude", dest, icon=dest)
     print(dest)
 
