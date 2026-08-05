@@ -271,6 +271,26 @@ def fmt_reset(iso):
     return f"resets in {int(delta // 86400)}d"
 
 
+def usage_for(name, is_active, offline=False):
+    """(usage, is_live) for a saved account.
+
+    Access tokens stay valid ~8h, so a parked account can usually be queried
+    with its own stored token and there is no need to switch to it. Falls back
+    to the snapshot taken when we last left that account."""
+    m = read_json(slot_meta(name), {}) or {}
+    cached = m.get("usage") or {}
+    if offline:
+        return cached, False
+    tok, exp = token_of(CRED if is_active else slot_cred(name))
+    if tok and exp > time.time() + 30:
+        fresh = fetch_usage(tok)
+        if fresh:
+            m["usage"] = fresh
+            write_json(slot_meta(name), m, 0o600)
+            return fresh, True
+    return cached, False
+
+
 def pct_color(pct):
     if pct >= 90:
         return RED
@@ -386,6 +406,7 @@ def activate(name):
 def cmd_list(args):
     names = profiles()
     cur = active_name()
+    offline = "--offline" in args or "--no-net" in args
     live = live_status()
     live_email = (live or {}).get("email")
 
@@ -393,10 +414,11 @@ def cmd_list(args):
         out = {"active": cur, "liveEmail": live_email, "accounts": []}
         for n in names:
             m = read_json(slot_meta(n), {}) or {}
+            u, live_now = usage_for(n, n == cur, offline)
             out["accounts"].append({
                 "name": n, "email": m.get("email"), "plan": m.get("plan"),
-                "savedAt": m.get("savedAt"), "usage": m.get("usage"),
-                "active": n == cur})
+                "savedAt": m.get("savedAt"), "usage": u or None,
+                "usageLive": live_now, "active": n == cur})
         print(json.dumps(out, indent=2))
         return 0
 
@@ -433,22 +455,17 @@ def cmd_list(args):
             line += f" {CYA}[{plan}]{RST}"
         info(line)
 
-        u = m.get("usage") or {}
-        if is_active:
-            tok, _ = token_of(CRED)
-            fresh = fetch_usage(tok)
-            if fresh:
-                u = fresh
-                m["usage"] = fresh
-                write_json(slot_meta(n), m, 0o600)
+        u, live_now = usage_for(n, is_active, offline)
         if u.get("percent") is not None:
             pct = u["percent"]
-            when = "live" if is_active else fmt_rel(u.get("at"))
+            when = "live" if live_now else fmt_rel(u.get("at"))
             reset = fmt_reset(u.get("resets_at"))
             bits = " ".join(x for x in (reset, f"{DIM}{when}{RST}") if x)
             info(f"     {pct_color(pct)}{pct:5.1f}% used{RST}  {DIM}{bits}{RST}")
-        elif not is_active:
-            info(f"     {DIM}usage unknown - last checked {fmt_rel(u.get('at')) or 'never'}{RST}")
+        else:
+            stale = fmt_rel(u.get("at")) or "never"
+            info(f"     {DIM}usage unknown - token too old to ask, "
+                 f"last checked {stale}{RST}")
 
     if live_email and cur:
         cur_meta = read_json(slot_meta(cur), {}) or {}

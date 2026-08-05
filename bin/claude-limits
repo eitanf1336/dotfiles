@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""claude-limits — show Claude's current usage limits (5-hour session + weekly).
+
+Reads the same data Claude Code's /usage screen shows, straight from the
+Anthropic OAuth usage endpoint, using the token in ~/.claude/.credentials.json.
+Prints a colored bar per active limit with how full it is and when it resets.
+
+Usage:
+  claude-limits            pretty summary of every limit
+  claude-limits <account>  limits for an account saved by claude-account
+                           (e.g. `claude-limits dad`) without switching to it
+  claude-limits -a         one line per saved account, to see who has headroom
+  claude-limits -q         one compact line (highest-utilization limit)
+  claude-limits --json     raw JSON from the API
+  claude-limits -h
+"""
+import os
+import sys
+import json
+import time
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
+
+CRED = os.path.expanduser("~/.claude/.credentials.json")
+URL = "https://api.anthropic.com/api/oauth/usage"
+UA = "claude-cli/2.1.197 (claude-limits)"
+
+use_color = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+if use_color:
+    RED, YEL, GRN, CYA, GRY, BLD, DIM, RST = (
+        "\033[31m", "\033[33m", "\033[32m", "\033[36m",
+        "\033[90m", "\033[1m", "\033[2m", "\033[0m")
+else:
+    RED = YEL = GRN = CYA = GRY = BLD = DIM = RST = ""
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+ACCOUNTS = os.path.expanduser("~/.claude/accounts")
+
+
+def account_names():
+    try:
+        return sorted(n for n in os.listdir(ACCOUNTS)
+                      if os.path.isfile(os.path.join(ACCOUNTS, n,
+                                                     "credentials.json")))
+    except OSError:
+        return []
+
+
+def cred_path(account=None):
+    """Live credentials, or a parked account saved by claude-account.
+
+    A parked account's own token stays valid ~8h, so its limits can be read
+    without switching to it."""
+    if not account:
+        return CRED
+    p = os.path.join(ACCOUNTS, account, "credentials.json")
+    if not os.path.isfile(p):
+        names = account_names()
+        die(f"{RED}No saved account called {account!r}.{RST}\n"
+            + (f"Saved: {', '.join(names)}" if names else
+               "Save one with `claude-account save <name>`."))
+    return p
+
+
+def load_token(account=None):
+    path = cred_path(account)
+    try:
+        with open(path) as fh:
+            oauth = json.load(fh)["claudeAiOauth"]
+    except (OSError, KeyError, json.JSONDecodeError):
+        die(f"{RED}Can't read Claude credentials at {path}.{RST}\n"
+            "Log in with Claude Code first (run `claude`).")
+    exp = oauth.get("expiresAt", 0) / 1000
+    expired = exp and exp < time.time()
+    return oauth.get("accessToken"), oauth, expired
+
+
+def fetch(token):
+    req = urllib.request.Request(URL, headers={
+        "Authorization": "Bearer " + token,
+        "anthropic-beta": "oauth-2025-04-20",
+        "Content-Type": "application/json",
+        "User-Agent": UA,
+    })
+    with urllib.request.urlopen(req, timeout=25) as r:
+        return json.loads(r.read().decode())
+
+
+def color_for(percent, severity=None):
+    if severity in ("critical", "error") or percent >= 90:
+        return RED
+    if severity in ("warning", "high") or percent >= 75:
+        return YEL
+    return GRN
+
+
+def bar(percent, width=18):
+    percent = max(0.0, min(100.0, float(percent)))
+    filled = int(round(percent / 100 * width))
+    c = color_for(percent)
+    return c + "█" * filled + GRY + "░" * (width - filled) + RST
+
+
+def fmt_reset(iso):
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    now = datetime.now(timezone.utc)
+    delta = (dt - now).total_seconds()
+    loc = dt.astimezone()
+    if delta <= 0:
+        rel = "now"
+    elif delta < 3600:
+        rel = f"{int(delta // 60)}m"
+    elif delta < 86400:
+        rel = f"{int(delta // 3600)}h {int((delta % 3600) // 60)}m"
+    else:
+        rel = f"{int(delta // 86400)}d {int((delta % 86400) // 3600)}h"
+    same_day = loc.date() == datetime.now().date()
+    when = loc.strftime("%H:%M") if same_day else loc.strftime("%a %d %b %H:%M")
+    return f"resets in {rel} {DIM}({when}){RST}"
+
+
+LABELS = {
+    "session": "Session (5h)",
+    "weekly_all": "Weekly (all)",
+    "weekly": "Weekly (all)",
+    "weekly_opus": "Weekly (Opus)",
+    "weekly_sonnet": "Weekly (Sonnet)",
+    "opus": "Weekly (Opus)",
+}
+
+
+def collect(data):
+    """Return list of (label, percent, severity, resets_at) to display."""
+    rows, seen = [], set()
+    for lim in data.get("limits") or []:
+        kind = lim.get("kind") or lim.get("group") or ""
+        label = LABELS.get(kind, kind.replace("_", " ").title() or "Limit")
+        pct = lim.get("percent")
+        if pct is None:
+            continue
+        rows.append((label, float(pct), lim.get("severity"),
+                     lim.get("resets_at")))
+        seen.add(round(float(pct)))
+    if not rows:  # fall back to the top-level blocks
+        for key, label in (("five_hour", "Session (5h)"),
+                           ("seven_day", "Weekly (all)")):
+            blk = data.get(key)
+            if isinstance(blk, dict) and blk.get("utilization") is not None:
+                rows.append((label, float(blk["utilization"]), None,
+                             blk.get("resets_at")))
+    return rows
+
+
+def show_all(quiet=False):
+    """One line per saved account, so you can see who has headroom."""
+    names = account_names()
+    if not names:
+        die(f"{YEL}No saved accounts.{RST} "
+            "Save one with `claude-account save <name>`.")
+    try:
+        with open(os.path.join(ACCOUNTS, "active")) as fh:
+            active = fh.read().strip()
+    except OSError:
+        active = None
+    width = max(len(n) for n in names)
+    if not quiet:
+        print(f"{BLD}Claude usage limits{RST} {DIM}(all accounts){RST}\n")
+    for n in names:
+        token, _oauth, _expired = load_token(n)
+        mark = f"{GRN}*{RST}" if n == active else " "
+        try:
+            rows = collect(fetch(token)) if token else []
+        except (urllib.error.URLError, OSError, json.JSONDecodeError):
+            rows = []
+        if not rows:
+            print(f" {mark} {n.ljust(width)}  {GRY}unavailable (stale token; "
+                  f"run `claude-account use {n}` to refresh){RST}")
+            continue
+        label, pct, sev, reset = max(rows, key=lambda r: r[1])
+        c = color_for(pct, sev)
+        print(f" {mark} {n.ljust(width)}  {bar(pct, 14)}  {c}{pct:5.0f}%{RST}  "
+              f"{GRY}{label} · {fmt_reset(reset)}{RST}")
+    if not quiet:
+        print()
+
+
+def main():
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(__doc__.strip())
+        return
+    quiet = "-q" in args or "--quiet" in args
+    as_json = "--json" in args
+    if "--all" in args or "-a" in args:
+        return show_all(quiet)
+    account = next((a for a in args if not a.startswith("-")), None)
+
+    token, oauth, expired = load_token(account)
+    if not token:
+        die(f"{RED}No access token found — run `claude` to log in.{RST}")
+    try:
+        data = fetch(token)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            hint = " (token expired)" if expired else ""
+            if account:
+                die(f"{RED}Auth rejected for '{account}'{hint}.{RST}\n"
+                    f"Its saved token has gone stale. Run "
+                    f"`claude-account use {account}` once to refresh it.")
+            die(f"{RED}Auth rejected{hint}.{RST} "
+                "Refresh it by running `claude` once, then retry.")
+        die(f"{RED}Usage endpoint returned HTTP {e.code}.{RST}")
+    except urllib.error.URLError as e:
+        die(f"{RED}Network error:{RST} {e.reason}")
+
+    if as_json:
+        print(json.dumps(data, indent=2))
+        return
+
+    rows = collect(data)
+    if not rows:
+        die(f"{YEL}No usage limits reported.{RST}")
+
+    if quiet:
+        label, pct, sev, reset = max(rows, key=lambda r: r[1])
+        c = color_for(pct, sev)
+        tail = fmt_reset(reset)
+        tail = " · " + tail.replace(f"{DIM}", "").replace(f"{RST}", "") if tail else ""
+        print(f"{c}{pct:.0f}%{RST} {label}{tail}")
+        return
+
+    tier = (oauth.get("subscriptionType") or "").capitalize()
+    tierline = f" {DIM}·{RST} {BLD}Claude {tier}{RST}" if tier else ""
+    who = f" {DIM}({account}){RST}" if account else ""
+    print(f"{BLD}Claude usage limits{RST}{who}{tierline}\n")
+    width = max(len(r[0]) for r in rows)
+    for label, pct, sev, reset in rows:
+        c = color_for(pct, sev)
+        print(f"  {label.ljust(width)}  {bar(pct)}  "
+              f"{c}{pct:5.0f}%{RST}  {GRY}{fmt_reset(reset)}{RST}")
+
+    extra = data.get("extra_usage") or {}
+    if extra.get("is_enabled"):
+        u = extra.get("utilization")
+        pcttxt = f"{u:.0f}%" if u is not None else "on"
+        print(f"\n  {DIM}Extra usage: enabled ({pcttxt}){RST}")
+    print()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
