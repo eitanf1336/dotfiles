@@ -31,8 +31,9 @@ if use_color:
     RED, YEL, GRN, CYA, GRY, BLD, DIM, RST = (
         "\033[31m", "\033[33m", "\033[32m", "\033[36m",
         "\033[90m", "\033[1m", "\033[2m", "\033[0m")
+    SOFT = "\033[37m"   # reset times: readable, still quieter than the bars
 else:
-    RED = YEL = GRN = CYA = GRY = BLD = DIM = RST = ""
+    RED = YEL = GRN = CYA = GRY = BLD = DIM = RST = SOFT = ""
 
 
 def die(msg, code=1):
@@ -162,8 +163,32 @@ def collect(data):
     return rows
 
 
+def short_reset(iso):
+    """Just the "how long until it resets" part, for the side-by-side table."""
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return ""
+    d = (dt - datetime.now(timezone.utc)).total_seconds()
+    if d <= 0:
+        return "now"
+    if d < 3600:
+        return f"{int(d // 60)}m"
+    if d < 86400:
+        return f"{int(d // 3600)}h{int((d % 3600) // 60):02d}m"
+    return f"{int(d // 86400)}d{int((d % 86400) // 3600)}h"
+
+
+# columns shown by -a, in order
+ALL_COLS = ("Session (5h)", "Weekly (all)")
+CELL_W = 22  # visible width of one cell: bar(10) + " " + "100%" + " " + reset(6)
+
+
 def show_all(quiet=False):
-    """One line per saved account, so you can see who has headroom."""
+    """One line per saved account, 5h next to weekly, so you can see at a
+    glance which account has room before switching."""
     names = account_names()
     if not names:
         die(f"{YEL}No saved accounts.{RST} "
@@ -176,6 +201,8 @@ def show_all(quiet=False):
     width = max(len(n) for n in names)
     if not quiet:
         print(f"{BLD}Claude usage limits{RST} {DIM}(all accounts){RST}\n")
+        head = "  ".join(c.ljust(CELL_W) for c in ALL_COLS)
+        print(f"   {' ' * width}  {DIM}{head}{RST}")
     for n in names:
         token, _oauth, _expired = load_token(n)
         mark = f"{GRN}*{RST}" if n == active else " "
@@ -187,10 +214,21 @@ def show_all(quiet=False):
             print(f" {mark} {n.ljust(width)}  {GRY}unavailable (stale token; "
                   f"run `claude-account use {n}` to refresh){RST}")
             continue
-        label, pct, sev, reset = max(rows, key=lambda r: r[1])
-        c = color_for(pct, sev)
-        print(f" {mark} {n.ljust(width)}  {bar(pct, 14)}  {c}{pct:5.0f}%{RST}  "
-              f"{GRY}{label} · {fmt_reset(reset)}{RST}")
+        by = {}
+        for label, pct, sev, reset in rows:
+            by.setdefault(label, (pct, sev, reset))
+        cells = []
+        for col in ALL_COLS:
+            v = by.get(col)
+            if not v:
+                cells.append(f"{GRY}{'n/a'.ljust(CELL_W)}{RST}")
+                continue
+            pct, sev, reset = v
+            c = color_for(pct, sev)
+            # bar is 10 visible chars, then " NNN% ", then the reset
+            cells.append(f"{bar(pct, 10)} {c}{pct:3.0f}%{RST} "
+                         f"{SOFT}{short_reset(reset).ljust(6)}{RST}")
+        print(f" {mark} {n.ljust(width)}  " + "  ".join(cells))
     if not quiet:
         print()
 
@@ -248,7 +286,7 @@ def main():
     for label, pct, sev, reset in rows:
         c = color_for(pct, sev)
         print(f"  {label.ljust(width)}  {bar(pct)}  "
-              f"{c}{pct:5.0f}%{RST}  {GRY}{fmt_reset(reset)}{RST}")
+              f"{c}{pct:5.0f}%{RST}  {SOFT}{fmt_reset(reset)}{RST}")
 
     extra = data.get("extra_usage") or {}
     if extra.get("is_enabled"):

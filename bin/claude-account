@@ -66,8 +66,9 @@ if use_color:
     RED, YEL, GRN, CYA, GRY, BLD, DIM, RST = (
         "\033[31m", "\033[33m", "\033[32m", "\033[36m",
         "\033[90m", "\033[1m", "\033[2m", "\033[0m")
+    SOFT = "\033[37m"   # reset times: readable, still quieter than the bars
 else:
-    RED = YEL = GRN = CYA = GRY = BLD = DIM = RST = ""
+    RED = YEL = GRN = CYA = GRY = BLD = DIM = RST = SOFT = ""
 
 
 def die(msg, code=1):
@@ -461,7 +462,7 @@ def cmd_list(args):
             when = "live" if live_now else fmt_rel(u.get("at"))
             reset = fmt_reset(u.get("resets_at"))
             bits = " ".join(x for x in (reset, f"{DIM}{when}{RST}") if x)
-            info(f"     {pct_color(pct)}{pct:5.1f}% used{RST}  {DIM}{bits}{RST}")
+            info(f"     {pct_color(pct)}{pct:5.1f}% used{RST}  {SOFT}{bits}{RST}")
         else:
             stale = fmt_rel(u.get("at")) or "never"
             info(f"     {DIM}usage unknown - token too old to ask, "
