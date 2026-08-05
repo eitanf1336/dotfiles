@@ -604,15 +604,24 @@ def cmd_add(args):
             info(f"{DIM}Current account '{cur}' saved.{RST}")
 
     backup_current()
-    info(f"\n{BLD}Logging out, then opening the login page for the new account.{RST}")
+    info(f"\n{BLD}Opening the login page for the new account.{RST}")
     info(f"{DIM}Sign in as the OTHER account in the browser window.{RST}\n")
-    subprocess.run(["claude", "auth", "logout"], check=False)
+    # Deliberately NOT `claude auth logout`: that revokes the token on the
+    # server, which kills the account we just saved and forces a re-login on it
+    # later. Dropping the local credentials file is all the CLI needs to ask for
+    # a fresh login, and it leaves every saved slot valid.
+    try:
+        os.unlink(CRED)
+    except OSError:
+        pass
     rc = subprocess.run(["claude", "auth", "login"], check=False).returncode
-    if rc != 0:
+    if rc != 0 or not have_live_creds():
         info(f"\n{RED}Login didn't complete.{RST}")
         if cur:
             info(f"Putting '{cur}' back.")
             activate(cur)
+        else:
+            info(f"Recover the previous login with {CYA}claude-account restore{RST}.")
         return 1
 
     st = live_status() or {}
