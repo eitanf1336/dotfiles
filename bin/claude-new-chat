@@ -13,13 +13,24 @@
 PROJECT="${1:-$HOME}"
 BOARD="$HOME/.local/bin/claude-c"
 
-# Ctrl+Alt+T's terminal on this box is Ptyxis; --standalone gives a fresh window
-# rather than a tab in whatever is already open, so the shortcut always behaves
-# the same whether or not a terminal is running.
-# NOTE: `-x` takes ONE command string, so the argv form (`-- cmd args …`) is used
-# instead — it passes --new and the project through without quoting games. It runs
-# under `bash -l` so ~/.profile is sourced and `claude` is on PATH even when the
-# keybinding fires with a bare session environment.
-setsid -f ptyxis --standalone --title "New Claude chat" \
-    -- bash -lc 'exec "$1" --new "$2"' _ "$BOARD" "$PROJECT" \
-    >/dev/null 2>&1
+# The command is run under `bash -l` so ~/.profile is sourced and `claude` is on
+# PATH even when the keybinding fires with a bare session environment.
+INNER=(bash -lc 'exec "$1" --new "$2"' _ "$BOARD" "$PROJECT")
+
+# Use the SAME terminal Ctrl+Alt+T opens — Terminator here (it's the
+# x-terminal-emulator alternative), so the window carries the wallpaper-theme
+# background and gets tiled like every other terminal. Ptyxis is only a fallback
+# for a machine without Terminator. -u (no dbus) guarantees a real new window
+# that actually runs our command instead of the running instance quietly opening
+# a plain shell.
+if command -v terminator >/dev/null 2>&1; then
+    setsid -f terminator -u -T "New Claude chat" \
+        --working-directory "$HOME" -x "${INNER[@]}" \
+        >/dev/null 2>&1
+elif command -v ptyxis >/dev/null 2>&1; then
+    # NOTE: ptyxis's -x takes ONE command string, so the argv form is used.
+    setsid -f ptyxis --standalone --title "New Claude chat" -- "${INNER[@]}" \
+        >/dev/null 2>&1
+else
+    setsid -f x-terminal-emulator -e "${INNER[*]}" >/dev/null 2>&1
+fi
