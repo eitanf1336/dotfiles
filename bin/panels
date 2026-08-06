@@ -14,7 +14,15 @@
 # Detaches so the terminal / caller is freed immediately.
 
 PORTFOLIO=/home/eitan/code/portfolio-desktop/portfolio.py
-SURF=/home/eitan/code/surf-desktop/surf.py
+SURF=/home/eitan/code/claude-stuff/surf-desktop/surf.py
+
+# A widget whose repo has moved launches into nothing, and setsid throws the
+# error away: Ctrl+Shift+M then looks like "the surf panel just stopped
+# working". Complain on screen instead of half-starting.
+for w in "$PORTFOLIO" "$SURF"; do
+    [ -x "$w" ] || notify-send -u critical -i video-display 'Desktop panels' \
+        "Missing: $w — fix the path in $0" >/dev/null 2>&1
+done
 
 desktop() {   # $1 = Show | Restore
     gdbus call --session --dest org.gnome.Shell \

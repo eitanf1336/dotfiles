@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# surf — launch the surf-forecast desktop panel (Poleg Beach, Netanya).
+#   surf            → a normal application window (title bar, taskbar)
+#   surf --widget   → the frameless desktop widget (autostart / Ctrl+Shift+M)
+# Detaches so the terminal is freed immediately.
+#
+# The repo moved to ~/code/claude-stuff/ and this launcher kept pointing at the
+# old path, so every launch silently did nothing (setsid throws stderr away).
+# Say so out loud instead of vanishing if it ever moves again.
+SURF=/home/eitan/code/claude-stuff/surf-desktop/surf.py
+
+if [ ! -x "$SURF" ]; then
+    notify-send -u critical -i weather-storm 'Surf widget' \
+        "Not found at $SURF — the repo moved, fix the path in $0" 2>/dev/null
+    echo "surf: $SURF is missing" >&2
+    exit 1
+fi
+
+setsid -f "$SURF" "$@" >/dev/null 2>&1

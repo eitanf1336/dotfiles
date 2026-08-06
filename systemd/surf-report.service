@@ -1,6 +1,6 @@
 [Unit]
 Description=Daily Poleg surf-forecast PDF to WhatsApp (Surf Status group)
-Documentation=file://%h/code/surf-desktop/README.md
+Documentation=file://%h/code/claude-stuff/surf-desktop/README.md
 
 [Service]
 Type=oneshot
