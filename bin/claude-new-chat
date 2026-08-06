@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# claude-new-chat — Ctrl+Alt+Y: open a terminal (like Ctrl+Alt+T) that is ALREADY
+# inside a brand-new Claude chat in the System project. No board, no menus, no
+# thinking-level prompt (it uses the persisted default). Ctrl+Z detaches from the
+# chat — it keeps running — and drops you on the normal claude-c board, in System.
+#
+# Pass a project key to start somewhere else, e.g.:
+#   claude-new-chat /home/eitan/code/MyProjects/Loorp
+#   claude-new-chat HW
+#
+# Detaches from the calling shell (see ~/.claude memory: launchers-must-detach).
+
+PROJECT="${1:-$HOME}"
+BOARD="$HOME/.local/bin/claude-c"
+
+# Ctrl+Alt+T's terminal on this box is Ptyxis; --standalone gives a fresh window
+# rather than a tab in whatever is already open, so the shortcut always behaves
+# the same whether or not a terminal is running.
+# NOTE: `-x` takes ONE command string, so the argv form (`-- cmd args …`) is used
+# instead — it passes --new and the project through without quoting games. It runs
+# under `bash -l` so ~/.profile is sourced and `claude` is on PATH even when the
+# keybinding fires with a bare session environment.
+setsid -f ptyxis --standalone --title "New Claude chat" \
+    -- bash -lc 'exec "$1" --new "$2"' _ "$BOARD" "$PROJECT" \
+    >/dev/null 2>&1

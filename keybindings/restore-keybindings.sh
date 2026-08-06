@@ -134,6 +134,12 @@ gsettings set "$k" name 'Calculate selection (popup)'
 gsettings set "$k" binding '<Control><Alt>c'
 gsettings set "$k" command '/home/eitan/.local/bin/calc'
 
+paths+=("/claude-new-chat/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/claude-new-chat/"
+gsettings set "$k" name 'New Claude chat'
+gsettings set "$k" binding '<Primary><Alt>y'
+gsettings set "$k" command '/home/eitan/bin/claude-new-chat'
+
 # Spotify transport on Ctrl+Super+arrows. These drive spotify-skip over MPRIS
 # and are deliberately NOT the XF86Audio* media keys, which the laptop lacks.
 paths+=("/spotify-next/")

@@ -47,6 +47,14 @@ it and the status line leads with a matching chip.
   d            delete the selected chat permanently (asks to confirm)
   Ctrl+R       reload this script (pick up edits without restarting)
   q            quit
+
+Command line:
+  chats.py                 open the board
+  chats.py --new [proj]    skip the board — create a background chat in `proj`
+                           (default: the System project, i.e. the home folder)
+                           and attach to it immediately. Ctrl+Z out of the chat
+                           lands on the board, in that project. This is what
+                           Ctrl+Alt+Y runs (see ~/bin/claude-new-chat).
 """
 
 import contextlib
@@ -2107,6 +2115,55 @@ def create_bg_resume(full_id, fork=False, cwd=None):
     return mt.group(1) if mt else None
 
 
+def start_new_chat(project_key=None, effort=None):
+    """Create a new background chat in `project_key` and attach straight to it,
+    without the board ever being drawn. This backs `claude-c --new` (Ctrl+Alt+Y):
+    the terminal opens already inside a fresh chat, and Ctrl+Z detaches and drops
+    you on the board in that same project, exactly like leaving any other chat.
+
+    No thinking-level prompt here — that would defeat "immediately" — so it uses
+    the persisted default (change it with 'd<n>' on the board's normal 'n' flow).
+    Returns True if a chat was created."""
+    pj = _load_json(PROJECTS_STORE)
+    run_cwd = None
+    if project_key:
+        run_cwd = (project_key if os.path.isdir(project_key)
+                   else pj.get("cwds", {}).get(project_key))
+    if not (run_cwd and os.path.isdir(run_cwd)):
+        run_cwd = os.environ.get("CHATS_LAUNCH_CWD") or os.getcwd()
+    ensure_trusted(run_cwd)
+    effort = effort or load_effort_default()
+    label = pj.get("list", {}).get(project_key) or project_key or run_cwd
+    print(f"\n▶ New background chat in {label} — {run_cwd} (thinking: {effort}) …")
+    short = create_bg_agent(run_cwd, effort)
+    if not short:
+        print("  Couldn't create the chat (is `claude` on PATH?) — opening the board.")
+        time.sleep(1.5)
+        return False
+    full = next((s for s, r in agents_active().items()
+                 if r.get("id") == short), None)
+    if full:
+        _json_set(STORE, full, "In Progress")
+        if project_key:
+            _json_set(PROJECT_TAGS_STORE, full, project_key)
+    print("  Attaching — press Ctrl+Z to leave it running and go to the board.\n")
+    accent = None
+    if projcolor and project_key:
+        try:
+            accent = projcolor.color_for(project_key)
+        except Exception:
+            accent = None
+    set_terminal_accent(accent)
+    try:
+        run_child(["claude", "attach", short], run_cwd)
+    except FileNotFoundError:
+        print("Could not find `claude` on PATH.")
+        input("Press Enter to open the board …")
+    finally:
+        clear_terminal_accent()
+    return True
+
+
 # ── terminal-resize (SIGWINCH) relay ───────────────────────────────────────
 # THE "resizing the window garbles the chat" BUG. The kernel delivers a
 # terminal's SIGWINCH only to the FOREGROUND process group of that terminal's
@@ -2366,12 +2423,29 @@ def main():
         print("No Claude projects directory found at", PROJECTS_DIR)
         return
 
+    # --new [<project key>] — skip the board: create a fresh background chat in
+    # that project and attach to it right away. Default project is System (the
+    # home folder). Ctrl+Z out of the chat lands on the board in that project.
+    argv = sys.argv[1:]
+    boot_new = False
+    boot_project = str(HOME)
+    if argv and argv[0] in ("--new", "-n", "--new-chat"):
+        boot_new = True
+        if len(argv) > 1 and argv[1]:
+            boot_project = argv[1]
+
     last_id = None
     # Project to restore when the board reopens after a chat. _KEEP_PROJECT on
     # the first launch (use whatever's persisted); after a chat it becomes the
     # project the board was showing, so Ctrl+Z always returns you to the SAME
     # project screen you left — never the chat's own project.
     last_project = _KEEP_PROJECT
+
+    if boot_new:
+        start_new_chat(boot_project)
+        # Whether or not the chat came up, the board that follows opens on the
+        # requested project — that's the "straight into System" half of the ask.
+        last_project = boot_project
     while True:
         # Every child (attach/resume/fork) can leave the terminal in focus-
         # reporting / mouse mode; scrub those before drawing the board so we
