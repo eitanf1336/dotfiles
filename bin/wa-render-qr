@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# wa-render-qr <payload.txt> <out.png> — render a QR PNG from a raw payload file.
+# Tries qrencode, then uv (qrcode[pil]), then a system python with qrcode.
+set -euo pipefail
+IN="${1:?payload file}"; OUT="${2:?output png}"
+
+if command -v qrencode >/dev/null 2>&1; then
+  qrencode -s 8 -m 2 -o "$OUT" -r "$IN"
+elif command -v uv >/dev/null 2>&1; then
+  uv run --quiet --with 'qrcode[pil]' python - "$IN" "$OUT" <<'PY'
+import sys, qrcode
+qrcode.make(open(sys.argv[1]).read().strip()).save(sys.argv[2])
+PY
+else
+  python3 - "$IN" "$OUT" <<'PY'
+import sys, qrcode
+qrcode.make(open(sys.argv[1]).read().strip()).save(sys.argv[2])
+PY
+fi

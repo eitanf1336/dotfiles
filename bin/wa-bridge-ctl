@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# wa-bridge-ctl {start|stop|status|restart|build|logs}: manage the WhatsApp Go bridge.
+#
+# The bridge normally runs as the systemd user unit whatsapp-bridge.service.
+# When that unit exists this script drives *it*, instead of forking a second
+# copy: two bridges cannot both hold port 8080, and the loser used to die
+# quietly, which looked exactly like "the bot is ignoring me". Only when no
+# unit is installed does it fall back to the old nohup+pidfile mode.
+#
+# Config (override via env or ~/.config/whatsapp-claude/config):
+#   WA_REPO   path to the cloned whatsapp-mcp repo (default ~/code/whatsapp-mcp)
+#   GO_BIN    path to the go binary (autodetected)
+#   WA_UNIT   systemd user unit for the bridge (default whatsapp-bridge.service)
+set -euo pipefail
+
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}/whatsapp-claude/config"
+[ -f "$CFG" ] && . "$CFG"
+
+WA_REPO="${WA_REPO:-$HOME/code/whatsapp-mcp}"
+BRIDGE_DIR="$WA_REPO/whatsapp-bridge"
+BIN="$BRIDGE_DIR/whatsapp-bridge-bin"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/whatsapp-claude"
+mkdir -p "$STATE"
+PIDFILE="$STATE/bridge.pid"
+LOG="$STATE/bridge.log"
+UNIT="${WA_UNIT:-whatsapp-bridge.service}"
+
+# Is the bridge managed by systemd on this machine?
+have_unit() {
+  systemctl --user cat "$UNIT" >/dev/null 2>&1
+}
+
+find_go() {
+  if [ -n "${GO_BIN:-}" ] && [ -x "$GO_BIN" ]; then echo "$GO_BIN"; return; fi
+  for g in "$(command -v go 2>/dev/null || true)" "$HOME/.local/go-sdk/go/bin/go" /usr/local/go/bin/go; do
+    [ -n "$g" ] && [ -x "$g" ] && { echo "$g"; return; }
+  done
+  echo ""; return 1
+}
+
+is_running() {
+  if have_unit; then
+    systemctl --user is-active --quiet "$UNIT"
+  else
+    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+  fi
+}
+
+build() {
+  local go; go="$(find_go)"
+  [ -z "$go" ] && { echo "go not found: install Go or set GO_BIN" >&2; exit 1; }
+  echo "building bridge with $go ..."
+  ( cd "$BRIDGE_DIR" && "$go" build -o whatsapp-bridge-bin . )
+  echo "built $BIN"
+}
+
+start() {
+  [ -x "$BIN" ] || build
+  if have_unit; then
+    systemctl --user start "$UNIT"
+    echo "started $UNIT"
+    return
+  fi
+  if is_running; then echo "already running (pid $(cat "$PIDFILE"))"; return; fi
+  ( cd "$BRIDGE_DIR" && nohup "$BIN" >"$LOG" 2>&1 & echo $! >"$PIDFILE" )
+  echo "started bridge pid $(cat "$PIDFILE"), log: $LOG"
+}
+
+stop() {
+  if have_unit; then
+    systemctl --user stop "$UNIT"
+    echo "stopped $UNIT"
+    return
+  fi
+  if is_running; then kill "$(cat "$PIDFILE")" 2>/dev/null || true; sleep 1
+    kill -9 "$(cat "$PIDFILE")" 2>/dev/null || true; fi
+  rm -f "$PIDFILE"; echo "stopped"
+}
+
+# logs [--since "<systemd timespec>"]: recent bridge output, whichever backend
+# is in charge. Callers grep this instead of assuming a log file exists.
+logs() {
+  local since=""
+  [ "${1:-}" = "--since" ] && { since="${2:-}"; shift 2 || true; }
+  if have_unit; then
+    if [ -n "$since" ]; then
+      journalctl --user -u "$UNIT" --since "$since" --no-pager 2>/dev/null
+    else
+      journalctl --user -u "$UNIT" -n 200 --no-pager 2>/dev/null
+    fi
+  else
+    cat "$LOG" 2>/dev/null
+  fi
+}
+
+status() {
+  if have_unit; then
+    if is_running; then
+      echo "bridge: RUNNING ($UNIT, pid $(systemctl --user show -p MainPID --value "$UNIT"))"
+    else
+      echo "bridge: stopped ($UNIT)"
+    fi
+  elif is_running; then
+    echo "bridge: RUNNING (pid $(cat "$PIDFILE"))"
+  else
+    echo "bridge: stopped"
+  fi
+  local st
+  st="$(curl -s --max-time 2 http://localhost:8080/api/status 2>/dev/null || true)"
+  if [ -n "$st" ]; then
+    echo "REST :8080: reachable"
+    echo "link: $st"
+  elif curl -s --max-time 2 http://localhost:8080/api/send -o /dev/null 2>/dev/null; then
+    # Older bridge build without /api/status.
+    echo "REST :8080: reachable (no /api/status; rebuild the bridge)"
+  else
+    echo "REST :8080: not reachable"
+  fi
+}
+
+case "${1:-status}" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; sleep 1; start ;;
+  build) build ;;
+  logs) shift; logs "$@" ;;
+  status) status ;;
+  *) echo "usage: wa-bridge-ctl {start|stop|status|restart|build|logs}"; exit 1 ;;
+esac

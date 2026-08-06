@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# wa-reconnect: ensure the WhatsApp bridge is linked, popping a QR window if a
+# scan is needed. The window refreshes the code automatically and closes itself
+# the moment the phone links. Designed to be invoked by Claude, by the doctor,
+# or by hand.
+#
+#   wa-reconnect            # link if needed; no-op if already connected
+#   wa-reconnect --force    # always re-pair (shows QR even if linked)
+#
+# Exit: 0 linked, 1 cancelled/failed.
+#
+# The bridge is driven through wa-bridge-ctl, which prefers the systemd unit
+# when one is installed. Log checks go through `wa-bridge-ctl logs` for the
+# same reason: under systemd the output lives in the journal, and grepping a
+# stale file made this script think a live bridge had never connected.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+export PATH="$HERE:$PATH"
+
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}/whatsapp-claude/config"
+[ -f "$CFG" ] && . "$CFG"
+WA_REPO="${WA_REPO:-$HOME/code/whatsapp-mcp}"
+BRIDGE_DIR="$WA_REPO/whatsapp-bridge"
+QR_TXT="$BRIDGE_DIR/qr_code.txt"
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/whatsapp-claude"
+mkdir -p "$STATE"
+QR_PNG="$STATE/qr.png"
+STATUS="$STATE/popup.status"
+SNAP="$STATE/bridge.snap"
+LOCK="$STATE/reconnect.lock"
+
+FORCE=0; [ "${1:-}" = "--force" ] && FORCE=1
+note() { command -v notify-send >/dev/null 2>&1 && notify-send "WhatsApp" "$1" || true; echo "[wa-reconnect] $1"; }
+
+# Only one linking session at a time. The doctor runs every 5 minutes and must
+# not stack QR windows on top of each other.
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "[wa-reconnect] another linking session is already running"; exit 1
+fi
+
+# Log window: only look at lines produced by the session we are about to start.
+BRIDGE_SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
+snap() { wa-bridge-ctl logs --since "$BRIDGE_SINCE" >"$SNAP" 2>/dev/null || true; }
+saw()  { grep -qiE "$1" "$SNAP" 2>/dev/null; }
+
+# Fresh bridge session so we deterministically see either auth or a QR.
+wa-bridge-ctl stop >/dev/null 2>&1 || true
+rm -f "$QR_TXT" "$QR_PNG"; : > "$SNAP"; echo waiting > "$STATUS"
+sleep 1
+BRIDGE_SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
+wa-bridge-ctl start >/dev/null
+
+# Wait for the bridge to either authenticate (already linked) or emit a QR.
+for _ in $(seq 1 60); do
+  [ -f "$QR_TXT" ] && break
+  snap; saw "Connected to WhatsApp" && break
+  sleep 0.5
+done
+snap
+
+if [ ! -f "$QR_TXT" ] && saw "Connected to WhatsApp" && [ "$FORCE" -eq 0 ]; then
+  note "Already linked (bridge connected)."
+  exit 0
+fi
+
+if [ ! -f "$QR_TXT" ]; then
+  note "Bridge did not produce a QR or connect. Check: wa-bridge-ctl logs"
+  exit 1
+fi
+
+# QR path: render, pop the window, and supervise until linked.
+wa-render-qr "$QR_TXT" "$QR_PNG"
+note "Scan the QR window to link WhatsApp."
+( wa-qr-popup --image "$QR_PNG" --status "$STATUS" ) &
+POPUP_PID=$!
+
+prev=""; overall=0
+while kill -0 "$POPUP_PID" 2>/dev/null; do
+  snap
+  if saw "Successfully connected|Connected to WhatsApp"; then
+    echo connected > "$STATUS"; break
+  fi
+  if [ "$(cat "$STATUS" 2>/dev/null)" = "cancel" ]; then
+    note "Linking cancelled."
+    wa-bridge-ctl stop >/dev/null 2>&1 || true
+    exit 1
+  fi
+  if [ -f "$QR_TXT" ]; then
+    cur="$(cat "$QR_TXT" 2>/dev/null)"
+    if [ -n "$cur" ] && [ "$cur" != "$prev" ]; then
+      wa-render-qr "$QR_TXT" "$QR_PNG" 2>/dev/null || true
+      prev="$cur"
+    fi
+  fi
+  # If WhatsApp closed the QR channel, restart for a fresh code.
+  if saw "Error sending close to websocket|Timeout waiting for QR"; then
+    echo expired > "$STATUS"
+    BRIDGE_SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
+    wa-bridge-ctl restart >/dev/null 2>&1 || true
+    prev=""
+  fi
+  sleep 1; overall=$((overall+1))
+  [ "$overall" -gt 900 ] && { note "Timed out waiting to link."; kill "$POPUP_PID" 2>/dev/null; exit 1; }
+done
+
+wait "$POPUP_PID" 2>/dev/null || true
+snap
+if saw "Successfully connected|Connected to WhatsApp"; then
+  # Clear the doctor's alert state so it does not re-nag about a link that is
+  # now healthy, and make sure the bot itself is running against it.
+  rm -f "$HOME/.config/claude-whatsapp/.link-alert" "$BRIDGE_DIR/store/logged_out.flag" 2>/dev/null || true
+  systemctl --user restart claude-whatsapp.service 2>/dev/null || true
+  note "✓ WhatsApp linked."
+  exit 0
+fi
+exit 1

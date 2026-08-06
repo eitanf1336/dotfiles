@@ -1,0 +1,22 @@
+[Unit]
+Description=Claude WhatsApp bot — replies to the "My Claude" self-group via the whatsapp-mcp bridge
+After=network-online.target whatsapp-bridge.service
+# Wants, not Requires: Requires propagates the bridge's restarts to this unit,
+# and KillMode=mixed then kills whatever claude -p is mid-mission. A rebuilt
+# bridge cost a 10-minute APK build that way. The bot already survives a bridge
+# outage on its own (it logs "bridge down" and retries), so ordering is enough.
+Wants=network-online.target whatsapp-bridge.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/eitan
+Environment=PATH=/home/eitan/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /home/eitan/code/claude-stuff/claude-whatsapp-bot/bot.py
+Restart=always
+RestartSec=5
+# Keep claude subprocesses alive with the service
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

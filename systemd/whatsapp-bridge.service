@@ -1,0 +1,15 @@
+[Unit]
+Description=WhatsApp Go bridge (whatsapp-mcp) — backs the Claude WhatsApp bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/eitan/code/whatsapp-mcp/whatsapp-bridge
+ExecStart=/home/eitan/code/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge-bin
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

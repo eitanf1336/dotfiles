@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""wa-qr-popup — a small GTK window that shows the WhatsApp linking QR code
+and closes itself the moment the phone links (or the user dismisses it).
+
+Usage:
+    wa-qr-popup --image /path/to/qr.png --status /path/to/status
+
+Contract with the orchestrator (wa-reconnect):
+  * The orchestrator keeps --image fresh (re-rendering as WhatsApp rotates the
+    code). This window reloads it whenever the file's mtime changes.
+  * The orchestrator writes one word to --status:
+        connected  -> window shows a check and auto-closes
+        expired    -> (optional) shown as a transient hint
+  * If the user closes the window first, it writes `cancel` to --status so the
+    orchestrator can stop the bridge's pairing attempt.
+
+Pure stdlib + system GTK (python3-gi), same stack as claude-ask. No pip deps.
+"""
+import os
+os.environ.setdefault('GDK_BACKEND', 'x11')  # allow centering under XWayland
+
+import sys
+import argparse
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk, GLib, GdkPixbuf
+
+# --- theme: borrow the wallpaper-rotation accent (same trick as claude-ask) ---
+ORDER = ['green', 'blue', 'purple', 'red', 'gold', 'brown', 'wood']
+ACCENTS = {'green': '#4ade80', 'blue': '#60a5fa', 'purple': '#c084fc',
+           'red': '#f87171', 'gold': '#fbbf24', 'brown': '#d2a679',
+           'wood': '#deb887'}
+
+
+def current_accent():
+    try:
+        p = os.path.expanduser('~/.local/state/desktop-rotation/index')
+        idx = int(open(p).read().strip())
+        return ACCENTS[ORDER[idx % len(ORDER)]]
+    except Exception:
+        return '#25D366'  # WhatsApp green fallback
+
+
+class QRWindow(Gtk.Window):
+    def __init__(self, image_path, status_path, accent):
+        super().__init__(title='Link WhatsApp')
+        self.image_path = image_path
+        self.status_path = status_path
+        self.accent = accent
+        self._img_mtime = 0
+        self._done = False
+
+        self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
+        self.set_keep_above(True)
+        self.set_resizable(False)
+        self.set_border_width(0)
+        self.connect('destroy', self.on_destroy)
+        self.connect('key-press-event', self.on_key)
+
+        css = Gtk.CssProvider()
+        css.load_from_data(f"""
+            window {{ background-color: #0d1117; }}
+            .title {{ color: {accent}; font-size: 17px; font-weight: 700; }}
+            .step  {{ color: #c9d1d9; font-size: 12px; }}
+            .muted {{ color: #6e7681; font-size: 11px; }}
+            .ok    {{ color: {accent}; font-size: 20px; font-weight: 700; }}
+            .card  {{ background-color: #ffffff; border-radius: 14px; padding: 14px; }}
+        """.encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        outer.set_margin_top(18); outer.set_margin_bottom(18)
+        outer.set_margin_start(22); outer.set_margin_end(22)
+        self.add(outer)
+
+        title = Gtk.Label(label='Scan to link WhatsApp')
+        title.get_style_context().add_class('title')
+        outer.pack_start(title, False, False, 0)
+
+        steps = Gtk.Label()
+        steps.set_markup(
+            'On your phone:  <b>WhatsApp → Settings →\n'
+            'Linked Devices → Link a Device</b>')
+        steps.set_justify(Gtk.Justification.CENTER)
+        steps.get_style_context().add_class('step')
+        outer.pack_start(steps, False, False, 0)
+
+        card = Gtk.Box()
+        card.get_style_context().add_class('card')
+        card.set_halign(Gtk.Align.CENTER)
+        self.image = Gtk.Image()
+        card.add(self.image)
+        outer.pack_start(card, False, False, 0)
+
+        self.status = Gtk.Label(label='Waiting for scan…  (the code refreshes automatically)')
+        self.status.get_style_context().add_class('muted')
+        outer.pack_start(self.status, False, False, 0)
+
+        self.refresh_image(force=True)
+        GLib.timeout_add(700, self.tick)
+
+    def refresh_image(self, force=False):
+        try:
+            m = os.path.getmtime(self.image_path)
+        except OSError:
+            return
+        if not force and m == self._img_mtime:
+            return
+        self._img_mtime = m
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                self.image_path, 300, 300, True)
+            self.image.set_from_pixbuf(pb)
+        except Exception:
+            pass
+
+    def tick(self):
+        if self._done:
+            return False
+        self.refresh_image()
+        state = ''
+        try:
+            with open(self.status_path) as f:
+                state = f.read().strip()
+        except OSError:
+            pass
+        if state == 'connected':
+            self._done = True
+            self.status.set_text('✓ Linked!')
+            self.status.get_style_context().add_class('ok')
+            GLib.timeout_add(900, self._close)
+            return False
+        if state == 'expired':
+            self.status.set_text('Refreshing code…')
+        return True
+
+    def _close(self):
+        Gtk.main_quit()
+        return False
+
+    def on_key(self, _w, ev):
+        if ev.keyval == Gdk.KEY_Escape:
+            self.cancel()
+
+    def on_destroy(self, _w):
+        if not self._done:
+            self._write('cancel')
+        Gtk.main_quit()
+
+    def cancel(self):
+        self._write('cancel')
+        Gtk.main_quit()
+
+    def _write(self, msg):
+        try:
+            with open(self.status_path, 'w') as f:
+                f.write(msg)
+        except OSError:
+            pass
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--image', required=True)
+    ap.add_argument('--status', required=True)
+    args = ap.parse_args()
+    if not os.path.exists(args.status):
+        open(args.status, 'w').close()
+    win = QRWindow(args.image, args.status, current_accent())
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == '__main__':
+    main()

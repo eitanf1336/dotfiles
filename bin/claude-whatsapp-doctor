@@ -14,9 +14,23 @@
 # the wa-history symlink, and restarts the service. If it cannot fix things it
 # shouts (desktop notification) instead of failing quietly.
 #
+# 2026-08-06: it happened again, for a completely different reason, and this
+# script reported "healthy" throughout. WhatsApp unlinked the device at 19:49
+# ("Got device removed stream error"); the bridge process stayed up and the bot
+# stayed up, both perfectly idle, because a linked device is not the same thing
+# as a running process. Nothing noticed for an hour, and only the user did.
+# So checks 4b/4c below look at the *link*: is this device still paired, and is
+# the socket actually connected. Losing the pairing needs a phone to fix it, so
+# the repair is to put the QR on screen and say so, loudly, until it is scanned.
+#
 # Run by claude-whatsapp-doctor.timer every 5 minutes, and once at boot.
 
 set -uo pipefail
+
+# The repair paths below shell out to wa-reconnect / notify-send. A watchdog
+# that cannot find its own tools is worse than none, so do not rely on whatever
+# PATH the service happens to inherit.
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 
 UNIT=claude-whatsapp.service
 UNIT_DIR="$HOME/.config/systemd/user"
@@ -140,6 +154,126 @@ fi
 if ! systemctl --user is-active --quiet "$BRIDGE_UNIT" 2>/dev/null; then
     log "bridge down; starting $BRIDGE_UNIT"
     systemctl --user start "$BRIDGE_UNIT" 2>/dev/null
+    sleep 5
+fi
+
+# --- 4b. Link health --------------------------------------------------------
+# The failure this section exists for: WhatsApp drops the pairing (device
+# removed on the phone, or the ~2-week linked-device expiry) and every layer
+# above keeps looking fine. Only the link state tells the truth.
+WA_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/whatsapp-claude"
+RECONNECT_LOCK="$WA_STATE/reconnect.lock"
+LINK_ALERT="$STATE_DIR/.link-alert"        # epoch of last "go scan" shout
+DISCONNECT_MARK="$STATE_DIR/.disconnected" # consecutive not-connected checks
+ALERT_EVERY=1800                           # re-shout every 30 min while unlinked
+
+find_bridge_dir() {
+    local d
+    for d in "$HOME/code/whatsapp-mcp/whatsapp-bridge" \
+             "$HOME/code/claude-stuff/whatsapp-mcp/whatsapp-bridge"; do
+        [[ -d "$d" ]] && { printf '%s' "$d"; return 0; }
+    done
+    d=$(find "$HOME/code" -maxdepth 4 -type d -name whatsapp-bridge 2>/dev/null | head -n1)
+    [[ -n "$d" ]] && { printf '%s' "$d"; return 0; }
+    return 1
+}
+BRIDGE_DIR=$(find_bridge_dir || true)
+
+# A linking session in progress owns the bridge: leave it alone, and do not
+# stack a second QR window on top of the one already waiting to be scanned.
+relinking() {
+    [[ -f "$RECONNECT_LOCK" ]] || return 1
+    ! flock -n "$RECONNECT_LOCK" true 2>/dev/null
+}
+
+# Authoritative pairing check straight from whatsmeow's own store: it deletes
+# the device row on logout. Works even against an old bridge build with no
+# /api/status. Echoes yes/no/unknown.
+device_paired() {
+    local db="$BRIDGE_DIR/store/whatsapp.db"
+    [[ -f "$db" ]] || { echo unknown; return; }
+    python3 - "$db" <<'PY' 2>/dev/null || echo unknown
+import sqlite3, sys
+try:
+    c = sqlite3.connect('file:%s?mode=ro' % sys.argv[1], uri=True)
+    n = c.execute('select count(*) from whatsmeow_device').fetchone()[0]
+    print('yes' if n else 'no')
+except Exception:
+    print('unknown')
+PY
+}
+
+api_status=$(curl -s --max-time 4 http://localhost:8080/api/status 2>/dev/null || true)
+api_logged_in=""; api_connected=""
+if [[ -n "$api_status" ]]; then
+    api_logged_in=$(grep -o '"logged_in":[a-z]*' <<<"$api_status" | cut -d: -f2)
+    api_connected=$(grep -o '"connected":[a-z]*' <<<"$api_status" | cut -d: -f2)
+fi
+
+paired=$(device_paired)
+[[ -n "$BRIDGE_DIR" && -f "$BRIDGE_DIR/store/logged_out.flag" ]] && paired=no
+[[ "$api_logged_in" == "false" ]] && paired=no
+
+if relinking; then
+    log "a linking session is in progress; skipping link checks"
+elif [[ "$paired" == "no" ]]; then
+    # Unlinked. Only a phone can fix this, so put the QR on screen and shout.
+    now=$(date +%s)
+    last=$(cat "$LINK_ALERT" 2>/dev/null || echo 0)
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    if (( now - last >= ALERT_EVERY )); then
+        printf '%s' "$now" >"$LINK_ALERT"
+        notify "WhatsApp unlinked this device. The bot cannot see or send anything. Scan the QR window that just opened (WhatsApp → Linked devices)."
+        log "UNLINKED: launching wa-reconnect for a QR scan"
+        if command -v wa-reconnect >/dev/null 2>&1; then
+            setsid -f nohup wa-reconnect >>"$WA_STATE/reconnect.log" 2>&1 </dev/null || \
+                notify "Could not launch wa-reconnect. Run it in a terminal: wa-reconnect"
+        else
+            notify "wa-reconnect is missing. Re-link by hand from $BRIDGE_DIR"
+        fi
+    else
+        log "UNLINKED (alerted $((now - last))s ago; waiting for the scan)"
+    fi
+elif [[ -n "$api_status" && "$api_connected" == "false" ]]; then
+    # Paired but the socket is down. One flap is normal; two checks in a row
+    # (10 minutes deaf) is not, so bounce the bridge and escalate if that fails.
+    n=$(cat "$DISCONNECT_MARK" 2>/dev/null || echo 0)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    n=$((n + 1)); printf '%s' "$n" >"$DISCONNECT_MARK"
+    log "bridge paired but not connected (strike $n)"
+    if (( n >= 2 )); then
+        log "restarting $BRIDGE_UNIT to force a reconnect"
+        systemctl --user restart "$BRIDGE_UNIT" 2>/dev/null
+        sleep 8
+        after=$(curl -s --max-time 4 http://localhost:8080/api/status 2>/dev/null || true)
+        if grep -q '"connected":true' <<<"$after"; then
+            log "bridge reconnected"
+            printf '0' >"$DISCONNECT_MARK"
+        else
+            notify "WhatsApp bridge is paired but will not connect. Messages are not getting through."
+        fi
+    fi
+elif [[ -z "$api_status" ]] && systemctl --user is-active --quiet "$BRIDGE_UNIT" 2>/dev/null; then
+    # Process alive, REST port dead: an old build without /api/status, or a
+    # wedged listener. Distinguish with the send endpoint before restarting.
+    if curl -s --max-time 4 -o /dev/null http://localhost:8080/api/send 2>/dev/null; then
+        log "bridge REST up but /api/status missing; rebuild it (wa-bridge-ctl build)"
+        printf '0' >"$DISCONNECT_MARK"
+    else
+        n=$(cat "$DISCONNECT_MARK" 2>/dev/null || echo 0)
+        [[ "$n" =~ ^[0-9]+$ ]] || n=0
+        n=$((n + 1)); printf '%s' "$n" >"$DISCONNECT_MARK"
+        log "bridge running but REST :8080 is dead (strike $n)"
+        if (( n >= 2 )); then
+            log "restarting $BRIDGE_UNIT (dead REST port)"
+            systemctl --user restart "$BRIDGE_UNIT" 2>/dev/null
+            printf '0' >"$DISCONNECT_MARK"
+        fi
+    fi
+else
+    # Healthy: clear both counters so a future incident starts from zero.
+    printf '0' >"$DISCONNECT_MARK"
+    rm -f "$LINK_ALERT"
 fi
 
 # --- 5. Ensure the bot is actually running ----------------------------------
