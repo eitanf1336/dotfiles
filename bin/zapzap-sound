@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# zapzap-sound : silence WhatsApp (ZapZap) completely, or give it audio back.
+#
+# "off" is a hard block, not a volume slider: it revokes the flatpak's PulseAudio
+# socket AND its raw /dev/snd access, so the app has no audio path at all, and it
+# turns off GNOME's notification sound for ZapZap. Nothing it does can make noise.
+# Side effect: no voice-note playback, no calls, no mic while it's off.
+#
+# Usage:  zapzap-sound off       # mute for good (default)
+#         zapzap-sound on        # restore audio
+#         zapzap-sound status
+set -uo pipefail
+
+APP=com.rtosta.zapzap
+GKEY="org.gnome.desktop.notifications.application:/org/gnome/desktop/notifications/application/com-rtosta-zapzap/"
+MODE=${1:-off}
+
+restart_if_running() {
+  if pgrep -f "python /app/bin/zapzap" >/dev/null 2>&1; then
+    echo "  restarting ZapZap so it takes effect now..."
+    flatpak kill "$APP" 2>/dev/null
+    sleep 2
+    setsid -f flatpak run "$APP" >/dev/null 2>&1
+  else
+    echo "  ZapZap is not running; applies on next launch."
+  fi
+}
+
+case "$MODE" in
+  off)
+    flatpak override --user --nosocket=pulseaudio --nodevice=all --device=dri --device=shm "$APP"
+    gsettings set "$GKEY" enable-sound-alerts false
+    echo "ZapZap muted: no audio socket, no /dev/snd, no notification sound."
+    restart_if_running
+    ;;
+  on)
+    flatpak override --user --socket=pulseaudio --device=all "$APP"
+    gsettings set "$GKEY" enable-sound-alerts true
+    echo "ZapZap audio restored."
+    restart_if_running
+    ;;
+  status)
+    perms=$(flatpak info --show-permissions "$APP" 2>/dev/null)
+    snd=$(grep -q 'pulseaudio' <<<"$perms" && echo yes || echo no)
+    dev=$(grep -E '^devices=' <<<"$perms" | grep -q 'all' && echo yes || echo no)
+    alert=$(gsettings get "$GKEY" enable-sound-alerts)
+    echo "pulseaudio socket : $snd"
+    echo "raw sound devices : $dev"
+    echo "GNOME sound alert : $alert"
+    [ "$snd" = no ] && [ "$dev" = no ] && [ "$alert" = false ] \
+      && echo "=> SILENT" || echo "=> can make sound"
+    ;;
+  *)
+    echo "usage: zapzap-sound [off|on|status]" >&2; exit 1 ;;
+esac
