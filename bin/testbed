@@ -7,13 +7,17 @@ and Claude Code sessions and only dies at logout/shutdown. That gives Claude and
 you the same stable page to test against instead of a server per session that
 reloads under your hands. Activate one with `/testbed <project>` in Claude Code.
 
+Ports stick. Name one and it is that project's port from then on
+(`testbed surfstatus 5300`, then plain `testbed surfstatus` reuses 5300); name
+none and a free port in 5300-5399 is assigned and remembered the same way.
+
 Usage:
-  testbed <project>                 start (or reuse) that project's static server
-  testbed up <project> [--port N] [--no-wait] [--rebuild]
+  testbed <project> [PORT]          start (or reuse) that project's static server
+  testbed up <project> [PORT] [--no-wait] [--rebuild]
   testbed status [project]          what is registered, what is running
   testbed url <project>             print just the URL
   testbed logs <project> [-n N] [-f]
-  testbed restart <project>
+  testbed restart <project> [PORT]
   testbed down <project> | --all
   testbed doctor <project> [--json] report what setup is still missing
   testbed add <project> <path> [--port N] [--script NAME]
@@ -336,9 +340,26 @@ def print_report(rep):
 def cmd_up(args):
     data = load()
     key, entry = resolve(args.project, data)
-    if args.port:
-        entry["port"] = args.port
+
+    # An explicit port becomes this project's port from now on. Without one it
+    # keeps whichever port it was given on the day it was registered.
+    want, old = args.port, entry.get("port")
+    if want and want != old:
+        if not 1024 <= want <= 65535:
+            die(f"{want} is not a usable port (pick 1024-65535)")
+        taken = [k for k, v in data["projects"].items()
+                 if k != key and v.get("port") == want]
+        if taken:
+            die(f"port {want} is already assigned to {BLD}{taken[0]}{RST}; give it "
+                f"another one first (testbed up {taken[0]} --port <N>) or "
+                f"testbed forget {taken[0]}")
+        if port_listening(want):
+            die(f"port {want} is in use by something else right now, so {key} "
+                f"cannot have it")
+        entry["port"] = want
         save(data)
+        info(f"{key} moves from port {old} to {BLD}{want}{RST}, and keeps it")
+        args.rebuild = True
     port = entry["port"]
 
     rep = diagnose(key, entry)
@@ -465,7 +486,7 @@ def cmd_down(args):
 def cmd_restart(args):
     data = load()
     key, _ = resolve(args.project, data, create=False)
-    args.project, args.rebuild, args.port, args.no_wait = key, True, None, False
+    args.project, args.rebuild, args.no_wait = key, True, False
     cmd_up(args)
 
 
@@ -535,6 +556,9 @@ def main():
 
     up = sub.add_parser("up", help="start or reuse a project's static dev server")
     up.add_argument("project")
+    up.add_argument("port_pos", nargs="?", type=int, metavar="PORT",
+                    help="pin it to this port from now on (default: keep the "
+                         "one assigned when it was registered)")
     up.add_argument("--port", type=int)
     up.add_argument("--no-wait", action="store_true")
     up.add_argument("--rebuild", action="store_true", help="restart even if healthy")
@@ -551,6 +575,8 @@ def main():
 
     rs = sub.add_parser("restart")
     rs.add_argument("project")
+    rs.add_argument("port_pos", nargs="?", type=int, metavar="PORT")
+    rs.add_argument("--port", type=int)
     rs.set_defaults(func=cmd_restart)
 
     lg = sub.add_parser("logs")
@@ -589,6 +615,11 @@ def main():
     if not argv:
         argv = ["status"]
     args = p.parse_args(argv)
+    pos = getattr(args, "port_pos", None)
+    if pos:
+        if args.port and args.port != pos:
+            die(f"you gave two different ports ({pos} and {args.port}), pick one")
+        args.port = pos
     if not getattr(args, "func", None):
         p.print_help()
         sys.exit(1)

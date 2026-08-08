@@ -1,6 +1,6 @@
 ---
 description: Keep a project's no-reload dev server up until the PC shuts down, so every session tests against the same stable URL
-argument-hint: <project>  (e.g. apeirion, surfstatus) | status | down <project> | logs <project>
+argument-hint: <project> [port]  (e.g. surfstatus, or surfstatus 5300) | status | down <project> | logs <project>
 allowed-tools: Bash(testbed:*), Bash(npm:*), Bash(curl:*), Read, Edit, Write, Grep, Glob
 ---
 
@@ -20,10 +20,17 @@ Requested project (may be empty): **$ARGUMENTS**
 If the argument is `status`, `down …`, `logs …`, `restart …`, or `url …`, just
 run `testbed <that>` and report the result in one line.
 
-Otherwise treat the argument as a project name (fuzzy is fine, `testbed`
-resolves it by scanning `~/code`), and:
+Otherwise the first argument is a project name (fuzzy is fine, `testbed`
+resolves it by scanning `~/code`) and an optional second argument is a port.
 
-1. Run `testbed up <project>`.
+**The port is optional and sticky.** Pass it straight through as the positional
+port (`testbed up surfstatus 5300`) and it becomes that project's port from then
+on. With no port given, do not invent one: `testbed` assigns a free port in
+5300-5399 on first registration and reuses it forever after. Naming a port that
+another project holds, or that some other process is using, fails loudly and
+changes nothing, so just relay the error.
+
+1. Run `testbed up <project> [port]`.
    - **Exit 0** means it is serving. Report the URL in one line and stop. Do
      not start any other dev server for this project for the rest of the
      session; use that URL for every check.
@@ -76,3 +83,7 @@ resolves it by scanning `~/code`), and:
   before theorising.
 - The server is shared with the user, who may have that tab open right now.
   Do not stop or restart one you did not start without saying why first.
+- Changing the port of a **running** server breaks the tab the user has open,
+  because the URL moves. Only do it when they asked for that port in this
+  message, and say the new URL in your reply. Never move a live server's port
+  to try something out; use a throwaway project for that.
