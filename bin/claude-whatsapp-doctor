@@ -276,6 +276,118 @@ else
     rm -f "$LINK_ALERT"
 fi
 
+# --- 4d. Deafness: up, linked, and still not reading the group --------------
+# 2026-08-09: the bot ignored the group for the third time, and for the third
+# distinct reason — messages typed in the Whatclaude app went out through the
+# bridge's /api/send, which did not write them to messages.db, and messages.db
+# is the only thing the bot reads. Process alive, link fine, queue empty,
+# every check above green, user ignored.
+#
+# The lesson from three incidents is that checking the *machinery* is not
+# enough; check the *job*. Two signals, both independent of why it broke:
+#   * heartbeat: the poll loop touches a file every cycle. Stale mtime means
+#     the loop is wedged even when nothing has been sent to it.
+#   * unclaimed rows: a message sitting in the group DB above the bot's
+#     watermark for minutes means the loop is not consuming, whatever its
+#     reason. The reverse (watermark *past* the end of the DB, after the store
+#     is rebuilt on a re-link) makes the bot permanently deaf and is repaired
+#     by resetting the watermark.
+STATE_JSON="$STATE_DIR/state.json"
+HEARTBEAT="$STATE_DIR/heartbeat"
+DEAF_AFTER=${CWD_DEAF_AFTER:-240}         # unclaimed this long = not reading
+BEAT_AFTER=${CWD_BEAT_AFTER:-120}         # poll loop silent this long = wedged
+DEAF_COOLDOWN=${CWD_DEAF_COOLDOWN:-900}   # never bounce for deafness more often
+DEAF_MARK="$STATE_DIR/.deaf-restart"
+
+deaf_restart() {   # $1 = reason
+    local now last
+    now=$(date +%s)
+    last=$(cat "$DEAF_MARK" 2>/dev/null || echo 0)
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    if (( now - last < DEAF_COOLDOWN )); then
+        log "DEAF ($1) but restarted $((now - last))s ago; leaving it alone"
+        return
+    fi
+    printf '%s' "$now" >"$DEAF_MARK"
+    log "DEAF: $1 — restarting $UNIT"
+    systemctl --user restart "$UNIT" 2>/dev/null
+    sleep 5
+    if systemctl --user is-active --quiet "$UNIT"; then
+        log "bot restarted after deafness"
+    else
+        notify "Bot was not reading the group ($1) and would not restart."
+    fi
+}
+
+if systemctl --user is-active --quiet "$UNIT" && [[ -n "$BRIDGE_DIR" ]]; then
+    # Wedged poll loop. Skipped silently when the heartbeat file does not exist
+    # yet (an older bot.py, or a bot that just started): absence is not evidence.
+    if [[ -f "$HEARTBEAT" ]]; then
+        beat_age=$(( $(date +%s) - $(stat -c %Y "$HEARTBEAT" 2>/dev/null || date +%s) ))
+        (( beat_age > BEAT_AFTER )) && deaf_restart "poll loop silent for ${beat_age}s"
+    fi
+
+    # Unclaimed messages / runaway watermark.
+    deaf=$(python3 - "$STATE_JSON" "$BRIDGE_DIR/store/messages.db" <<'PY' 2>/dev/null || echo UNKNOWN
+import datetime, json, sqlite3, sys
+
+def out(s):
+    print(s); raise SystemExit
+
+try:
+    st = json.load(open(sys.argv[1]))
+except Exception:
+    out("UNKNOWN")
+jid, last = st.get("group_jid"), st.get("last_rowid")
+if not jid or not isinstance(last, int):
+    out("UNKNOWN")
+try:
+    c = sqlite3.connect("file:%s?mode=ro" % sys.argv[2], uri=True)
+    dbmax = c.execute("SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()[0]
+    # The watermark is past the end of the store: the DB was rebuilt (re-link,
+    # manual delete) and every future message will land below it, unseen.
+    if last > dbmax:
+        out("AHEAD %d" % dbmax)
+    row = c.execute(
+        "SELECT timestamp FROM messages WHERE chat_jid = ? AND rowid > ? "
+        "ORDER BY rowid ASC LIMIT 1", (jid, last)).fetchone()
+except Exception:
+    out("UNKNOWN")
+if not row:
+    out("OK")
+try:
+    ts = datetime.datetime.fromisoformat(str(row[0]))
+    if ts.tzinfo is None:
+        ts = ts.astimezone()
+    age = int((datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds())
+except Exception:
+    age = 0
+out("UNCLAIMED %d" % max(age, 0))
+PY
+)
+    case "$deaf" in
+        AHEAD*)
+            dbmax=${deaf#AHEAD }
+            log "watermark past end of store (db max $dbmax); resetting and restarting"
+            systemctl --user stop "$UNIT" 2>/dev/null
+            python3 - "$STATE_JSON" "$dbmax" <<'PY' 2>/dev/null
+import json, sys
+p = sys.argv[1]
+s = json.load(open(p))
+s["last_rowid"] = int(sys.argv[2])
+json.dump(s, open(p, "w"))
+PY
+            systemctl --user start "$UNIT" 2>/dev/null
+            notify "The bot's message watermark was past the end of the store (it would have ignored everything). Reset and restarted."
+            ;;
+        UNCLAIMED*)
+            age=${deaf#UNCLAIMED }
+            (( age > DEAF_AFTER )) && \
+                deaf_restart "a message has sat unread in the group for ${age}s"
+            ;;
+    esac
+fi
+
 # --- 5. Ensure the bot is actually running ----------------------------------
 if ! systemctl --user is-active --quiet "$UNIT"; then
     log "bot not active; starting"
