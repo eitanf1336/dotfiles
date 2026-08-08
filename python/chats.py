@@ -23,8 +23,13 @@ Keys:
                chat's project.
   f            fork a copy of the selected chat
   x            stop the selected live agent
-  s            star/unstar the selected chat — it stays where it is, but its
-               row gets a bright yellow background (and a ★) so it stands out
+  s            cycle the selected chat's mark. Press once for ★ starred (bright
+               yellow row, "deal with this"), again for ♡ special (just a quiet
+               heart on an otherwise normal row, "I love this one and might
+               wander back to it in five years for no reason"), again to clear.
+  Ctrl+S       show ONLY marked chats — both ★ and ♡, everything else hidden.
+               Press again to go back to the full board. Not remembered between
+               launches, so the board never opens mysteriously half-empty.
   1..6         file the selected chat into a category. A freshly-filed chat
                sorts to the TOP of its category, so an accidental move stays in
                plain sight instead of sinking into a big pile.
@@ -98,6 +103,32 @@ _PDI = "⁩"  # Pop Directional Isolate
 
 def _has_rtl(s):
     return any(unicodedata.bidirectional(c) in ("R", "AL") for c in s)
+
+
+def _no_flow_control(fd=0):
+    """Stop the tty driver from eating Ctrl+S / Ctrl+Q as XOFF / XON, so the
+    board can bind Ctrl+S at all. Without this the keystroke never becomes a
+    keypress: it just SUSPENDS the terminal's output and the board looks frozen
+    (Ctrl+Q would be the only way out). Returns the previous attrs to restore,
+    or None if this isn't a real tty / the call failed. curses only touches
+    ICANON/ISIG (cbreak), so nothing later re-enables IXON behind our back."""
+    try:
+        old = termios.tcgetattr(fd)
+        new = list(old)
+        new[0] &= ~(termios.IXON | termios.IXOFF | termios.IXANY)
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        return old
+    except Exception:
+        return None
+
+
+def _restore_flow_control(old, fd=0):
+    if old is None:
+        return
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        pass
 
 
 def _bidi(s):
@@ -622,6 +653,12 @@ NAMES_STORE = HOME / ".claude" / "chats" / "names.json"
 # it just paints the row's background so it jumps out wherever it sits.
 STARRED_STORE = HOME / ".claude" / "chats" / "starred.json"
 
+# sessionId -> True for chats you marked special ('s' twice). Deliberately a
+# SEPARATE store and a much quieter mark than the star: a star is loud because
+# it means "this needs you", while special means "keep this one around, I may
+# want it years from now". Both are folded in by the Ctrl+S marked-only filter.
+SPECIAL_STORE = HOME / ".claude" / "chats" / "special.json"
+
 
 def load_names():
     return _load_json(NAMES_STORE)
@@ -629,6 +666,10 @@ def load_names():
 
 def load_starred():
     return _load_json(STARRED_STORE)
+
+
+def load_special():
+    return _load_json(SPECIAL_STORE)
 
 
 def claude_names():
@@ -770,6 +811,11 @@ class App:
         self.store = load_store()
         self.names = load_names()  # sessionId -> user's custom name
         self.starred = load_starred()  # sessionId -> True (highlighted row)
+        self.special = load_special()  # sessionId -> True (quiet ♡ keepsake mark)
+        # Ctrl+S: show only ★/♡ chats. Session-only on purpose (NOT persisted
+        # like show_hidden): a filter that survives a restart would reopen the
+        # board looking like most of the chats had vanished.
+        self.marked_only = False
         self.moved = load_moved()  # sessionId -> ts it was last (re)filed
         self.superseded_map = load_superseded()   # old id -> continuation id (bg-resume)
         self.superseded = set(self.superseded_map)  # old ids hidden after bg-resume
@@ -1507,6 +1553,12 @@ class App:
             # chats from hidden ones stay out until Ctrl+H (P panel) shows them.
             cs = [c for c in cs
                   if project_key_for(c, self.tags) not in self.hidden_projects]
+        if self.marked_only:
+            # Ctrl+S. Deliberately BOTH marks: the whole point of the special ♡
+            # is that it lives in the same shortlist as the stars, just without
+            # shouting on the full board.
+            cs = [c for c in cs
+                  if c["id"] in self.starred or c["id"] in self.special]
         return cs
 
     def grouped(self):
@@ -1552,6 +1604,16 @@ class App:
         setup_colors()
         self.stdscr.timeout(350)  # wake often so the running-dot animates smoothly
         curses.flushinp()  # drop any keys buffered before the board opened
+        # Ctrl+S (marked-only) is XOFF to the terminal driver by default, so it
+        # has to be turned off here or the key never arrives. Restored on the way
+        # out so chats and the shell you quit to keep normal flow control.
+        _flow = _no_flow_control()
+        try:
+            self._loop()
+        finally:
+            _restore_flow_control(_flow)
+
+    def _loop(self):
         while True:
             rows, nav = self.build_rows()
             if not self._positioned and self._want_select:
@@ -1687,6 +1749,7 @@ class App:
                 self.store = load_store()
                 self.names = load_names()
                 self.starred = load_starred()
+                self.special = load_special()
                 self.moved = load_moved()
                 self.tags = load_project_tags()
                 self.superseded_map = load_superseded()  # rescan() resolves & sets self.superseded
@@ -1729,14 +1792,34 @@ class App:
                     self.store = _json_set(STORE, c["id"], cat)
                     self.message = f"Moved to “{cat}”  —  u to undo"
         elif ch in (ord("s"), ord("S")):
+            # One key, three states: unmarked -> ★ starred -> ♡ special ->
+            # unmarked. "Double s" is the special mark, so the loud star and the
+            # quiet keepsake never need two different keys to reach.
             c = self.selected_chat(nav)
             if c:
-                if c["id"] in self.starred:
+                if c["id"] in self.starred:          # ★ -> ♡
                     self.starred = _json_set(STARRED_STORE, c["id"], None)
-                    self.message = "Unstarred"
-                else:
+                    self.special = _json_set(SPECIAL_STORE, c["id"], True)
+                    self.message = "Special ♡  ·  s again to clear"
+                elif c["id"] in self.special:        # ♡ -> unmarked
+                    self.special = _json_set(SPECIAL_STORE, c["id"], None)
+                    self.message = "Mark cleared"
+                else:                                # unmarked -> ★
                     self.starred = _json_set(STARRED_STORE, c["id"], True)
-                    self.message = "Starred ★ — s again to unstar"
+                    self.message = "Starred ★  ·  s again for special ♡"
+        elif ch == 19:  # Ctrl+S — show only the chats you've marked (★ and ♡)
+            self.marked_only = not self.marked_only
+            if self.marked_only:
+                n = len(self.visible_chats())
+                self.message = (f"Marked only: {n} chat{'' if n == 1 else 's'} "
+                                "(★ + ♡)  ·  ^S for all"
+                                if n else
+                                "Nothing marked here yet, press s on a chat "
+                                "(^S for all)")
+            else:
+                self.message = "Showing all chats"
+            self.sel = min(self.sel, max(0, len(nav) - 1))
+            self.scroll = 0
         elif ch in (ord("u"), ord("U")):
             self._undo_move()
         elif ch in (ord("/"),):
@@ -1847,6 +1930,7 @@ class App:
                 chat["path"].unlink()
                 self.store = _json_set(STORE, chat["id"], None)
                 self.starred = _json_set(STARRED_STORE, chat["id"], None)
+                self.special = _json_set(SPECIAL_STORE, chat["id"], None)
                 self.rescan()
                 self.message = "Chat deleted"
             except Exception as e:
@@ -1868,6 +1952,10 @@ class App:
                 n = len(self.hidden_projects)
                 scope += (f" (incl. {n} hidden)" if self.show_hidden
                           else f" ({n} hidden)")
+        if self.marked_only:
+            # Say it in the header chip too, so a half-empty board is never a
+            # mystery: the filter stays visible the whole time it's on.
+            scope += " · ★♡ only"
         # Header: plain "Claude Chats — N chats  " then the active project drawn
         # as a chip filled with THAT project's own color, so a glance at the top
         # of the screen tells you which project you're in even before you read it.
@@ -1887,7 +1975,7 @@ class App:
             except curses.error:
                 pass
         help1 = ("Enter open   / find   Space fold   n new   r rename   m move   "
-                 "o mode   f fork   x stop   s star   1-6 file   u undo   "
+                 "o mode   f fork   x stop   s mark ★♡   ^S marked   1-6 file   u undo   "
                  "d delete   P projects   ^R reload   q quit")
         self.stdscr.addstr(1, 0, help1[: w - 1], curses.color_pair(8) | curses.A_DIM)
         legend = "  ".join(f"{i+1}:{CATEGORIES[i]}" for i in range(6))
@@ -1961,8 +2049,14 @@ class App:
                 avail = w - 1 - _dwidth(tail) - len(prefix)
                 t = self.display_title(c)
                 starred = c["id"] in self.starred
+                # A chat is one or the other, never both (the 's' cycle moves it
+                # from ★ to ♡), but guard anyway so a hand-edited store can't
+                # draw two marks on one row.
+                special = (not starred) and c["id"] in self.special
                 if starred:
                     t = "★ " + t
+                elif special:
+                    t = "♡ " + t
                 if _dwidth(t) > avail:
                     t = _clamp(t, max(0, avail - 1)) + "…"
                 # _bidi() keeps a Hebrew/RTL name from flipping the whole row;
@@ -1996,6 +2090,17 @@ class App:
                         self.stdscr.addstr(line_y, len(prefix),
                                            _clamp(body, w - 1 - len(prefix)),
                                            attr)
+                    if special and t.startswith("♡") and not _has_rtl(t):
+                        # Repaint just the heart in magenta. The rest of the row
+                        # keeps its ordinary colors on purpose: this mark should
+                        # be findable, not attention-grabbing like a star. An RTL
+                        # title is skipped because _bidi() flips the mark to the
+                        # right-hand end, so column 5 isn't where it landed.
+                        try:
+                            self.stdscr.addstr(line_y, len(prefix), "♡",
+                                               curses.color_pair(5))
+                        except curses.error:
+                            pass
                     self._draw_indicator(line_y, status, sel=False)
 
         sep_y = h - footer_h - 1
@@ -2589,6 +2694,8 @@ def main():
                         _json_set(NAMES_STORE, new_full, old_name)
                     if c["id"] in app.starred:
                         _json_set(STARRED_STORE, new_full, True)
+                    if c["id"] in app.special:
+                        _json_set(SPECIAL_STORE, new_full, True)
                     # Record the link NOW so the original folds away the moment
                     # the continuation has real content — otherwise the two sit
                     # side by side as a duplicate for the whole session. This is
@@ -2676,6 +2783,7 @@ def main():
                 _json_set(PROJECT_TAGS_STORE, cont_full, None)
                 _json_set(NAMES_STORE, cont_full, None)
                 _json_set(STARRED_STORE, cont_full, None)
+                _json_set(SPECIAL_STORE, cont_full, None)
                 last_id = old_id  # keep the cursor on the original, not the phantom
 
         if dbg_on:
