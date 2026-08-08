@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""testbed: keep a project's no-reload dev server up until the PC shuts down.
+
+Runs a codebase's `dev:static` script (a vite dev server with hot reload off) as
+a transient systemd *user* service, so one fixed URL stays alive across terminal
+and Claude Code sessions and only dies at logout/shutdown. That gives Claude and
+you the same stable page to test against instead of a server per session that
+reloads under your hands. Activate one with `/testbed <project>` in Claude Code.
+
+Usage:
+  testbed <project>                 start (or reuse) that project's static server
+  testbed up <project> [--port N] [--no-wait] [--rebuild]
+  testbed status [project]          what is registered, what is running
+  testbed url <project>             print just the URL
+  testbed logs <project> [-n N] [-f]
+  testbed restart <project>
+  testbed down <project> | --all
+  testbed doctor <project> [--json] report what setup is still missing
+  testbed add <project> <path> [--port N] [--script NAME]
+  testbed forget <project>
+  testbed list                      registered projects, one per line
+
+Exit codes: 0 ok, 1 error, 2 project not found, 3 setup missing (see doctor).
+"""
+import argparse
+import http.client
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+CFG_DIR = os.path.join(HOME, ".config", "testbed")
+CFG = os.path.join(CFG_DIR, "projects.json")
+SCRIPT = "dev:static"
+PORT_BASE = 5300
+PORT_TOP = 5399
+SEARCH_ROOTS = [os.path.join(HOME, "code")]
+SCAN_DEPTH = 3
+SKIP_DIRS = {"node_modules", ".git", "dist", "build", ".next", ".wrangler",
+             "__pycache__", ".venv", "venv", "target", "old"}
+WAIT_SECONDS = 120
+
+if sys.stdout.isatty() and os.environ.get("NO_COLOR") is None:
+    GRN, RED, YEL, CYA, GRY, BLD, RST = ("\033[32m", "\033[31m", "\033[33m",
+                                         "\033[36m", "\033[90m", "\033[1m",
+                                         "\033[0m")
+else:
+    GRN = RED = YEL = CYA = GRY = BLD = RST = ""
+
+
+def die(msg, code=1):
+    print(f"{RED}testbed:{RST} {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg):
+    print(f"{GRY}·{RST} {msg}")
+
+
+def slugify(name):
+    return re.sub(r"[^a-z0-9]+", "-", os.path.basename(str(name)).lower()).strip("-")
+
+
+# ---------------------------------------------------------------- registry ---
+def load():
+    try:
+        with open(CFG) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {"projects": {}}
+    data.setdefault("projects", {})
+    return data
+
+
+def save(data):
+    os.makedirs(CFG_DIR, exist_ok=True)
+    tmp = CFG + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, CFG)
+
+
+def pkg_scripts(d):
+    try:
+        with open(os.path.join(d, "package.json")) as fh:
+            return json.load(fh).get("scripts", {}) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def is_web_dir(d):
+    """A directory that can plausibly serve a vite dev server."""
+    s = pkg_scripts(d)
+    if SCRIPT in s:
+        return True
+    dev = s.get("dev", "") + " " + s.get("start", "")
+    return "vite" in dev
+
+
+def scan_for(slug):
+    """Find candidate project directories under the search roots by name."""
+    hits = []
+    for root in SEARCH_ROOTS:
+        for cur, dirs, _files in os.walk(root):
+            depth = cur[len(root):].count(os.sep)
+            if depth >= SCAN_DEPTH:
+                dirs[:] = []
+            dirs[:] = [x for x in dirs if x not in SKIP_DIRS and not x.startswith(".")]
+            for name in dirs:
+                if slugify(name) == slug:
+                    hits.append(os.path.join(cur, name))
+    return hits
+
+
+def pick_web_dir(root):
+    """root itself if it can serve, else its one obvious web subpackage."""
+    if is_web_dir(root):
+        return root, None
+    try:
+        kids = sorted(
+            os.path.join(root, k) for k in os.listdir(root)
+            if k not in SKIP_DIRS and not k.startswith(".")
+            and os.path.isdir(os.path.join(root, k))
+        )
+    except OSError:
+        return None, f"cannot read {root}"
+    web = [k for k in kids if is_web_dir(k)]
+    if len(web) == 1:
+        return web[0], None
+    if not web:
+        if os.path.isfile(os.path.join(root, "package.json")):
+            return root, None          # npm project, just not a vite one yet
+        return None, (f"no package.json with a vite dev server under {root}; "
+                      f"register it explicitly: testbed add <name> <path>")
+    names = ", ".join(os.path.basename(w) for w in web)
+    return None, (f"{root} has several web packages ({names}); pick one: "
+                  f"testbed add <name> <path>")
+
+
+def free_port(data, want=None):
+    used = {p.get("port") for p in data["projects"].values()}
+    if want:
+        return want
+    for port in range(PORT_BASE, PORT_TOP + 1):
+        if port not in used and not port_listening(port):
+            return port
+    die("no free port in the testbed range (5300-5399)")
+
+
+def resolve(name, data, create=True):
+    """name -> (key, entry). Registers on first use."""
+    slug = slugify(name)
+    projects = data["projects"]
+    if slug in projects:
+        return slug, projects[slug]
+    matches = [k for k in projects if k.startswith(slug)]
+    if len(matches) == 1:
+        return matches[0], projects[matches[0]]
+    if not create:
+        die(f"{name!r} is not registered (testbed list)", 2)
+
+    hits = scan_for(slug)
+    if not hits:
+        die(f"found no directory named {name!r} under {', '.join(SEARCH_ROOTS)}; "
+            f"register it: testbed add {slug} /path/to/project", 2)
+    if len(hits) > 1:
+        # prefer one that already looks like a web project
+        webby = [h for h in hits if is_web_dir(h) or pick_web_dir(h)[0]]
+        hits = webby or hits
+    if len(hits) > 1:
+        die("ambiguous project name, matched:\n  " + "\n  ".join(hits) +
+            f"\nregister the right one: testbed add {slug} <path>", 2)
+
+    root = hits[0]
+    web, err = pick_web_dir(root)
+    if err:
+        die(err, 3)
+    entry = {"dir": web, "root": root, "port": free_port(data), "script": SCRIPT}
+    projects[slug] = entry
+    save(data)
+    info(f"registered {BLD}{slug}{RST} -> {web} on port {entry['port']}")
+    return slug, entry
+
+
+# ------------------------------------------------------------------ system ---
+def unit_of(key):
+    return f"testbed-{key}.service"
+
+
+def sctl(*args, check=False):
+    return subprocess.run(["systemctl", "--user", *args],
+                          capture_output=True, text=True, check=check)
+
+
+def unit_state(key):
+    return sctl("is-active", unit_of(key)).stdout.strip() or "unknown"
+
+
+def unit_since(key):
+    out = sctl("show", "-p", "ActiveEnterTimestamp", "--value", unit_of(key)).stdout.strip()
+    return out or ""
+
+
+def port_listening(port):
+    import socket
+    with socket.socket() as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def http_ok(port, path="/", timeout=2.0, tries=1):
+    """Does something answer HTTP on this port? Retries, because a vite server
+    that is re-optimizing dependencies can stall a request for a few seconds."""
+    for attempt in range(tries):
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+            c.request("GET", path)
+            r = c.getresponse()
+            r.read(1)
+            c.close()
+            return 200 <= r.status < 500
+        except Exception:
+            if attempt + 1 < tries:
+                time.sleep(0.5)
+    return False
+
+
+def port_flags(cmd, port, override=None):
+    """How to pin this dev server to a fixed port, per server family.
+
+    Vite/next/wrangler/astro take a flag; anything unrecognised gets only the
+    PORT env var (which is always set) and no invented flags.
+    """
+    if override is not None:
+        return [a.replace("{port}", str(port)) for a in override]
+    c = cmd or ""
+    if "vite" in c:
+        return ["--port", str(port), "--strictPort"]
+    if re.search(r"\b(next|astro|wrangler|nuxt)\b", c):
+        return ["--port", str(port)]
+    return []
+
+
+def journal(key, n=40):
+    r = subprocess.run(["journalctl", "--user", "-u", unit_of(key), "-n", str(n),
+                        "--no-pager", "-o", "cat"], capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+# ------------------------------------------------------------------ doctor ---
+def mode_of(cmd):
+    m = re.search(r"--mode[= ]+([A-Za-z0-9_.-]+)", cmd or "")
+    return m.group(1) if m else None
+
+
+def vite_config(d):
+    for n in ("vite.config.ts", "vite.config.js", "vite.config.mts",
+              "vite.config.mjs", "vite.config.cts"):
+        p = os.path.join(d, n)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def diagnose(key, entry):
+    d = entry["dir"]
+    script = entry.get("script", SCRIPT)
+    scripts = pkg_scripts(d)
+    cmd = scripts.get(script)
+    rep = {
+        "project": key, "dir": d, "port": entry.get("port"),
+        "script": script, "command": cmd,
+        "url": f"http://localhost:{entry.get('port')}",
+        "has_package_json": os.path.isfile(os.path.join(d, "package.json")),
+        "has_script": bool(cmd),
+        "has_node_modules": os.path.isdir(os.path.join(d, "node_modules")),
+        "vite_config": vite_config(d),
+        "mode": mode_of(cmd),
+        "hmr_disabled": None,
+        "state": unit_state(key),
+        "needs": [],           # things a human/Claude must write
+        "autofix": [],         # things `testbed up` fixes by itself
+    }
+    if not rep["has_package_json"]:
+        rep["needs"].append(f"{d} has no package.json, so there is nothing to run")
+        return rep
+    if not rep["has_script"]:
+        dev = scripts.get("dev") or scripts.get("start") or "(no dev script)"
+        rep["needs"].append(
+            f'add a "{script}" script to {os.path.join(d, "package.json")} that '
+            f'runs the dev server with hot reload OFF (current dev script: {dev})')
+    else:
+        cfg = rep["vite_config"]
+        if "vite" in cmd and rep["mode"] and cfg:
+            src = open(cfg, errors="replace").read()
+            rep["hmr_disabled"] = bool(re.search(r"hmr", src) and rep["mode"] in src)
+            if not rep["hmr_disabled"]:
+                rep["needs"].append(
+                    f"{cfg} does not turn HMR off for mode '{rep['mode']}': add "
+                    f"server.hmr = mode === '{rep['mode']}' ? false : undefined")
+        elif "vite" in cmd and not rep["mode"]:
+            rep["needs"].append(
+                f'"{script}" runs vite without a --mode flag, so nothing '
+                f"distinguishes it from plain dev and HMR stays on")
+    if not rep["has_node_modules"]:
+        rep["autofix"].append("npm install (dependencies are not installed)")
+    rep["ready"] = not rep["needs"]
+    return rep
+
+
+def print_report(rep):
+    ok = f"{GRN}ok{RST}"
+    print(f"{BLD}{rep['project']}{RST}  {rep['url']}  {GRY}{rep['dir']}{RST}")
+    print(f"  script {rep['script']}: " +
+          (f"{ok} {GRY}{rep['command']}{RST}" if rep["has_script"] else f"{RED}missing{RST}"))
+    if rep["mode"]:
+        hm = {True: ok, False: f"{RED}no{RST}", None: f"{YEL}unknown{RST}"}[rep["hmr_disabled"]]
+        print(f"  hot reload off (mode '{rep['mode']}'): {hm}"
+              f"{'  ' + GRY + str(rep['vite_config']) + RST if rep['vite_config'] else ''}")
+    print(f"  node_modules: {ok if rep['has_node_modules'] else YEL + 'missing' + RST}")
+    print(f"  server: {rep['state']}")
+    for n in rep["autofix"]:
+        print(f"  {YEL}auto:{RST} {n}")
+    for n in rep["needs"]:
+        print(f"  {RED}needs:{RST} {n}")
+    if rep["ready"]:
+        print(f"  {GRN}ready{RST} - testbed up {rep['project']}")
+
+
+# ---------------------------------------------------------------- commands ---
+def cmd_up(args):
+    data = load()
+    key, entry = resolve(args.project, data)
+    if args.port:
+        entry["port"] = args.port
+        save(data)
+    port = entry["port"]
+
+    rep = diagnose(key, entry)
+    if rep["needs"]:
+        print(f"{YEL}setup needed before {key} can be served:{RST}")
+        for n in rep["needs"]:
+            print(f"  - {n}")
+        print(f"\nAsk Claude Code to do it: {BLD}/testbed {key}{RST}   "
+              f"{GRY}(it writes the script + config, then starts this server){RST}")
+        sys.exit(3)
+
+    state = unit_state(key)
+    if state == "active" and not args.rebuild:
+        if http_ok(port, timeout=5, tries=3):
+            print(f"{GRN}already up{RST}  {BLD}http://localhost:{port}{RST}  "
+                  f"{GRY}({key}, since {unit_since(key)}){RST}")
+            return
+        info("unit is running but not answering, restarting it")
+        args.rebuild = True
+    if state in ("active", "failed", "activating") or args.rebuild:
+        sctl("stop", unit_of(key))
+        sctl("reset-failed", unit_of(key))
+        for _ in range(20):
+            if unit_state(key) not in ("active", "activating", "deactivating"):
+                break
+            time.sleep(0.25)
+
+    if not rep["has_node_modules"]:
+        info(f"npm install in {entry['dir']} (first run, this takes a minute)")
+        r = subprocess.run(["npm", "install"], cwd=entry["dir"])
+        if r.returncode != 0:
+            die("npm install failed, fix that and re-run")
+
+    if port_listening(port):
+        die(f"port {port} is already taken by something else; "
+            f"give this project another one: testbed up {key} --port <N>")
+
+    flags = port_flags(rep["command"], port, entry.get("port_args"))
+    if not flags:
+        info(f"{rep['command']!r} takes no known --port flag, passing PORT={port} "
+             f"in the environment instead")
+    cmd = [
+        "systemd-run", "--user", f"--unit=testbed-{key}",
+        f"--description=testbed {entry.get('script', SCRIPT)} for {key}",
+        f"--working-directory={entry['dir']}",
+        f"--setenv=PATH={os.environ.get('PATH', '')}",
+        f"--setenv=PORT={port}",
+        "--setenv=NO_COLOR=1", "--setenv=BROWSER=none",
+        "-p", "Restart=on-failure", "-p", "RestartSec=2",
+        "-p", "StartLimitBurst=3",
+        "--", "npm", "run", entry.get("script", SCRIPT), *(["--", *flags] if flags else []),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        die("systemd-run failed:\n" + (r.stderr.strip() or r.stdout.strip()))
+
+    entry["last_started"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    save(data)
+    url = f"http://localhost:{port}"
+    if args.no_wait:
+        print(f"{GRN}starting{RST}  {BLD}{url}{RST}  {GRY}({unit_of(key)}){RST}")
+        return
+
+    t0 = time.time()
+    while time.time() - t0 < WAIT_SECONDS:
+        if http_ok(port):
+            print(f"{GRN}up{RST}  {BLD}{url}{RST}  {GRY}{key}, "
+                  f"{time.time() - t0:.0f}s, hot reload off, "
+                  f"lives until logout{RST}")
+            return
+        if unit_state(key) not in ("active", "activating"):
+            print(f"{RED}the server died on startup.{RST} Last output:\n")
+            print(journal(key, 40))
+            sys.exit(1)
+        time.sleep(0.5)
+    print(f"{YEL}started but not answering after {WAIT_SECONDS}s{RST} ({url}). "
+          f"Recent output:\n")
+    print(journal(key, 25))
+    sys.exit(1)
+
+
+def cmd_status(args):
+    data = load()
+    projects = data["projects"]
+    if args.project:
+        key, entry = resolve(args.project, data, create=False)
+        projects = {key: entry}
+    if not projects:
+        print("nothing registered yet. In Claude Code: /testbed <project>")
+        return
+    w = max(len(k) for k in projects) + 2
+    print(f"{BLD}{'PROJECT'.ljust(w)}{'PORT'.ljust(6)}{'STATE'.ljust(11)}"
+          f"{'URL'.ljust(26)}DIR{RST}")
+    for key in sorted(projects):
+        e = projects[key]
+        st = unit_state(key)
+        live = st == "active" and http_ok(e.get("port", 0), timeout=5, tries=3)
+        color = GRN if live else (YEL if st == "active" else
+                                 (RED if st == "failed" else GRY))
+        label = "up" if live else ("no answer" if st == "active" else st)
+        url = f"http://localhost:{e.get('port')}"
+        print(f"{key.ljust(w)}{str(e.get('port')).ljust(6)}"
+              f"{color}{label.ljust(11)}{RST}"
+              f"{(url if live else '-').ljust(26)}{GRY}{e.get('dir')}{RST}")
+
+
+def cmd_down(args):
+    data = load()
+    if not args.all and not args.project:
+        die("which one? testbed down <project>, or testbed down --all")
+    keys = sorted(data["projects"]) if args.all else [resolve(args.project, data, create=False)[0]]
+    if not keys:
+        return
+    for key in keys:
+        st = unit_state(key)
+        if st in ("active", "activating", "failed"):
+            sctl("stop", unit_of(key))
+            sctl("reset-failed", unit_of(key))
+            print(f"stopped {BLD}{key}{RST}")
+        else:
+            print(f"{GRY}{key} was not running{RST}")
+
+
+def cmd_restart(args):
+    data = load()
+    key, _ = resolve(args.project, data, create=False)
+    args.project, args.rebuild, args.port, args.no_wait = key, True, None, False
+    cmd_up(args)
+
+
+def cmd_logs(args):
+    data = load()
+    key, _ = resolve(args.project, data, create=False)
+    cmd = ["journalctl", "--user", "-u", unit_of(key), "-n", str(args.n),
+           "--no-pager", "-o", "cat"]
+    if args.follow:
+        cmd.remove("--no-pager")
+        cmd.append("-f")
+    os.execvp("journalctl", cmd)
+
+
+def cmd_url(args):
+    data = load()
+    _key, e = resolve(args.project, data, create=False)
+    print(f"http://localhost:{e['port']}")
+
+
+def cmd_doctor(args):
+    data = load()
+    key, entry = resolve(args.project, data)
+    rep = diagnose(key, entry)
+    if args.json:
+        print(json.dumps(rep, indent=2))
+    else:
+        print_report(rep)
+    sys.exit(0 if rep["ready"] else 3)
+
+
+def cmd_add(args):
+    data = load()
+    path = os.path.abspath(os.path.expanduser(args.path))
+    if not os.path.isdir(path):
+        die(f"{path} is not a directory")
+    key = slugify(args.project)
+    entry = data["projects"].get(key, {})
+    entry.update({"dir": path, "script": args.script,
+                  "port": args.port or entry.get("port") or free_port(data)})
+    entry.setdefault("root", path)
+    data["projects"][key] = entry
+    save(data)
+    print(f"registered {BLD}{key}{RST} -> {path} on port {entry['port']}")
+
+
+def cmd_forget(args):
+    data = load()
+    key, _ = resolve(args.project, data, create=False)
+    if unit_state(key) == "active":
+        sctl("stop", unit_of(key))
+    del data["projects"][key]
+    save(data)
+    print(f"forgot {key}")
+
+
+def cmd_list(args):
+    for key, e in sorted(load()["projects"].items()):
+        print(f"{key}\t{e.get('port')}\t{e.get('dir')}")
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="testbed", add_help=True,
+        description="Keep a project's no-reload dev server up until the PC shuts down.")
+    sub = p.add_subparsers(dest="cmd")
+
+    up = sub.add_parser("up", help="start or reuse a project's static dev server")
+    up.add_argument("project")
+    up.add_argument("--port", type=int)
+    up.add_argument("--no-wait", action="store_true")
+    up.add_argument("--rebuild", action="store_true", help="restart even if healthy")
+    up.set_defaults(func=cmd_up)
+
+    st = sub.add_parser("status", help="what is registered and running")
+    st.add_argument("project", nargs="?")
+    st.set_defaults(func=cmd_status)
+
+    dn = sub.add_parser("down", help="stop a server")
+    dn.add_argument("project", nargs="?")
+    dn.add_argument("--all", action="store_true")
+    dn.set_defaults(func=cmd_down)
+
+    rs = sub.add_parser("restart")
+    rs.add_argument("project")
+    rs.set_defaults(func=cmd_restart)
+
+    lg = sub.add_parser("logs")
+    lg.add_argument("project")
+    lg.add_argument("-n", type=int, default=60)
+    lg.add_argument("-f", "--follow", action="store_true")
+    lg.set_defaults(func=cmd_logs)
+
+    ur = sub.add_parser("url")
+    ur.add_argument("project")
+    ur.set_defaults(func=cmd_url)
+
+    dc = sub.add_parser("doctor", help="report what setup is still missing")
+    dc.add_argument("project")
+    dc.add_argument("--json", action="store_true")
+    dc.set_defaults(func=cmd_doctor)
+
+    ad = sub.add_parser("add", help="register a project explicitly")
+    ad.add_argument("project")
+    ad.add_argument("path")
+    ad.add_argument("--port", type=int)
+    ad.add_argument("--script", default=SCRIPT)
+    ad.set_defaults(func=cmd_add)
+
+    fg = sub.add_parser("forget")
+    fg.add_argument("project")
+    fg.set_defaults(func=cmd_forget)
+
+    ls = sub.add_parser("list")
+    ls.set_defaults(func=cmd_list)
+
+    argv = sys.argv[1:]
+    known = set(sub.choices) | {"-h", "--help"}
+    if argv and argv[0] not in known:
+        argv = ["up"] + argv                    # `testbed apeirion` == `testbed up apeirion`
+    if not argv:
+        argv = ["status"]
+    args = p.parse_args(argv)
+    if not getattr(args, "func", None):
+        p.print_help()
+        sys.exit(1)
+    if not shutil.which("systemd-run"):
+        die("systemd-run is missing, so servers cannot be persisted")
+    args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
