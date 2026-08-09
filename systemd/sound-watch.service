@@ -1,0 +1,13 @@
+[Unit]
+Description=Log every audio stream that starts, with the app behind it
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/bin/sound-watch
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target

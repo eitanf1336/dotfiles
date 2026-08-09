@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# sound-log : show what has made noise on this PC, newest last.
+#   sound-log            last 30 events
+#   sound-log 100        last 100
+#   sound-log -f         follow live
+F=~/.local/state/sound-log.txt
+[ -f "$F" ] || { echo "nothing logged yet (is sound-watch.service running?)"; exit 0; }
+case "${1:-}" in
+  -f|--follow) tail -f "$F" ;;
+  *) tail -n "${1:-30}" "$F" ;;
+esac

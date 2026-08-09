@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Log every audio stream that starts on this machine, and the app behind it.
+
+Runs as a user service off `pw-mon`, so it catches even a half-second
+notification blip (polling the graph misses those). Every playback or capture
+stream gets one line in ~/.local/state/sound-log.txt. Point of it: when
+something wakes you at 3am, you can name the culprit instead of guessing.
+"""
+import subprocess, time, os, sys, re
+
+LOG = os.path.expanduser("~/.local/state/sound-log.txt")
+# our own audio tooling, not worth logging
+IGNORE = {"pw-mon", "pw-dump", "pw-cli", "pw-play", "pw-cat", "pactl",
+          "wireplumber", "pipewire", "pipewire-pulse", "sound-watch"}
+
+def emit(kind, app, binary, media):
+    line = (f"{time.strftime('%Y-%m-%d %H:%M:%S')} {kind} "
+            f"app={app} bin={binary} media={media}\n")
+    with open(LOG, "a") as f:
+        f.write(line)
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+def handle(block):
+    props, typ = {}, ""
+    for ln in block:
+        s = ln.strip()
+        m = re.match(r'^type:\s*(\S+)', s)
+        if m:
+            typ = m.group(1)
+            continue
+        m = re.match(r'^([\w.\-]+) = "(.*)"$', s)
+        if m:
+            props[m.group(1)] = m.group(2)
+    if not typ.endswith("Node"):
+        return
+    cls = props.get("media.class", "")
+    if not cls.startswith("Stream/"):
+        return
+    binary = props.get("application.process.binary", "")
+    app = (props.get("application.name") or binary
+           or props.get("node.name") or "?")
+    if binary in IGNORE or app in IGNORE:
+        return
+    kind = "PLAY" if "Output" in cls else "REC "
+    emit(kind, app, binary, props.get("media.name", ""))
+
+def main():
+    p = subprocess.Popen(["pw-mon"], stdout=subprocess.PIPE, text=True,
+                         bufsize=1)
+    # pw-mon replays the whole existing graph on connect; skip that burst so a
+    # service restart does not log streams that were already running.
+    settled = time.monotonic() + 2.0
+    block, collecting = [], False
+    for ln in p.stdout:
+        ln = ln.rstrip("\n")
+        if not ln.startswith((" ", "\t", "*")):      # a new top-level event
+            if collecting and time.monotonic() > settled:
+                handle(block)
+            block, collecting = [], ln.startswith("added:")
+            continue
+        if collecting:
+            block.append(ln)
+    if collecting:
+        handle(block)
+
+main()
