@@ -48,6 +48,39 @@ sudo update-initramfs -u
 ## Verify after reboot
 
 ```bash
-cat /sys/bus/pci/devices/0000:01:00.0/power/control   # expect: on
-journalctl -k -b | grep -c "Xid"                      # expect: 0
+cat /proc/driver/nvidia/params | grep DynamicPowerManagement   # expect: 0
+cat /sys/bus/pci/devices/0000:01:00.0/power/control            # expect: on
+journalctl -k -b | grep -c "Xid"                               # expect: 0
+```
+
+**Check the runtime value, not the conf file.** See the regression below.
+
+## Regression, 2026-08-09
+
+The conf file was still sitting in `/etc/modprobe.d/`, but it had not been in
+effect for weeks:
+
+```
+/proc/driver/nvidia/params        DynamicPowerManagement: 2     <- should be 0
+0000:01:00.0/power/control        auto                          <- should be on
+```
+
+Because `nvidia_drm modeset=1` is set, the nvidia modules are loaded from the
+**initramfs**, which carries its own copy of `/etc/modprobe.d`. The conf file was
+never baked in, so modprobe never read it. The 2026-07-25 upgrade to driver 595.84
+regenerated the initramfs without it too.
+
+Fix is just `sudo update-initramfs -u -k $(uname -r)`, but the lesson is that a
+present conf file proves nothing here. Always read `/proc/driver/nvidia/params`.
+
+## HDMI audio function
+
+`etc/udev/rules.d/90-nvidia-hdmi-audio-no-suspend.rules` pins the GPU's HDA
+function `0000:01:00.1` to `power/control=on`. When that function runtime-suspends
+it cannot report the HDMI ELD, and any monitor audio sink silently disappears from
+PipeWire. Companion to the D3cold fix above.
+
+```bash
+sudo cp etc/udev/rules.d/90-nvidia-hdmi-audio-no-suspend.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
 ```

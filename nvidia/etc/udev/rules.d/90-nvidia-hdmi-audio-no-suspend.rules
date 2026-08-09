@@ -1,0 +1,4 @@
+# Keep the NVIDIA HDMI audio function out of runtime suspend. When it sleeps,
+# the HDMI ELD cannot be read and the monitor's audio sink vanishes from
+# PipeWire. Pairs with 99-nvidia-power-fix.conf (dGPU D3cold).
+ACTION=="add", SUBSYSTEM=="pci", KERNEL=="0000:01:00.1", ATTR{power/control}="on"
