@@ -6,6 +6,15 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/home/eitan/code/whatsapp-mcp/whatsapp-bridge
+# Files sent into the "My Claude" group get written to the bot's history log, so
+# the Whataclaude phone app can show them. Text was always logged by the bot;
+# attachments had no logger at all until this.
+Environment=BRIDGE_MEDIA_LOG=/home/eitan/.config/claude-whatsapp/history.jsonl
+Environment=BRIDGE_MEDIA_LOG_JID=120363410856554324@g.us
+# Sent files usually live in a build dir or /tmp, so keep our own copy for the
+# app to download later. Capped, oldest pruned first.
+Environment=BRIDGE_MEDIA_KEEP_DIR=/home/eitan/.cache/whatclaude/sent
+Environment=BRIDGE_MEDIA_KEEP_BYTES=2147483648
 ExecStart=/home/eitan/code/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge-bin
 Restart=always
 RestartSec=5
