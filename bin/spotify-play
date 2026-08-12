@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Press play in Spotify over MPRIS (snap Spotify needs --print-reply to actually act).
+set -u
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
+
+log() { echo "$(date '+%F %H:%M:%S') $*"; }
+
+mpris_status() {
+    timeout 10 dbus-send --session --print-reply \
+        --dest=org.mpris.MediaPlayer2.spotify /org/mpris/MediaPlayer2 \
+        org.freedesktop.DBus.Properties.Get \
+        string:org.mpris.MediaPlayer2.Player string:PlaybackStatus 2>/dev/null |
+        awk -F'"' '/string/ {print $2}'
+}
+
+if ! pgrep -f '/usr/share/spotify/spotify' >/dev/null; then
+    log "spotify is not running"
+    exit 1
+fi
+
+log "status before: $(mpris_status)"
+
+for attempt in 1 2 3; do
+    timeout 10 dbus-send --session --print-reply \
+        --dest=org.mpris.MediaPlayer2.spotify /org/mpris/MediaPlayer2 \
+        org.mpris.MediaPlayer2.Player.Play >/dev/null 2>&1
+    sleep 2
+    now=$(mpris_status)
+    if [ "$now" = "Playing" ]; then
+        log "playing (attempt $attempt)"
+        exit 0
+    fi
+    # Some builds only honour PlayPause when paused.
+    timeout 10 dbus-send --session --print-reply \
+        --dest=org.mpris.MediaPlayer2.spotify /org/mpris/MediaPlayer2 \
+        org.mpris.MediaPlayer2.Player.PlayPause >/dev/null 2>&1
+    sleep 2
+    now=$(mpris_status)
+    if [ "$now" = "Playing" ]; then
+        log "playing (attempt $attempt, playpause)"
+        exit 0
+    fi
+done
+
+log "failed to start playback (last status: ${now:-unknown})"
+exit 1
