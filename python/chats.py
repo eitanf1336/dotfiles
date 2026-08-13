@@ -1790,7 +1790,7 @@ class App:
                 else:
                     self._record_move(c["id"], cur)
                     self.store = _json_set(STORE, c["id"], cat)
-                    self.message = f"Moved to “{cat}”  —  u to undo"
+                    self.message = f"Moved to “{cat}”  ·  u to undo"
         elif ch in (ord("s"), ord("S")):
             # One key, three states: unmarked -> ★ starred -> ♡ special ->
             # unmarked. "Double s" is the special mark, so the loud star and the
@@ -1995,16 +1995,24 @@ class App:
         # Footer block: the FULL title of the chat under the cursor, wrapped over
         # as many lines as it needs (capped) so even a name longer than the
         # terminal width is fully readable. The list view shrinks to make room,
-        # so the footer never overlaps a chat row. A status message overrides it.
+        # so the footer never overlaps a chat row.
+        #
+        # A status message does NOT replace the title any more: it gets its own
+        # line ABOVE it. Filing a run of chats with 1-6 sets a message on every
+        # keypress, and when that message ate the footer the title of the chat
+        # you'd just landed on was invisible for the whole batch — you were
+        # filing blind. Message and title now coexist; each footer line carries
+        # its own attribute.
         FOOTER_MAX = 5
         footer = []
         if self.message:
-            footer = [_clamp(self.message, w - 2)]
-        elif nav:
+            footer.append((_clamp(self.message, w - 2), curses.A_BOLD))
+        if nav:
             kind, payload = rows[nav[self.sel]]
             if kind == "chat":
                 segs = _wrap(self.display_title(payload), w - 2) or [""]
-                footer = [_bidi(s) for s in segs[:FOOTER_MAX]]
+                title_attr = curses.color_pair(8) | curses.A_BOLD
+                footer += [(_bidi(s), title_attr) for s in segs[:FOOTER_MAX]]
         footer_h = max(1, len(footer))
         # +1 for a faint separator rule between the list and the footer.
         view_h = h - top - footer_h - 1
@@ -2109,12 +2117,10 @@ class App:
                                proj_attr(pcolor) if pcolor else curses.A_DIM)
         except curses.error:
             pass
-        attr = curses.A_BOLD if self.message else (curses.color_pair(8)
-                                                   | curses.A_BOLD)
         base = h - len(footer)
-        for i, fline in enumerate(footer):
+        for i, (fline, fattr) in enumerate(footer):
             try:
-                self.stdscr.addstr(base + i, 0, fline, attr)
+                self.stdscr.addstr(base + i, 0, fline, fattr)
             except curses.error:
                 pass
         self.stdscr.refresh()
