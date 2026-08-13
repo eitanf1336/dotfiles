@@ -27,6 +27,18 @@
       <description>If the focused window belongs to a monitor's batch, swaps it with the next member (the column to its right, or the row below it) and re-flows the group. Does nothing if it is already last or not in a batch.</description>
     </key>
 
+    <key name="focus-terminal-left" type="as">
+      <default><![CDATA[['<Super><Alt>Left']]]></default>
+      <summary>Move keyboard focus to the terminal one position towards the start of the group</summary>
+      <description>Focuses the previous member of the focused terminal's batch (the column to its left, or the row above it) without moving any window, so you can type into it immediately. At the first column it hops to the batch on the monitor to the left, if there is one. When the focused window is not a tiled terminal, falls back to switching to the workspace on the left.</description>
+    </key>
+
+    <key name="focus-terminal-right" type="as">
+      <default><![CDATA[['<Super><Alt>Right']]]></default>
+      <summary>Move keyboard focus to the terminal one position towards the end of the group</summary>
+      <description>Focuses the next member of the focused terminal's batch (the column to its right, or the row below it) without moving any window, so you can type into it immediately. At the last column it hops to the batch on the monitor to the right, if there is one. When the focused window is not a tiled terminal, falls back to switching to the workspace on the right.</description>
+    </key>
+
     <key name="maximize-terminal" type="as">
       <default><![CDATA[['<Super>Up']]]></default>
       <summary>Maximise the focused terminal over its group (hide the column division)</summary>

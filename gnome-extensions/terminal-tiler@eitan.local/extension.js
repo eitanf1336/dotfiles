@@ -9,6 +9,8 @@ const KEY = 'tile-new-terminal';
 const MIN_KEY = 'minimize-terminal-group';
 const MOVE_LEFT_KEY = 'move-terminal-left';
 const MOVE_RIGHT_KEY = 'move-terminal-right';
+const FOCUS_LEFT_KEY = 'focus-terminal-left';
+const FOCUS_RIGHT_KEY = 'focus-terminal-right';
 const MAX_KEY = 'maximize-terminal';
 const UNMAX_KEY = 'unmaximize-terminal';
 
@@ -72,6 +74,22 @@ export default class TerminalTilerExtension extends Extension {
             Meta.KeyBindingFlags.NONE,
             Shell.ActionMode.NORMAL,
             () => this._onMove(1)
+        );
+
+        // Walk keyboard focus along the group without moving any window.
+        Main.wm.addKeybinding(
+            FOCUS_LEFT_KEY,
+            this._settings,
+            Meta.KeyBindingFlags.NONE,
+            Shell.ActionMode.NORMAL,
+            () => this._onFocusMove(-1)
+        );
+        Main.wm.addKeybinding(
+            FOCUS_RIGHT_KEY,
+            this._settings,
+            Meta.KeyBindingFlags.NONE,
+            Shell.ActionMode.NORMAL,
+            () => this._onFocusMove(1)
         );
 
         // Maximise the focused terminal over its group / restore the division.
@@ -144,6 +162,8 @@ export default class TerminalTilerExtension extends Extension {
         Main.wm.removeKeybinding(MIN_KEY);
         Main.wm.removeKeybinding(MOVE_LEFT_KEY);
         Main.wm.removeKeybinding(MOVE_RIGHT_KEY);
+        Main.wm.removeKeybinding(FOCUS_LEFT_KEY);
+        Main.wm.removeKeybinding(FOCUS_RIGHT_KEY);
         Main.wm.removeKeybinding(MAX_KEY);
         Main.wm.removeKeybinding(UNMAX_KEY);
         global.display.disconnectObject(this);
@@ -354,6 +374,113 @@ export default class TerminalTilerExtension extends Extension {
         const half = Math.round(wa.width / 2);
         const x = delta < 0 ? wa.x : wa.x + (wa.width - half);
         win.move_resize_frame(false, x, wa.y, half, wa.height);
+    }
+
+    // Walk keyboard focus one slot along the group WITHOUT moving any window:
+    // delta -1 focuses the previous member (left column / row above), +1 the
+    // next. The target is activate()d, so the very next keystroke goes into
+    // that terminal — handy for hopping between two Claude sessions side by
+    // side. At either end of the group, hop to the batch on the adjacent
+    // monitor if one exists, so the keys keep walking across screens.
+    _onFocusMove(delta) {
+        const focus = global.display.focus_window;
+        let monitor = this._monitorOf(focus);
+        // Same re-absorb as _onMove: a terminal ejected by a stray drag would
+        // otherwise make the key silently dead until it is re-added.
+        if (monitor === null && this._isTerminal(focus)) {
+            const m = focus.get_monitor();
+            if (this._batches.has(m)) {
+                this._add(m, focus);
+                this._tile(m);
+                monitor = m;
+            }
+        }
+        if (monitor === null) {
+            // Not one of our terminals — keep the accelerator's old meaning
+            // (these arrows were Mutter's switch-to-workspace-left/right until
+            // the tiler took them) so no other window loses the shortcut.
+            this._switchWorkspace(delta);
+            return;
+        }
+        const arr = this._batches.get(monitor);
+        if (!arr)
+            return;
+        const live = arr.filter(w => this._isAlive(w));
+        const i = live.indexOf(focus);
+        if (i < 0)
+            return;
+        const j = i + delta;
+        const target = (j >= 0 && j < live.length)
+            ? live[j]
+            : this._edgeTerminal(monitor, delta);
+        if (!target || target === focus)
+            return;
+        this._focusTerminal(target);
+    }
+
+    // Give `win` keyboard focus, restoring/raising it first so it is really on
+    // screen and really typable. If its monitor's group is in the maximised
+    // (one full-screen terminal) state, move the maximise onto `win` too —
+    // otherwise focus would land on a peer hidden behind the maximised one.
+    _focusTerminal(win) {
+        const monitor = this._monitorOf(win);
+        if (monitor !== null && this._maxed.has(monitor)) {
+            this._maxed.set(monitor, win);
+            this._tile(monitor);
+        }
+        this._syncing = true;
+        if (win.minimized)
+            win.unminimize();
+        win.raise();
+        this._syncing = false;
+        // Not guarded: the focus change should still pull the rest of the
+        // group along, exactly as a click on that terminal would.
+        win.activate(global.get_current_time());
+    }
+
+    // First/last terminal of the nearest batch on a monitor to the left
+    // (delta<0) or right (delta>0) of `fromMonitor`, or null if there is none.
+    // Monitors are ordered by the centre of their geometry, so this follows the
+    // physical screen layout rather than the arbitrary monitor indices.
+    _edgeTerminal(fromMonitor, delta) {
+        const mons = Main.layoutManager.monitors;
+        const from = mons[fromMonitor];
+        if (!from)
+            return null;
+        const fromMid = from.x + from.width / 2;
+        let best = null, bestDist = Infinity;
+        for (const [idx, arr] of this._batches) {
+            if (idx === fromMonitor)
+                continue;
+            const m = mons[idx];
+            if (!m)
+                continue;
+            const d = (m.x + m.width / 2) - fromMid;
+            // Wrong side of the current monitor (or stacked exactly on it).
+            if (delta < 0 ? d >= 0 : d <= 0)
+                continue;
+            if (Math.abs(d) < bestDist) {
+                bestDist = Math.abs(d);
+                best = arr;
+            }
+        }
+        if (!best)
+            return null;
+        const live = best.filter(w => this._isAlive(w));
+        if (!live.length)
+            return null;
+        // Enter the neighbouring group from the side we arrived on.
+        return delta < 0 ? live[live.length - 1] : live[0];
+    }
+
+    // Plain workspace switch, the stock meaning of these arrows before the
+    // tiler claimed them (see _onFocusMove's fallback).
+    _switchWorkspace(delta) {
+        const wm = global.workspace_manager;
+        const idx = wm.get_active_workspace_index() + delta;
+        if (idx < 0 || idx >= wm.get_n_workspaces())
+            return;
+        wm.get_workspace_by_index(idx).activate(global.get_current_time());
     }
 
     // Maximise the focused terminal over the rest of its group: it grows to

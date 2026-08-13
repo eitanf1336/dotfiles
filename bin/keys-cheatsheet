@@ -20,6 +20,10 @@ BASE = 'org.gnome.settings-daemon.plugins.media-keys'
 EXTRAS = [
     ('Blackout the screen under the pointer', 'Super+B'),
     ('Tile terminals into columns',           'Super+Enter'),
+    ('Hide / bring back the terminal group',  'Super+Ctrl+Enter'),
+    ('Move a terminal within its group',      'Super+Left / Right'),
+    ('Focus the next / previous terminal',    'Super+Alt+Left / Right'),
+    ('Zoom one terminal over its group',      'Super+Up / Down'),
     ('Show this shortcuts overlay',           'Super+K'),
 ]
 

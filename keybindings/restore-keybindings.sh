@@ -232,3 +232,16 @@ fi
 gsettings set org.gnome.mutter.keybindings toggle-tiled-left  "@as []"
 gsettings set org.gnome.mutter.keybindings toggle-tiled-right "@as []"
 echo "Cleared Mutter edge-tiling off <Super>Left/Right."
+
+# And free <Super><Alt>Left/Right, which the terminal-tiler now uses to walk
+# keyboard focus between the terminals of a tiled group. GNOME ships them as
+# duplicate accelerators for switch-to-workspace-left/right; drop just those
+# two entries and workspace switching keeps <Super>Page_Up/Down, the keypad
+# variants and <Control><Alt>Left/Right. (The tiler also falls back to a plain
+# workspace switch when the focused window is not one of its terminals, so the
+# old behaviour survives on that key for every other app.)
+gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-left \
+    "['<Super>Page_Up', '<Super>KP_Prior', '<Control><Alt>Left']"
+gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-right \
+    "['<Super>Page_Down', '<Super>KP_Next', '<Control><Alt>Right']"
+echo "Freed <Super><Alt>Left/Right for terminal-tiler focus movement."
