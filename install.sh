@@ -79,6 +79,7 @@ for t in "$REPO"/systemd/*.timer; do
 done
 # Units that are not timer-driven still need enabling explicitly.
 systemctl --user enable --now media-keep-awake.service 2>/dev/null || true
+systemctl --user enable --now power-menu-rescue.service 2>/dev/null || true
 
 echo "==> autostart entries -> $AUTOSTART"
 for f in "$REPO"/autostart/*.desktop; do
@@ -118,4 +119,6 @@ Done. Next steps:
       gnome-extensions enable displaylink-nightlight@eitan.local
       gnome-extensions enable terminal-tiler@eitan.local
   - Ensure ~/.local/bin is on your PATH.
+  - Install the polkit rule that lets "Restart Anyway" actually restart
+    (see polkit/README.md).
 EOF

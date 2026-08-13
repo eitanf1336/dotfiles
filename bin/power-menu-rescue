@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# power-menu-rescue: make GNOME's "Restart Anyway" / "Power Off Anyway" actually work.
+#
+# The bug (GNOME 50 / gnome-session-service on Ubuntu):
+#   Whenever any app registers a logout inhibitor (Text Editor with unsaved
+#   files, Nautilus copying, ...), gnome-session-service takes a logind *block*
+#   inhibitor on "shutdown" ("user session inhibited").  You then get the
+#   "some applications are busy" dialog, you click Restart Anyway, and
+#   gnome-session calls logind Reboot() WITHOUT asking to bypass inhibitors.
+#   logind refuses because of gnome-session's own lock:
+#     Shutdown failed: org.freedesktop.login1.BlockedByInhibitorLock
+#   and the machine just sits there.
+#
+# What this does:
+#   Watches the end-session dialog signals plus the user journal.  If a
+#   confirmed restart/power-off is followed by that exact logind refusal, it
+#   finishes the job with `systemctl reboot|poweroff -i`.  It never fires on
+#   its own: it needs both the explicit confirmation and the failure.
+#
+# The -i (ignore inhibitors) call is passwordless thanks to
+#   /etc/polkit-1/rules.d/49-force-shutdown-ignore-inhibit.rules
+#
+# Set POWER_MENU_RESCUE_DRY_RUN=1 to log what it would do instead of doing it, and
+# POWER_MENU_RESCUE_TEST_INPUT=<file> to replay lines instead of watching live.
+
+set -u
+
+DIALOG_PATH=/org/gnome/SessionManager/EndSessionDialog
+TAG="power-menu-rescue:"
+WINDOW=120   # seconds a confirmation stays "armed"
+
+log() { printf '%s %s\n' "$TAG" "$*"; }
+
+sources() {
+    if [ -n "${POWER_MENU_RESCUE_TEST_INPUT:-}" ]; then
+        cat "$POWER_MENU_RESCUE_TEST_INPUT"
+        return
+    fi
+
+    trap 'kill 0 2>/dev/null' EXIT
+
+    # Confirmation signals from the shell's end-session dialog.
+    gdbus monitor --session --dest org.gnome.Shell --object-path "$DIALOG_PATH" 2>/dev/null &
+
+    # gnome-session-service logs its failure here.
+    journalctl --user -f -n0 -o cat 2>/dev/null &
+
+    wait -n
+}
+
+log "watching for blocked restart/power-off"
+
+sources | while IFS= read -r line; do
+    # Never react to our own journal output.
+    case "$line" in "$TAG"*) continue ;; esac
+
+    case "$line" in
+        *ConfirmedReboot*)
+            pending=reboot; stamp=$SECONDS
+            log "restart confirmed, armed"
+            ;;
+        *ConfirmedShutdown*)
+            pending=poweroff; stamp=$SECONDS
+            log "power off confirmed, armed"
+            ;;
+        *EndSessionDialog.Canceled*|*EndSessionDialog.ConfirmedLogout*)
+            pending=""
+            ;;
+        *BlockedByInhibitorLock*)
+            [ -n "${pending:-}" ] || continue
+            if (( SECONDS - stamp > WINDOW )); then
+                pending=""
+                continue
+            fi
+            log "logind refused GNOME's $pending because an app holds a block lock; forcing it"
+            if [ "${POWER_MENU_RESCUE_DRY_RUN:-0}" = 1 ]; then
+                log "DRY RUN: would run systemctl $pending -i"
+            else
+                systemctl "$pending" -i || log "systemctl $pending -i failed"
+            fi
+            pending=""
+            ;;
+    esac
+done

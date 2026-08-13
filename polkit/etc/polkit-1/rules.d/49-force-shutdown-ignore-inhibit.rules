@@ -1,0 +1,19 @@
+// Let the user at the machine actually complete a "Restart Anyway" /
+// "Power Off Anyway" while an app holds a shutdown block inhibitor.
+//
+// GNOME 50's gnome-session-service takes a logind block inhibitor on
+// "shutdown" whenever an app inhibits logout (unsaved documents, a file
+// copy, ...), and then its own Reboot() call is refused with
+// BlockedByInhibitorLock, so the power menu silently does nothing.
+// ~/bin/shutdown-rescue retries with `systemctl reboot|poweroff -i`,
+// which needs these actions.  Only for the active local session; the same
+// user can already reboot without a password, this just skips the
+// "an app is busy" veto they already clicked through.
+polkit.addRule(function (action, subject) {
+    if ((action.id == "org.freedesktop.login1.reboot-ignore-inhibit" ||
+         action.id == "org.freedesktop.login1.power-off-ignore-inhibit" ||
+         action.id == "org.freedesktop.login1.halt-ignore-inhibit") &&
+        subject.user == "eitan" && subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});
