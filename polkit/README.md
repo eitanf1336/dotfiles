@@ -28,6 +28,12 @@ and `gdbus call --session --dest org.gnome.SessionManager --object-path
 /org/gnome/SessionManager --method org.gnome.SessionManager.GetInhibitors` show
 who is holding what).
 
+The same rule also covers `suspend-ignore-inhibit` / `hibernate-ignore-inhibit`,
+for `bin/await-claude-shut` ("Suspend when Claude's done"): when logind refuses
+the sleep because something holds a block inhibitor, it escalates to
+`systemctl suspend -i`. Without the rule that escalation waits for a password,
+and the entire point of the feature is that nobody is at the keyboard.
+
 **Fix:** `bin/power-menu-rescue` (systemd user unit `power-menu-rescue.service`)
 watches for a confirmed restart/power-off followed by that exact logind refusal
 and finishes the job with `systemctl reboot|poweroff -i`. That `-i` needs the

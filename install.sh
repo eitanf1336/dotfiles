@@ -83,10 +83,12 @@ systemctl --user enable --now power-menu-rescue.service 2>/dev/null || true
 
 # power-menu-rescue is useless without its polkit rule (see polkit/README.md):
 # without it `systemctl reboot -i` asks for a password the service cannot type,
-# and the power menu silently keeps doing nothing. Install it once, via pkexec
-# so this script can stay unprivileged.
-echo "==> polkit rule for power-menu-rescue"
-if pkcheck --action-id org.freedesktop.login1.reboot-ignore-inhibit --process $$ >/dev/null 2>&1; then
+# and the power menu silently keeps doing nothing. Same for await-claude-shut's
+# `systemctl suspend -i`. Install it once, via pkexec so this script can stay
+# unprivileged. The check probes the newest action in the rule, so a box with an
+# older copy installed still gets the update.
+echo "==> polkit rule for power-menu-rescue / await-claude-shut"
+if pkcheck --action-id org.freedesktop.login1.suspend-ignore-inhibit --process $$ >/dev/null 2>&1; then
     echo "    already authorized"
 elif pkexec install -m 0644 -o root -g root \
         "$REPO/polkit/etc/polkit-1/rules.d/49-force-shutdown-ignore-inhibit.rules" \

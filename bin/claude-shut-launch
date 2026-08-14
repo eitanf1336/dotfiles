@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# claude-shut-launch — the thing the "…when Claude's done" power-menu items run.
+#
+#   claude-shut-launch <poweroff|reboot|suspend|halt> [extra await-claude-shut args]
+#
+# Its only job is to make sure await-claude-shut ACTUALLY starts, whatever state
+# the desktop's terminals are in, and to leave a log line even when it doesn't.
+#
+# Why this exists: the GNOME extension used to spawn
+#   terminator -T title -x bash -lc '<waiter> --action suspend --grace 90'
+# directly. When a terminator instance is already running, terminator hands the
+# command line to that instance over DBus, where the -x array is *joined into a
+# single string* and re-split — so `bash -lc <waiter> --action suspend` ran the
+# waiter with no arguments at all: the "Suspend when Claude's done" button
+# silently powered off instead, on the default 60s grace. `-u` (--no-dbus) is
+# what keeps the arguments intact; everything else here is belt and braces so a
+# missing or broken terminal can never swallow the run silently again.
+set -uo pipefail
+
+ACTION=${1:-poweroff}; shift || true
+WAITER=$HOME/bin/await-claude-shut
+LOG=${AWAIT_CLAUDE_SHUT_LOG:-$HOME/.local/state/await-claude-shut.log}
+RUNDIR=${AWAIT_CLAUDE_SHUT_RUNDIR:-${XDG_RUNTIME_DIR:-/tmp}/claude-shut}
+PIDFILE=$RUNDIR/waiter.pid
+GRACE=${CLAUDE_SHUT_GRACE:-90}
+
+mkdir -p "$(dirname "$LOG")" "$RUNDIR" 2>/dev/null || LOG=/dev/null
+say() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG" 2>/dev/null; echo "$*"; }
+notify() {
+  command -v notify-send >/dev/null 2>&1 &&
+    notify-send -i system-shutdown "$1" "$2" >/dev/null 2>&1
+}
+
+case "$ACTION" in
+  poweroff|reboot|suspend|halt) ;;
+  *) say "launcher: refusing unknown action '$ACTION'"; exit 2;;
+esac
+
+# Log the click before anything can go wrong, so "I pressed it and nothing
+# happened" is always answerable from the log.
+say "menu click: action=$ACTION grace=${GRACE}s (launcher pid $$)"
+
+waiter_alive() {
+  local pid; pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
+  [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null
+}
+
+if waiter_alive; then
+  say "launcher: a waiter is already armed (pid $(cat "$PIDFILE")); ignoring this click."
+  notify "Already armed" "Claude shutdown is already counting down. Cancel with: await-claude-shut --cancel"
+  exit 0
+fi
+
+# The command the terminal window runs. Kept as one string, passed as ONE argv
+# element to bash -lc, so nothing downstream can re-split it.
+INNER="$(printf '%q' "$WAITER") --action $ACTION --grace $GRACE $*; ec=\$?; "'
+[ "$ec" = 0 ] || { echo; read -n1 -rsp "[finished with an error or was cancelled, press any key to close]"; echo; }'
+TITLE="${ACTION^} when Claude's done"
+
+# Try each terminal in turn, and believe none of them: a terminal counts as
+# working only once the waiter itself has written its pidfile.
+started() {
+  local waited=0
+  while [ "$waited" -lt 8 ]; do
+    waiter_alive && return 0
+    sleep 1; waited=$((waited + 1))
+  done
+  return 1
+}
+
+try() {
+  local name=$1; shift
+  command -v "$1" >/dev/null 2>&1 || return 1
+  say "launcher: trying $name…"
+  setsid "$@" >/dev/null 2>&1 &
+  started && { say "launcher: waiter running in $name (pid $(cat "$PIDFILE"))"; return 0; }
+  say "launcher: $name did not produce a running waiter."
+  return 1
+}
+
+# -u / --no-dbus on terminator is load-bearing; see the header.
+try terminator /usr/bin/terminator -u -T "$TITLE" -x bash -lc "$INNER" && exit 0
+try ptyxis     /usr/bin/ptyxis --new-window -x "bash -lc $(printf '%q' "$INNER")" && exit 0
+try xterm      /usr/bin/xterm -T "$TITLE" -e bash -lc "$INNER" && exit 0
+
+# No terminal would take it. Run it anyway, detached, and say so on the desktop:
+# an armed shutdown with no window beats a button that does nothing.
+say "launcher: no terminal worked; running the waiter headless."
+setsid bash -lc "$INNER" >>"$LOG" 2>&1 &
+if started; then
+  notify "$TITLE" "Armed with no terminal window (none would open). Cancel with: await-claude-shut --cancel"
+  exit 0
+fi
+
+say "launcher: FAILED to start the waiter at all. Nothing is armed."
+notify "Could not arm \"$TITLE\"" "await-claude-shut would not start. See $LOG"
+exit 1

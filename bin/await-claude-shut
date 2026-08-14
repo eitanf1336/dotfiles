@@ -13,6 +13,8 @@
 #     -g, --grace S      cancellable countdown before shutdown       (default 60)
 #     -a, --action A     poweroff | reboot | suspend | halt          (default poweroff)
 #     -n, --dry-run      print what it would do; never shut down
+#         --cancel       kill a waiter started earlier (any window), then exit
+#         --status       say whether a waiter is armed, then exit
 #     -h, --help
 #
 # During the grace countdown, press Ctrl+C to cancel. If Claude starts
@@ -30,6 +32,8 @@ ACTION=poweroff
 DRYRUN=0
 STATUS_CMD=${CLAUDE_STATUS_CMD:-claude-status}   # overridable for testing
 LOG=${AWAIT_CLAUDE_SHUT_LOG:-$HOME/.local/state/await-claude-shut.log}
+RUNDIR=${AWAIT_CLAUDE_SHUT_RUNDIR:-${XDG_RUNTIME_DIR:-/tmp}/claude-shut}
+PIDFILE=$RUNDIR/waiter.pid
 
 die() { echo "await-claude-shut: $*" >&2; exit 1; }
 
@@ -41,18 +45,21 @@ while [ $# -gt 0 ]; do
     -g|--grace)    GRACE=${2:?};    shift 2;;
     -a|--action)   ACTION=${2:?};   shift 2;;
     -n|--dry-run)  DRYRUN=1; shift;;
-    -h|--help)     sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    --cancel)      MODE=cancel; shift;;
+    --status)      MODE=status; shift;;
+    -h|--help)     sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) die "unknown option: $1 (try --help)";;
   esac
 done
+MODE=${MODE:-run}
 
 case "$ACTION" in
   poweroff|reboot|suspend|halt) ;;
   *) die "invalid --action '$ACTION' (poweroff|reboot|suspend|halt)";;
 esac
-command -v "$STATUS_CMD" >/dev/null 2>&1 || die "'$STATUS_CMD' not found on PATH"
 
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || LOG=/dev/null
+mkdir -p "$RUNDIR" 2>/dev/null
 
 # Print to the window AND to the log, so closing the window doesn't erase the
 # evidence of what happened.
@@ -62,6 +69,67 @@ say() {
 }
 wipe() { printf '\r%*s\r' 64 ''; }   # clear the countdown line
 
+# A shutdown that quietly refused is the one failure mode that looks exactly
+# like success from a closed terminal window, so shout about it on the desktop.
+notify() {
+  [ "${AWAIT_CLAUDE_SHUT_NOTIFY:-1}" = 0 ] && return 0
+  command -v notify-send >/dev/null 2>&1 &&
+    notify-send -u critical -i system-shutdown "$1" "$2" >/dev/null 2>&1
+}
+
+# The pid of a waiter that is still alive, or nothing.
+live_waiter() {
+  local pid
+  pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
+  [ -n "${pid:-}" ] && [ "$pid" != "$$" ] && kill -0 "$pid" 2>/dev/null || return 1
+  echo "$pid"
+}
+
+case "$MODE" in
+  status)
+    if pid=$(live_waiter); then echo "armed (pid $pid)"; exit 0; fi
+    echo "not armed"; exit 1;;
+  cancel)
+    if pid=$(live_waiter); then
+      say "cancelled by --cancel (killing waiter pid $pid)"
+      for sig in INT TERM KILL; do
+        kill -"$sig" "$pid" 2>/dev/null
+        for _ in 1 2 3 4 5 6; do
+          kill -0 "$pid" 2>/dev/null || break 2
+          sleep 0.5
+        done
+      done
+      kill -0 "$pid" 2>/dev/null && { echo "could not kill waiter pid $pid"; exit 1; }
+      rm -f "$PIDFILE" 2>/dev/null
+      echo "cancelled the waiter (pid $pid)"
+      exit 0
+    fi
+    echo "nothing to cancel: no waiter is armed"; exit 1;;
+esac
+
+command -v "$STATUS_CMD" >/dev/null 2>&1 || die "'$STATUS_CMD' not found on PATH"
+
+# One waiter at a time: a second armed countdown just races the first.
+if pid=$(live_waiter); then
+  say "another waiter is already armed (pid $pid); not starting a second one."
+  notify "Claude shutdown already armed" \
+          "A waiter is already counting down (pid $pid). Cancel it first: await-claude-shut --cancel"
+  exit 3
+fi
+echo $$ >"$PIDFILE" 2>/dev/null
+trap 'rm -f "$PIDFILE" 2>/dev/null' EXIT
+
+# bash only runs a trap once the *foreground* command finishes, so a plain
+# `sleep 30` would swallow a Ctrl+C (or a --cancel) for up to half a minute.
+# Sleeping in the background and `wait`-ing on it makes every wait interruptible.
+NAP_PID=
+nap() { sleep "$1" & NAP_PID=$!; wait "$NAP_PID" 2>/dev/null; NAP_PID=; }
+on_cancel() {
+  [ -n "$NAP_PID" ] && kill "$NAP_PID" 2>/dev/null
+  wipe; say "cancelled."; rm -f "$PIDFILE" 2>/dev/null; exit 130
+}
+trap on_cancel INT TERM
+
 # Return 0 if Claude is actively running (compute in flight), 1 otherwise.
 # NOTE: one call costs a couple of seconds (it queries the agent daemon and
 # samples TUI CPU), which is why every wait below is wall-clock based.
@@ -70,40 +138,114 @@ claude_busy() {
   [ "$?" -eq 1 ]
 }
 
+# logind refuses poweroff/reboot outright while anything holds a *block*
+# inhibitor on "shutdown" (GNOME 50 holds one on its own behalf whenever an app
+# inhibits logout), and would refuse a suspend the same way for "sleep". Log who
+# is holding what before we try, so a refusal is self-explanatory in the log.
+inhibitor_what() { case "$1" in suspend) echo sleep;; *) echo shutdown;; esac; }
+log_blockers() {
+  local what blockers
+  what=$(inhibitor_what "$ACTION")
+  blockers=$(systemd-inhibit --list --mode=block 2>/dev/null |
+             awk -v w="$what" '$0 ~ w {print}' | head -5)
+  [ -n "$blockers" ] && say "note: block inhibitors on '$what' are present:" &&
+    while IFS= read -r l; do say "      $l"; done <<<"$blockers"
+  return 0
+}
+
+# Did the machine actually sleep since $1 (epoch seconds)?
+suspended_since() {
+  journalctl -k --since "@$1" -o cat 2>/dev/null | grep -q "PM: suspend entry"
+}
+
+# Run systemctl once. Echoes its output, returns its exit status.
+# Overridable so the refusal/escalation path can be tested without suspending
+# the machine (see the tests in the dotfiles repo).
+SYSTEMCTL=${AWAIT_CLAUDE_SHUT_SYSTEMCTL:-systemctl}
+run_systemctl() {
+  $SYSTEMCTL "$ACTION" "$@" 2>&1
+}
+
 do_shutdown() {
   if [ "$DRYRUN" -eq 1 ]; then
     say "[dry-run] would run: systemctl $ACTION"
     exit 0
   fi
-  say ">>> systemctl $ACTION"
-  local out rc t0
+
+  # Past this point the decision is made: a SIGTERM here is systemd taking the
+  # machine down, not a cancellation, and must not be logged as one.
+  trap - INT TERM
+  log_blockers
+
+  local t0 out rc forced=0
   t0=$(date +%s)
-  out=$(systemctl "$ACTION" 2>&1); rc=$?
+  say ">>> systemctl $ACTION"
+  out=$(run_systemctl); rc=$?
   [ -n "$out" ] && say "systemctl said: $out"
+
+  # Refused because something holds a block inhibitor: that veto is exactly what
+  # the user already decided against by arming this, so override it. `-i` needs
+  # the polkit rule from the dotfiles repo (polkit/README.md); without it
+  # systemctl fails fast with "Interactive authentication required" rather than
+  # hanging, and we report that below.
   if [ "$rc" -ne 0 ]; then
-    say "FAILED: 'systemctl $ACTION' exited $rc. The machine is still awake."
+    say "refused; retrying with -i (ignore inhibitors)…"
+    t0=$(date +%s); forced=1
+    out=$(run_systemctl -i); rc=$?
+    [ -n "$out" ] && say "systemctl -i said: $out"
+  fi
+
+  if [ "$rc" -ne 0 ]; then
+    say "FAILED: 'systemctl $ACTION' would not run. The machine is still awake."
+    case "$out" in
+      *authentication*|*Authentication*)
+        say "       polkit blocked the override. Install the rule:"
+        say "       ~/code/linux-setup/install.sh  (see polkit/README.md)";;
+    esac
+    notify "Claude $ACTION failed" "The machine is still awake. See ~/.local/state/await-claude-shut.log"
     exit "$rc"
   fi
 
   # systemctl returns as soon as logind accepts the request; the machine goes
-  # down a moment later (delay inhibitors get a few seconds first). For sleep
-  # actions, verify it really happened instead of assuming.
-  if [ "$ACTION" = suspend ]; then
-    say "request accepted; waiting for the machine to actually go to sleep…"
-    local waited=0
-    while [ "$waited" -lt 20 ]; do
-      sleep 2
-      waited=$((waited + 2))
-      if journalctl -k --since "@$t0" -o cat 2>/dev/null | grep -q "PM: suspend entry"; then
-        say "confirmed: the system suspended, and has now resumed."
-        exit 0
-      fi
-    done
-    say "WARNING: logind accepted the request but no 'PM: suspend entry' appeared"
-    say "         within 20s. Something vetoed the sleep. Check: systemd-inhibit --list"
-    exit 1
-  fi
-  exit 0
+  # down a moment later (delay inhibitors get a few seconds first). Accepted is
+  # not the same as happened, so verify, and escalate once if nothing happened.
+  local attempt
+  for attempt in 1 2; do
+    if [ "$ACTION" = suspend ]; then
+      say "request accepted; waiting for the machine to actually go to sleep…"
+      local waited=0
+      while [ "$waited" -lt 25 ]; do
+        sleep 2; waited=$((waited + 2))
+        if suspended_since "$t0"; then
+          say "confirmed: the system suspended, and has now resumed."
+          exit 0
+        fi
+      done
+    else
+      # For poweroff/reboot/halt there is nothing to look for: if we are still
+      # running half a minute later, it did not happen.
+      say "request accepted; the machine should go down now…"
+      sleep 30
+    fi
+
+    [ "$forced" -eq 1 ] && break
+    say "nothing happened within the timeout. Something vetoed it; forcing with -i…"
+    log_blockers
+    t0=$(date +%s); forced=1
+    out=$(run_systemctl -i); rc=$?
+    [ -n "$out" ] && say "systemctl -i said: $out"
+    if [ "$rc" -ne 0 ]; then
+      say "FAILED: the forced '$ACTION -i' exited $rc. The machine is still awake."
+      notify "Claude $ACTION failed" "Even the forced attempt was refused. See ~/.local/state/await-claude-shut.log"
+      exit "$rc"
+    fi
+  done
+
+  say "WARNING: logind accepted the request (forced) and the machine is still up."
+  say "         Check: systemd-inhibit --list ; journalctl -b -u systemd-logind"
+  notify "Claude $ACTION did not happen" \
+         "logind accepted it but the machine stayed up. See ~/.local/state/await-claude-shut.log"
+  exit 1
 }
 
 # Wait for STABLE consecutive clear checks, then a re-checking grace countdown.
@@ -117,14 +259,14 @@ while :; do
       [ "$clear" -gt 0 ] && say "Claude woke back up, restarting the count."
       clear=0
       say "Claude still active, checking again in ${INTERVAL}s…"
-      sleep "$INTERVAL"
+      nap "$INTERVAL"
     else
       clear=$((clear + 1))
       if [ "$clear" -lt "$STABLE" ]; then
         # Confirming checks are seconds apart, not minutes: the long interval
         # is for waiting out real work, not for double-checking a quiet machine.
         say "clear ($clear/$STABLE), confirming in ${CONFIRM}s…"
-        sleep "$CONFIRM"
+        nap "$CONFIRM"
       else
         say "clear ($clear/$STABLE)"
       fi
@@ -134,7 +276,6 @@ while :; do
   # Grace countdown against a wall-clock deadline, so the periodic re-checks
   # cost real time instead of silently stretching the countdown.
   say "Claude is done. ${ACTION} in ${GRACE}s. Press Ctrl+C (or close this window) to cancel."
-  trap 'wipe; say "cancelled."; exit 130' INT
   deadline=$(( $(date +%s) + GRACE ))
   last_check=$(date +%s)
   restarted=0
@@ -147,9 +288,8 @@ while :; do
       if claude_busy; then restarted=1; break; fi
       last_check=$(date +%s)
     fi
-    sleep 1
+    nap 1
   done
-  trap - INT
   wipe
 
   if [ "$restarted" -eq 1 ]; then
