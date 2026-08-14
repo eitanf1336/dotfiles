@@ -55,11 +55,17 @@ it and the status line leads with a matching chip.
 
 Command line:
   chats.py                 open the board
+  chats.py <proj>          open the board already filtered to that project, e.g.
+                           `claude-c system`. `proj` is free text matched against
+                           project names and folders (case-insensitive, prefix or
+                           substring): a display name, a folder basename, a path,
+                           or `all` for the unfiltered board.
   chats.py --new [proj]    skip the board — create a background chat in `proj`
                            (default: the System project, i.e. the home folder)
                            and attach to it immediately. Ctrl+Z out of the chat
                            lands on the board, in that project. This is what
                            Ctrl+Alt+Y runs (see ~/bin/claude-new-chat).
+  chats.py --list          print every project the CLI can be pointed at
 """
 
 import contextlib
@@ -355,6 +361,84 @@ def project_key_for(chat, tags):
     return tags.get(chat["id"]) or chat.get("cwd") or "(unknown)"
 
 
+def project_candidates(deep=False):
+    """[(key, display name)] of every project the CLI can be pointed at.
+
+    Cheap by default: whatever projects.json knows about (added folders, virtual
+    projects with a cwd) plus every virtual project some chat is tagged into.
+    `deep=True` also parses the chat files to pick up folders that were never
+    added explicitly and only exist as some chat's working directory — that scan
+    costs real time, so it's only paid when the cheap list fails to match."""
+    pj = _load_json(PROJECTS_STORE)
+    listed = pj.get("list", {}) or {}
+    keys = dict.fromkeys(listed)                       # keep projects.json order
+    for k in (pj.get("cwds", {}) or {}):
+        keys.setdefault(k, None)
+    for k in load_project_tags().values():
+        if k:
+            keys.setdefault(k, None)
+    if deep:
+        for c in scan_chats():
+            k = c.get("cwd")
+            if k and k != "(unknown)":
+                keys.setdefault(k, None)
+    out = []
+    for k in keys:
+        name = listed.get(k) or (os.path.basename(k.rstrip("/"))
+                                 if os.path.isabs(k) else k)
+        out.append((k, name or k))
+    return out
+
+
+def _match_projects(arg, cands):
+    """Keys of `cands` matching `arg`, best tier only: exact name/key wins over
+    a prefix, which wins over a substring. Case- and accent-blind enough for
+    typing `claude-c system` at 2am."""
+    a = arg.casefold().strip()
+    if not a:
+        return []
+
+    def names(k, n):
+        yield n.casefold()
+        yield k.casefold()
+        if os.path.isabs(k):
+            yield os.path.basename(k.rstrip("/")).casefold()
+
+    for test in (lambda s: s == a,
+                 lambda s: s.startswith(a),
+                 lambda s: a in s):
+        hits = [k for k, n in cands if any(test(s) for s in names(k, n))]
+        if hits:
+            return list(dict.fromkeys(hits))
+    return []
+
+
+def resolve_project(arg):
+    """Map a free-text CLI argument to a project key.
+
+    Returns (ok, key, matches). `ok` False means nothing matched (or several did,
+    in which case `matches` holds the candidates to show). key None with ok True
+    is the "All projects" view. An existing folder path always resolves to
+    itself, so `claude-c .` or `claude-c ~/code/foo` work without the folder ever
+    having been added to the board."""
+    a = (arg or "").strip()
+    if a.casefold() in ("all", "-", "*"):
+        return True, None, []
+    p = os.path.abspath(os.path.expanduser(a))
+    if os.path.isdir(p) and (a.startswith(("/", "~", ".")) or os.sep in a):
+        return True, p, []
+
+    cands = project_candidates()
+    hits = _match_projects(a, cands)
+    if not hits:                       # only now pay for parsing every chat file
+        cands = project_candidates(deep=True)
+        hits = _match_projects(a, cands)
+    if len(hits) == 1:
+        return True, hits[0], []
+    named = {k: n for k, n in cands}
+    return False, None, [(k, named.get(k, k)) for k in hits]
+
+
 def _text_from_content(content):
     if isinstance(content, str):
         return content
@@ -531,6 +615,84 @@ def session_file(full_id):
     for f in PROJECTS_DIR.glob(f"*/{full_id}.jsonl"):
         return f
     return None
+
+
+# Cache keyed by (path, size, mtime) so hovering up and down a list of chats does not
+# re-read a transcript per keypress. Transcripts only ever grow, so this is exact.
+_STATUS_TAG_CACHE = {}
+
+# A status tag is the CAPS line the assistant is told to end every message with
+# (see ~/.claude/CLAUDE.md): DONE DONE, MUST REPLY, DONE BUT MUST READ, and so on.
+# Deliberately strict - all-caps words, no lowercase - so an ordinary shouted
+# sentence or a bare acronym in the prose does not get mistaken for a verdict.
+_STATUS_TAG_RE = re.compile(r"^[A-Z][A-Z0-9 ·,'\u2014\u2013()/&+-]{2,60}$")
+
+
+def last_status_tag(full_id):
+    """The CAPS status tag the last assistant turn signed off with, or None.
+
+    Reads only the TAIL of the transcript: these files reach tens of megabytes on a
+    long chat and the answer is always within the last turn or two. Scans backwards
+    and stops at the first assistant message that ends in a tag.
+    """
+    f = session_file(full_id)
+    if not f:
+        return None
+    try:
+        st = f.stat()
+    except OSError:
+        return None
+    key = (str(f), st.st_size, st.st_mtime_ns)
+    if key in _STATUS_TAG_CACHE:
+        return _STATUS_TAG_CACHE[key]
+
+    tag = None
+    looked = 0
+    try:
+        with f.open("rb") as fh:
+            # 512 KB of tail comfortably covers several long turns; a transcript
+            # smaller than that is simply read whole.
+            back = min(st.st_size, 512 * 1024)
+            fh.seek(st.st_size - back)
+            chunk = fh.read().decode("utf-8", "replace")
+        lines = chunk.splitlines()
+        # A partial first line is likely when we seeked into the middle of one.
+        for line in reversed(lines[1:] if back < st.st_size else lines):
+            line = line.strip()
+            if not line or '"assistant"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("type") != "assistant":
+                continue
+            content = (rec.get("message") or {}).get("content")
+            if not isinstance(content, list):
+                continue
+            text = "".join(b.get("text", "") for b in content
+                           if isinstance(b, dict) and b.get("type") == "text")
+            if not text.strip():
+                continue  # a pure tool-use turn signs nothing
+            last = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+            if last and _STATUS_TAG_RE.match(last[-1]):
+                tag = last[-1]
+                break
+            # No tag on this one, so look further back - but not far. A long working turn
+            # ends in narration ("running the build now…") with the real verdict several
+            # turns behind it, and a chat from before the sign-off rule existed has none at
+            # all. Fourteen turns clears a long tool-heavy stretch without dredging up a
+            # verdict old enough to be a lie.
+            looked += 1
+            if looked >= 14:
+                break
+    except Exception:
+        tag = None
+
+    _STATUS_TAG_CACHE[key] = tag
+    if len(_STATUS_TAG_CACHE) > 512:
+        _STATUS_TAG_CACHE.clear()
+    return tag
 
 
 def session_has_user_turn(full_id):
@@ -2013,6 +2175,17 @@ class App:
                 segs = _wrap(self.display_title(payload), w - 2) or [""]
                 title_attr = curses.color_pair(8) | curses.A_BOLD
                 footer += [(_bidi(s), title_attr) for s in segs[:FOOTER_MAX]]
+                # …and under the name, how that chat signed off: DONE DONE, MUST REPLY,
+                # DONE BUT MUST READ. It is the one line that says whether the chat can be
+                # closed unread, so it belongs where the eye already is.
+                #
+                # NOT while it is running: a live agent's last tag describes a turn that has
+                # since been superseded, and showing a stale DONE DONE over a chat that is
+                # mid-work is exactly the wrong thing to tell someone who closes on the tag.
+                if self.live.get(payload["id"]) != "running":
+                    tag = last_status_tag(payload["id"])
+                    if tag:
+                        footer.append((_clamp(tag, w - 2), curses.A_BOLD))
         footer_h = max(1, len(footer))
         # +1 for a faint separator rule between the list and the footer.
         view_h = h - top - footer_h - 1
@@ -2534,23 +2707,63 @@ def main():
         print("No Claude projects directory found at", PROJECTS_DIR)
         return
 
-    # --new [<project key>] — skip the board: create a fresh background chat in
-    # that project and attach to it right away. Default project is System (the
-    # home folder). Ctrl+Z out of the chat lands on the board in that project.
+    # Command line:
+    #   claude-c <project>          open the board straight in that project
+    #   claude-c --new [<project>]  skip the board: create a fresh background chat
+    #                               in that project and attach to it right away.
+    # The project is free text — a display name ("system", "technion"), a folder
+    # basename, a path, or "all" for the unfiltered board — resolved against the
+    # same project list the P panel shows. Ctrl+Z out of the chat lands on the
+    # board in that project.
     argv = sys.argv[1:]
     boot_new = False
     boot_project = str(HOME)
+    proj_arg = None
     if argv and argv[0] in ("--new", "-n", "--new-chat"):
         boot_new = True
-        if len(argv) > 1 and argv[1]:
-            boot_project = argv[1]
+        rest = " ".join(a for a in argv[1:] if a).strip()
+        proj_arg = rest or None
+    elif argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    elif argv and argv[0] in ("-l", "--list", "--projects"):
+        for key, name in sorted(project_candidates(deep=True),
+                                key=lambda kn: kn[1].lower()):
+            print(f"{name:<24} {key}")
+        return
+    elif argv and not argv[0].startswith("-"):
+        # Unquoted multi-word names ("claude-c my project") arrive as separate
+        # argv entries; join them back before matching.
+        proj_arg = " ".join(argv).strip()
+
+    boot_view = _KEEP_PROJECT
+    if proj_arg:
+        ok, key, matches = resolve_project(proj_arg)
+        if not ok:
+            if matches:
+                print(f"“{proj_arg}” matches several projects:")
+                for k, n in matches:
+                    print(f"  {n:<24} {k}")
+            else:
+                print(f"No project matches “{proj_arg}”. Known projects:")
+                for k, n in sorted(project_candidates(deep=True),
+                                   key=lambda kn: kn[1].lower()):
+                    print(f"  {n:<24} {k}")
+            sys.exit(1)
+        if boot_new:
+            # "All projects" isn't a place to put a new chat — fall back to the
+            # launch folder, exactly like a bare --new.
+            boot_project = key
+        else:
+            boot_view = key
 
     last_id = None
     # Project to restore when the board reopens after a chat. _KEEP_PROJECT on
     # the first launch (use whatever's persisted); after a chat it becomes the
     # project the board was showing, so Ctrl+Z always returns you to the SAME
-    # project screen you left — never the chat's own project.
-    last_project = _KEEP_PROJECT
+    # project screen you left — never the chat's own project. A project named on
+    # the command line overrides the persisted one for this launch.
+    last_project = boot_view
 
     if boot_new:
         start_new_chat(boot_project)
