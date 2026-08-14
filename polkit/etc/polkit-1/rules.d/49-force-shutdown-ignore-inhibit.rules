@@ -5,7 +5,7 @@
 // "shutdown" whenever an app inhibits logout (unsaved documents, a file
 // copy, ...), and then its own Reboot() call is refused with
 // BlockedByInhibitorLock, so the power menu silently does nothing.
-// ~/bin/shutdown-rescue retries with `systemctl reboot|poweroff -i`,
+// ~/.local/bin/power-menu-rescue retries with `systemctl reboot|poweroff -i`,
 // which needs these actions.  Only for the active local session; the same
 // user can already reboot without a password, this just skips the
 // "an app is busy" veto they already clicked through.

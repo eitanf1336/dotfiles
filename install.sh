@@ -81,6 +81,23 @@ done
 systemctl --user enable --now media-keep-awake.service 2>/dev/null || true
 systemctl --user enable --now power-menu-rescue.service 2>/dev/null || true
 
+# power-menu-rescue is useless without its polkit rule (see polkit/README.md):
+# without it `systemctl reboot -i` asks for a password the service cannot type,
+# and the power menu silently keeps doing nothing. Install it once, via pkexec
+# so this script can stay unprivileged.
+echo "==> polkit rule for power-menu-rescue"
+if pkcheck --action-id org.freedesktop.login1.reboot-ignore-inhibit --process $$ >/dev/null 2>&1; then
+    echo "    already authorized"
+elif pkexec install -m 0644 -o root -g root \
+        "$REPO/polkit/etc/polkit-1/rules.d/49-force-shutdown-ignore-inhibit.rules" \
+        /etc/polkit-1/rules.d/49-force-shutdown-ignore-inhibit.rules; then
+    echo "    installed 49-force-shutdown-ignore-inhibit.rules"
+else
+    echo "    NOT installed — 'Restart Anyway' will keep doing nothing."
+    echo "    Run it by hand: sudo install -m 0644 -o root -g root \\"
+    echo "      $REPO/polkit/etc/polkit-1/rules.d/49-force-shutdown-ignore-inhibit.rules /etc/polkit-1/rules.d/"
+fi
+
 echo "==> autostart entries -> $AUTOSTART"
 for f in "$REPO"/autostart/*.desktop; do
     ln -sf "$f" "$AUTOSTART/$(basename "$f")"

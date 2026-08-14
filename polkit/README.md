@@ -1,7 +1,9 @@
 # polkit rules
 
-System files here mirror their real paths under `/etc`. `install.sh` does **not**
-copy them (it runs unprivileged), so install them by hand once per machine.
+System files here mirror their real paths under `/etc`. `install.sh` itself runs
+unprivileged, so it installs them through `pkexec` (one graphical password
+prompt, skipped entirely when the rule is already in place). If that fails it
+prints the `sudo` line to run by hand.
 
 ## 49-force-shutdown-ignore-inhibit.rules
 

@@ -2,13 +2,13 @@
 Description=Finish a GNOME restart/power-off that an app inhibitor blocked
 PartOf=graphical-session.target
 After=graphical-session.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/power-menu-rescue
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=0
 
 [Install]
 WantedBy=graphical-session.target
