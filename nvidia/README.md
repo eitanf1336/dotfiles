@@ -27,7 +27,7 @@ update to fix it with.
 
 ## The fix
 
-`etc/modprobe.d/99-nvidia-power-fix.conf`:
+`etc/modprobe.d/zz-nvidia-power-fix.conf`:
 
 ```
 options nvidia NVreg_DynamicPowerManagement=0x00
@@ -37,10 +37,13 @@ options nvidia NVreg_DynamicPowerManagement=0x00
 broken resume path is never taken. Costs a few watts at idle (matters on battery,
 not while docked).
 
+`etc/modprobe.d/nvidia-runtimepm.conf` carries the same line and exists only to
+shadow Ubuntu's own file of that name. See the 2026-08-16 regression below.
+
 ## Install
 
 ```bash
-sudo cp etc/modprobe.d/99-nvidia-power-fix.conf /etc/modprobe.d/
+sudo cp etc/modprobe.d/zz-nvidia-power-fix.conf etc/modprobe.d/nvidia-runtimepm.conf /etc/modprobe.d/
 sudo update-initramfs -u
 # reboot
 ```
@@ -72,6 +75,32 @@ regenerated the initramfs without it too.
 
 Fix is just `sudo update-initramfs -u -k $(uname -r)`, but the lesson is that a
 present conf file proves nothing here. Always read `/proc/driver/nvidia/params`.
+
+## Regression, 2026-08-16 (the actual cause)
+
+`DynamicPowerManagement: 2` was back, so the initramfs story above was only half
+of it. `modprobe --showconfig | grep -i dynamicpower` gave the real answer:
+
+```
+options nvidia NVreg_DynamicPowerManagement=0x00      <- 99-nvidia-power-fix.conf
+options nvidia "NVreg_DynamicPowerManagement=0x02"    <- /lib/modprobe.d/nvidia-runtimepm.conf
+```
+
+modprobe reads every `*.conf` from `/etc/modprobe.d`, `/run/modprobe.d` and
+`/lib/modprobe.d` as one list sorted by **file name**, and for a repeated option
+the **last** line wins. `99-...` sorts before `nvidia-...`, so Ubuntu's
+gpu-manager file (regenerated on boot, owned by no package) won every time.
+
+Two changes, either of which alone is enough:
+
+* the fix was renamed `99-nvidia-power-fix.conf` -> `zz-nvidia-power-fix.conf`,
+  so it is now the last file read;
+* `/etc/modprobe.d/nvidia-runtimepm.conf` was added: a file of the same name in
+  `/etc` shadows the one in `/lib` completely, in the running system and inside
+  the initramfs alike (`mkinitramfs` copies both trees to their own paths).
+
+Verify with `modprobe --showconfig | grep -i dynamicpower` (no `0x02` line may
+remain), then after a reboot with `/proc/driver/nvidia/params`.
 
 ## HDMI audio function
 
