@@ -1,26 +1,117 @@
-#!/usr/bin/env bash
-# fix-cursor: bring back the mouse pointer when it vanishes on one screen.
-#
-# Cause (hybrid GPU, GNOME Wayland): the NVIDIA side occasionally fails to map
-# the hardware cursor buffer --
-#   nvidia-drm: Failed to map NvKmsKapiMemory
-#   gnome-shell: Realizing HW cursor failed: Failed write to gbm_bo: Cannot allocate memory
-#   gnome-shell: Failed to set hardware cursor ..., using OpenGL from now on
-# after which the pointer is simply not drawn on the affected monitor
-# (usually HDMI-1, the one wired to the NVIDIA card).
-#
-# This nudges the cursor size in gsettings and back, which makes mutter throw
-# away the broken cursor sprite and realize a fresh one, on every monitor.
-# No root, no VT bounce, no windows lost. If it does not help, run fix-screen
-# (Super+F5), which redoes a full modeset.
+#!/usr/bin/env python3
+"""fix-cursor: bring back the mouse pointer when it vanishes on one screen.
 
-key="org.gnome.desktop.interface cursor-size"
-cur="$(gsettings get $key)"
-tmp=$(( cur + 1 ))
+When does this happen: on wake from sleep. The dGPU comes back and the very
+first cursor upload fails --
 
-gsettings set $key "$tmp"
-sleep 1
-gsettings set $key "$cur"
+    nvidia-drm: Failed to map NvKmsKapiMemory
+    gnome-shell: Realizing HW cursor failed: Failed write to gbm_bo: Cannot allocate memory
+    gnome-shell: Failed to set hardware cursor (...), using OpenGL from now on
 
-echo "cursor sprite re-realized (size $cur)."
-echo "still missing? press Super+F5 (fix-screen) for a full display reset."
+after which the pointer is not drawn on the screen wired to the NVIDIA card
+(HDMI-1, the main one; eDP-1 and the dock's DP outputs are on the Intel card and
+keep their pointer). Super+F5 does not help: a VT bounce does not make mutter
+re-try the hardware cursor.
+
+What this does, in order of increasing force:
+  1. nudges the cursor size in gsettings, so mutter re-realizes the sprite;
+  2. blinks the primary monitor's refresh rate, which forces a real modeset and
+     a fresh cursor plane. The mode change is applied as *temporary*, so if
+     anything goes wrong GNOME puts the old mode back on its own after ~20s.
+
+If the pointer is still missing after this, mutter has latched the failure for
+the whole session and only restarting the compositor clears it: log out and back
+in (Wayland cannot restart gnome-shell in place). A reboot works too.
+"""
+
+import subprocess
+import sys
+import time
+
+import gi
+from gi.repository import Gio, GLib
+
+IFACE = "org.gnome.Mutter.DisplayConfig"
+PATH = "/org/gnome/Mutter/DisplayConfig"
+
+
+def bounce_cursor_size():
+    get = subprocess.run(
+        ["gsettings", "get", "org.gnome.desktop.interface", "cursor-size"],
+        capture_output=True, text=True, check=True).stdout.strip()
+    size = int(get)
+    for value in (size + 1, size):
+        subprocess.run(["gsettings", "set", "org.gnome.desktop.interface",
+                        "cursor-size", str(value)], check=True)
+        time.sleep(1)
+    print(f"cursor sprite re-realized (size {size})")
+
+
+def proxy():
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    return Gio.DBusProxy.new_sync(bus, Gio.DBusProxyFlags.NONE, None,
+                                  IFACE, PATH, IFACE, None)
+
+
+def state(p):
+    return p.call_sync("GetCurrentState", None, Gio.DBusCallFlags.NONE, -1, None).unpack()
+
+
+def current_modes(p):
+    _, monitors, _, _ = state(p)
+    return {mon[0][0]: m[0] for mon in monitors for m in mon[1] if m[6].get("is-current")}
+
+
+def apply_modes(p, override):
+    """Apply the current layout with `override` connector->mode, temporarily."""
+    serial, _monitors, logical, _props = state(p)
+    cur = current_modes(p)
+    lms = []
+    for x, y, scale, transform, primary, mons, _lp in logical:
+        entries = [(m[0], override.get(m[0], cur.get(m[0])), {}) for m in mons]
+        lms.append((x, y, scale, transform, primary, entries))
+    args = GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})",
+                        (serial, 1, lms, {"layout-mode": GLib.Variant("u", 1)}))
+    p.call_sync("ApplyMonitorsConfig", args, Gio.DBusCallFlags.NONE, -1, None)
+
+
+def blink_primary(p):
+    _serial, monitors, logical, _props = state(p)
+    primary = next((mons[0][0] for *_r, primary, mons, _lp in logical if primary), None)
+    if primary is None:
+        print("no primary monitor found, skipping the modeset")
+        return
+
+    modes = next((m[1] for m in monitors if m[0][0] == primary), [])
+    cur = next((m for m in modes if m[6].get("is-current")), None)
+    if cur is None:
+        print(f"{primary}: no current mode found, skipping the modeset")
+        return
+    # same resolution, different refresh rate -> least disruptive real modeset
+    alt = next((m[0] for m in modes
+                if m[1] == cur[1] and m[2] == cur[2] and m[0] != cur[0]), None)
+    if alt is None:
+        print(f"{primary}: no alternative refresh rate, skipping the modeset")
+        return
+
+    print(f"{primary}: {cur[0]} -> {alt} -> {cur[0]}")
+    apply_modes(p, {primary: alt})
+    time.sleep(5)
+    apply_modes(p, {primary: cur[0]})
+
+
+def main():
+    bounce_cursor_size()
+    try:
+        blink_primary(proxy())
+    except GLib.Error as err:            # never leave the screens half-configured
+        print(f"modeset failed ({err.message}); GNOME reverts on its own in ~20s",
+              file=sys.stderr)
+        return 1
+    print("still no pointer? mutter latched the failure for this session: "
+          "log out and back in (or reboot).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
