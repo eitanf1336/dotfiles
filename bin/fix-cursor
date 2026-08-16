@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# fix-cursor: bring back the mouse pointer when it vanishes on one screen.
+#
+# Cause (hybrid GPU, GNOME Wayland): the NVIDIA side occasionally fails to map
+# the hardware cursor buffer --
+#   nvidia-drm: Failed to map NvKmsKapiMemory
+#   gnome-shell: Realizing HW cursor failed: Failed write to gbm_bo: Cannot allocate memory
+#   gnome-shell: Failed to set hardware cursor ..., using OpenGL from now on
+# after which the pointer is simply not drawn on the affected monitor
+# (usually HDMI-1, the one wired to the NVIDIA card).
+#
+# This nudges the cursor size in gsettings and back, which makes mutter throw
+# away the broken cursor sprite and realize a fresh one, on every monitor.
+# No root, no VT bounce, no windows lost. If it does not help, run fix-screen
+# (Super+F5), which redoes a full modeset.
+
+key="org.gnome.desktop.interface cursor-size"
+cur="$(gsettings get $key)"
+tmp=$(( cur + 1 ))
+
+gsettings set $key "$tmp"
+sleep 1
+gsettings set $key "$cur"
+
+echo "cursor sprite re-realized (size $cur)."
+echo "still missing? press Super+F5 (fix-screen) for a full display reset."
