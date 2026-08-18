@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# makefast - find and fix whatever is making this laptop slow, in one command.
+#
+# Every check here is a real cause that actually cost this machine measurable
+# speed, in the order it was worth checking:
+#
+#   1. CPU clock       GNOME drops to power-saver on a low battery and never
+#                      restores it. 1200 MHz on a 4600 MHz chip: everything runs
+#                      at a quarter speed and NOTHING in top/free/pressure shows
+#                      it, because the box is not busy, it is just slow.
+#   2. Desktop priority session.slice ships with no cpu controller, so GNOME
+#                      Shell competes with builds and agents as equal threads.
+#   3. Abandoned servers  A dev server whose owner is gone, still burning cores
+#                      with its listening socket already closed. Invisible to
+#                      `ss`, invisible to "is it running?".
+#   4. Restart storms  A unit crash-looping on a taken port burns CPU forever
+#                      and survives reboots.
+#   5. Leaked Claude spares, then a plain report of what is actually using the
+#      machine, because sometimes the honest answer is "you have six agents".
+#
+# Usage:
+#   makefast          fix everything safe; ask once before killing anything
+#   makefast -y       never ask (for scripts / cron)
+#   makefast -n       dry run, change nothing
+#   makefast --bench  also time a single-core loop before and after
+set -uo pipefail
+
+ASK=1; DRY=0; BENCH=0
+for a in "$@"; do case "$a" in
+  -y|--yes)   ASK=0 ;;
+  -n|--dry-run) DRY=1 ;;
+  --bench)    BENCH=1 ;;
+  -h|--help)  sed -n '2,28p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  *) echo "makefast: unknown option $a (try --help)" >&2; exit 2 ;;
+esac; done
+
+if [ -t 1 ]; then
+  B=$'\e[1m'; R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; D=$'\e[2m'; X=$'\e[0m'
+else B=; R=; G=; Y=; D=; X=; fi
+
+FIXED=0; ISSUES=0; NOTES=0
+hdr()  { printf '\n%s%s%s\n' "$B" "$1" "$X"; }
+ok()   { printf '  %s.%s %s\n' "$G" "$X" "$1"; }
+fix()  { printf '  %s✔%s %s\n' "$G" "$X" "$1"; FIXED=$((FIXED+1)); }
+warn() { printf '  %s!%s %s\n' "$Y" "$X" "$1"; ISSUES=$((ISSUES+1)); }
+note() { printf '  %s-%s %s\n' "$D" "$X" "$1"; NOTES=$((NOTES+1)); }
+info() { printf '    %s%s%s\n' "$D" "$1" "$X"; }
+would() { [ "$DRY" = 1 ] && { printf '  %s~%s would: %s\n' "$Y" "$X" "$1"; return 0; }; return 1; }
+
+confirm() { # confirm "question"  -> 0 yes
+  [ "$DRY" = 1 ] && return 1
+  [ "$ASK" = 0 ] && return 0
+  [ -t 0 ] || return 1
+  local r; read -r -p "    ${B}$1${X} [y/N] " r </dev/tty || return 1
+  [ "$r" = y ] || [ "$r" = Y ]
+}
+
+bench() { python3 -c "
+import time
+t=time.perf_counter()
+x=0
+for i in range(4000000): x=(x*31+i)&0xffffffff
+print('%.3f' % (time.perf_counter()-t))
+" 2>/dev/null || echo "n/a"; }
+
+peak_mhz() { grep '^cpu MHz' /proc/cpuinfo | awk '{if($4>m)m=$4} END{printf "%.0f",m}'; }
+
+BEFORE=""
+[ "$BENCH" = 1 ] && { BEFORE=$(bench); }
+
+# ─────────────────────────────────────────────────────────── 1. CPU clock
+hdr "CPU clock"
+AC=""
+for f in /sys/class/power_supply/*/online; do
+  [ "$(cat "$(dirname "$f")/type" 2>/dev/null)" = "Mains" ] && AC=$(cat "$f" 2>/dev/null) && break
+done
+MAXKHZ=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0)
+
+if command -v powerprofilesctl >/dev/null 2>&1; then
+  PROF=$(powerprofilesctl get 2>/dev/null)
+  if [ "$PROF" = "power-saver" ] && [ "$AC" = "1" ]; then
+    if ! would "powerprofilesctl set balanced"; then
+      if powerprofilesctl set balanced 2>/dev/null; then
+        sleep 1
+        fix "profile was ${R}power-saver${X} while plugged in -> ${G}balanced${X}"
+        info "this is the big one: GNOME drops it on a low battery and never restores it"
+      else warn "could not change the power profile"; fi
+    fi
+  elif [ "$PROF" = "power-saver" ]; then
+    warn "profile is power-saver (on battery, so leaving it alone)"
+  else
+    ok "profile: $PROF"
+  fi
+fi
+
+EPP=$(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null)
+[ "$EPP" = "power" ] && [ "$AC" = "1" ] && warn "energy-performance preference is 'power' (max saving) while on AC"
+
+NT=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null)
+MP=$(cat /sys/devices/system/cpu/intel_pstate/max_perf_pct 2>/dev/null)
+if [ "${NT:-0}" = "1" ] || { [ -n "${MP:-}" ] && [ "$MP" -lt 100 ] 2>/dev/null; }; then
+  warn "turbo disabled or max_perf_pct capped at ${MP:-?}% (needs root)"
+  if ! would "restore turbo via pkexec"; then
+    if confirm "restore full turbo? (asks for your password)"; then
+      pkexec sh -c 'echo 0 > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null;
+                    echo 100 > /sys/devices/system/cpu/intel_pstate/max_perf_pct 2>/dev/null' \
+        && fix "turbo restored"
+    fi
+  fi
+fi
+
+# Thermal, so a genuinely hot machine is not mistaken for a misconfigured one.
+PKG=$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count 2>/dev/null || echo 0)
+TEMP=$(( $(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -rn | head -1 || echo 0) / 1000 ))
+UP=$(cut -d. -f1 /proc/uptime)
+if [ "${PKG:-0}" -gt 0 ] && [ "$UP" -gt 0 ]; then
+  RATE=$(( PKG * 3600 / UP ))            # throttle events per hour
+  if [ "$RATE" -ge 10 ]; then
+    warn "thermal throttling ${B}$RATE times/hour${X} (${PKG} since boot), now ${TEMP}C"
+    info "software cannot fix this: it is dust in the vents, or thermal paste"
+  else
+    note "throttled $PKG times since boot (${RATE}/h, now ${TEMP}C) - occasional, not a problem yet"
+  fi
+fi
+ok "clock now ${B}$(peak_mhz) MHz${X} of $((MAXKHZ/1000)) MHz max"
+
+# ────────────────────────────────────────────────── 2. desktop CPU priority
+hdr "Desktop priority"
+SS=/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/session.slice
+SHELL_CG=$(find "$SS" -maxdepth 1 -name 'org.gnome.Shell*' 2>/dev/null | head -1)
+if [ -n "$SHELL_CG" ]; then
+  W=$(cat "$SHELL_CG/cpu.weight" 2>/dev/null)
+  if [ -z "$W" ]; then
+    if ! would "systemctl --user daemon-reload to apply the priority drop-ins"; then
+      systemctl --user daemon-reload 2>/dev/null; sleep 1
+      W=$(cat "$SHELL_CG/cpu.weight" 2>/dev/null)
+      if [ -n "$W" ]; then fix "re-applied desktop CPU priority (weight $W)"
+      else warn "GNOME Shell has no cpu.weight: drop-in missing, run linux-setup/memory-swap/install-user.sh"; fi
+    fi
+  elif [ "$W" -lt 1000 ] 2>/dev/null; then
+    warn "GNOME Shell cpu.weight is only $W (expected 10000)"
+  else
+    ok "GNOME Shell cpu.weight $W, stall $(awk '/some/{print $2}' "$SHELL_CG/cpu.pressure" 2>/dev/null)"
+  fi
+fi
+
+# ─────────────────────────────────────────── 3. abandoned / runaway processes
+hdr "Runaway processes"
+SAMPLE=2
+declare -A T0
+for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+  s=$(awk '{print $14+$15}' "/proc/$p/stat" 2>/dev/null) && T0[$p]=$s
+done
+sleep "$SAMPLE"
+
+# never touch our own ancestry
+declare -A SELF; q=$$
+while [ "${q:-0}" -gt 1 ] 2>/dev/null; do SELF[$q]=1; q=$(awk '/^PPid:/{print $2}' "/proc/$q/status" 2>/dev/null); done
+
+SAFE='gnome-shell|Xwayland|pipewire|wireplumber|gdm|systemd|dbus|kwin|mutter|plasmashell|gsd-'
+SERVER='uvicorn|gunicorn|hypercorn|vite|next-server|webpack|nodemon|http\.server|flask|rails|ng serve'
+
+hogs=""; abandoned=""
+for p in "${!T0[@]}"; do
+  [ -n "${SELF[$p]:-}" ] && continue
+  [ -r "/proc/$p/stat" ] || continue
+  t1=$(awk '{print $14+$15}' "/proc/$p/stat" 2>/dev/null) || continue
+  pct=$(( (t1 - ${T0[$p]}) * 100 / (SAMPLE * 100) ))
+  [ "$pct" -lt 50 ] && continue
+  cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | cut -c1-95); [ -z "$cmd" ] && continue
+  comm=$(cat "/proc/$p/comm" 2>/dev/null)
+  echo "$comm" | grep -qE "$SAFE" && continue
+  cg=$(sed 's|.*/||' "/proc/$p/cgroup" 2>/dev/null)
+
+  # systemd-managed? leave it: it has caps and an owner.
+  case "$cg" in *.service) continue ;; esac
+
+  # An abandoned server: looks like a dev server, burning CPU, but has no
+  # listening socket. It is serving nobody and cannot be reached. This is the
+  # exact shape of a stuck shutdown that outlived the agent that started it.
+  if echo "$cmd" | grep -qE "$SERVER"; then
+    if ! ss -ltnpH 2>/dev/null | grep -q "pid=$p,"; then
+      abandoned+="$p|$pct|$cmd"$'\n'; continue
+    fi
+  fi
+  [ "$pct" -ge 200 ] && hogs+="$p|$pct|$cmd"$'\n'
+done
+
+if [ -n "$abandoned" ]; then
+  warn "abandoned server(s) burning CPU with no listening socket:"
+  while IFS='|' read -r p pct cmd; do [ -z "$p" ] && continue
+    printf '      %spid %-7s %4s%% of a core%s  %s\n' "$D" "$p" "$pct" "$X" "${cmd:0:70}"
+  done <<< "$abandoned"
+  if ! would "kill the abandoned server(s)"; then
+    if confirm "kill them? (they serve nothing)"; then
+      n=0; while IFS='|' read -r p _ _; do [ -z "$p" ] && continue
+        kill -TERM "$p" 2>/dev/null; n=$((n+1)); done <<< "$abandoned"
+      sleep 3
+      while IFS='|' read -r p _ _; do [ -z "$p" ] && continue
+        kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null; done <<< "$abandoned"
+      fix "killed $n abandoned server process(es)"
+    fi
+  fi
+else
+  ok "no abandoned servers"
+fi
+
+if [ -n "$hogs" ]; then
+  note "busy right now, but alive and owned (not touching them):"
+  while IFS='|' read -r p pct cmd; do [ -z "$p" ] && continue
+    printf '      %spid %-7s %4s%% of a core%s  %s\n' "$D" "$p" "$pct" "$X" "${cmd:0:70}"
+  done <<< "$hogs"
+fi
+
+# Permanent low-level burn: cheap per second, enormous per day. This is how an
+# always-on widget cost 59% of a core around the clock without ever showing up
+# as a spike.
+hdr "Always-on burn"
+found=0
+for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+  age=$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' '); [ -z "$age" ] && continue
+  [ "$age" -lt 1800 ] 2>/dev/null && continue
+  t=$(awk '{print $14+$15}' "/proc/$p/stat" 2>/dev/null) || continue
+  pct=$(( t / age ))          # ticks/sec == % of one core
+  [ "$pct" -lt 25 ] && continue
+  comm=$(cat "/proc/$p/comm" 2>/dev/null)
+  # gnome-shell and Xwayland always sit here; they are the desktop, not a leak.
+  echo "$comm" | grep -qE "$SAFE" && continue
+  printf '      %s%3s%% of a core for %sh%s  %s\n' "$D" "$pct" "$((age/3600))" "$X" "$comm"
+  found=$((found+1))
+done
+if [ "$found" = 0 ]; then ok "nothing burning a core in the background"
+else
+  NOTES=$((NOTES+1))
+  info "cheap per second, enormous per day: this is battery and heat all day long"
+fi
+
+# ───────────────────────────────────────────────────────── 4. restart storms
+hdr "Restart storms"
+storm=0
+while read -r u; do
+  [ -z "$u" ] && continue
+  n=$(systemctl --user show "$u" -p NRestarts --value 2>/dev/null)
+  [ -n "$n" ] && [ "$n" -ge 5 ] 2>/dev/null || continue
+  if [ "$(systemctl --user is-active "$u" 2>/dev/null)" = "active" ]; then
+    # still going round: every attempt costs real CPU, forever, across reboots
+    warn "$u has restarted $n times and is STILL looping (this burns CPU forever)"
+    storm=1
+  fi
+done < <(systemctl --user list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{print $1}')
+[ "$storm" = 0 ] && ok "no unit is crash-looping"
+
+# A unit that gave up costs nothing, but something you rely on is silently off.
+failed=$(systemctl --user list-units --state=failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+if [ -n "${failed// /}" ]; then
+  warn "dead units (not burning CPU, but they are off): $(echo $failed | tr '\n' ' ')"
+  if ! would "restart the dead unit(s)"; then
+    if confirm "try restarting them?"; then
+      n=0; total=0
+      for u in $failed; do
+        total=$((total+1))
+        systemctl --user reset-failed "$u" 2>/dev/null
+        systemctl --user restart "$u" 2>/dev/null
+        sleep 1
+        [ "$(systemctl --user is-active "$u" 2>/dev/null)" = "active" ] && { fix "$u is back up"; n=$((n+1)); } \
+          || warn "$u still will not start (journalctl --user -u $u)"
+      done
+      # everything that was warned about came back, so it is no longer your problem
+      [ "$n" = "$total" ] && ISSUES=$((ISSUES-1))
+      [ "$n" = 0 ] && info "nothing came back; these need a real look, not a retry"
+    fi
+  fi
+else
+  ok "no dead units"
+fi
+
+# ─────────────────────────────────────────────────────────── 5. Claude spares
+hdr "Claude Code"
+if command -v claude-spare-reaper >/dev/null 2>&1; then
+  if ! would "run claude-spare-reaper"; then
+    out=$(claude-spare-reaper 2>&1 | tail -1)
+    case "$out" in *"no orphaned"*) ok "no leaked spares" ;; *) fix "$out" ;; esac
+  fi
+fi
+if command -v claude-status >/dev/null 2>&1; then
+  act=$(claude-status 2>/dev/null | sed -n 2p | grep -oE '^[[:space:]]*[0-9]+' | tr -d ' ')
+  rss=$(ps -eo rss,args --no-headers 2>/dev/null | grep -E "claude/versions|claude bg-|claude attach" | grep -v grep \
+        | awk '{s+=$1} END {printf "%.1f", s/1024/1024}')
+  if [ -n "${act:-}" ] && [ "$act" -gt 0 ] 2>/dev/null; then
+    [ "$act" -ge 4 ] && note "$act Claude agents active, using ${rss} GB" \
+                     || ok "$act Claude agent(s) active, ${rss} GB"
+    [ "$act" -ge 4 ] && info "each active agent is ~700 MB. this is not a leak, it is the workload"
+  fi
+fi
+
+# ───────────────────────────────────────────────────────────── 6. the report
+hdr "Where the machine is now"
+read -r l1 l5 l15 _ < /proc/loadavg
+printf '  load %s (%s cores)   cpu pressure %s   mem pressure %s\n' \
+  "$l1" "$(nproc)" "$(awk '/some/{print $2}' /proc/pressure/cpu | cut -d= -f2)" \
+  "$(awk '/some/{print $2}' /proc/pressure/memory | head -1 | cut -d= -f2)"
+free -h | awk '/^Mem:/{printf "  RAM %s used of %s, %s available\n",$3,$2,$7} /^Swap:/{printf "  swap %s of %s used\n",$3,$2}'
+
+if [ "$BENCH" = 1 ]; then
+  AFTER=$(bench)
+  printf '\n  single-core loop: %s s -> %s%s s%s\n' "$BEFORE" "$B" "$AFTER" "$X"
+fi
+
+echo
+if [ "$FIXED" -gt 0 ] || [ "$ISSUES" -gt 0 ]; then
+  [ "$FIXED"  -gt 0 ] && printf '%s%s fixed.%s ' "$G" "$FIXED" "$X"
+  [ "$ISSUES" -gt 0 ] && printf '%s%s need you.%s' "$Y" "$ISSUES" "$X"
+  [ "$ISSUES" = 0 ] && printf 'Nothing else wrong.'
+  echo
+elif [ "$NOTES" -gt 0 ]; then
+  printf '%sNothing wrong. %s thing(s) noted above, none need doing.%s\n' "$G" "$NOTES" "$X"
+else
+  printf '%sNothing wrong. The machine is as fast as it gets.%s\n' "$G" "$X"
+fi
+[ "$DRY" = 1 ] && echo "(dry run: nothing was changed)"
+exit 0
