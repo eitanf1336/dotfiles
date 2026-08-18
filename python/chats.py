@@ -60,11 +60,13 @@ Command line:
                            project names and folders (case-insensitive, prefix or
                            substring): a display name, a folder basename, a path,
                            or `all` for the unfiltered board.
-  chats.py --new [proj]    skip the board — create a background chat in `proj`
-                           (default: the System project, i.e. the home folder)
-                           and attach to it immediately. Ctrl+Z out of the chat
-                           lands on the board, in that project. This is what
-                           Ctrl+Alt+Y runs (see ~/bin/claude-new-chat).
+  chats.py <proj> -n       skip the board — create a background chat in `proj`
+  chats.py --new [proj]    and attach to it immediately (default project: System,
+                           i.e. the home folder). Ctrl+Z out of the chat lands on
+                           the board, in that project. This is exactly what
+                           Ctrl+Alt+Y runs (see ~/bin/claude-new-chat). The flag
+                           may come before or after the project name, so
+                           `claude-c system -n` == `claude-c -n system`.
   chats.py --list          print every project the CLI can be pointed at
 """
 
@@ -2709,8 +2711,11 @@ def main():
 
     # Command line:
     #   claude-c <project>          open the board straight in that project
-    #   claude-c --new [<project>]  skip the board: create a fresh background chat
-    #                               in that project and attach to it right away.
+    #   claude-c <project> -n       skip the board: create a fresh background chat
+    #   claude-c -n [<project>]     in that project and attach to it right away.
+    # The flags are position-free on purpose: `claude-c system -n` and
+    # `claude-c -n system` do the same thing, because the natural way to type it
+    # is to name the project first and only then decide you want a new chat.
     # The project is free text — a display name ("system", "technion"), a folder
     # basename, a path, or "all" for the unfiltered board — resolved against the
     # same project list the P panel shows. Ctrl+Z out of the chat lands on the
@@ -2719,22 +2724,29 @@ def main():
     boot_new = False
     boot_project = str(HOME)
     proj_arg = None
-    if argv and argv[0] in ("--new", "-n", "--new-chat"):
-        boot_new = True
-        rest = " ".join(a for a in argv[1:] if a).strip()
-        proj_arg = rest or None
-    elif argv and argv[0] in ("-h", "--help", "help"):
+
+    NEW_FLAGS = ("--new", "-n", "--new-chat")
+    HELP_FLAGS = ("-h", "--help", "help")
+    LIST_FLAGS = ("-l", "--list", "--projects")
+
+    if any(a in HELP_FLAGS for a in argv):
         print(__doc__.strip())
         return
-    elif argv and argv[0] in ("-l", "--list", "--projects"):
+    if any(a in LIST_FLAGS for a in argv):
         for key, name in sorted(project_candidates(deep=True),
                                 key=lambda kn: kn[1].lower()):
             print(f"{name:<24} {key}")
         return
-    elif argv and not argv[0].startswith("-"):
-        # Unquoted multi-word names ("claude-c my project") arrive as separate
-        # argv entries; join them back before matching.
-        proj_arg = " ".join(argv).strip()
+
+    boot_new = any(a in NEW_FLAGS for a in argv)
+    rest = [a for a in argv if a and a not in NEW_FLAGS]
+    unknown = [a for a in rest if a.startswith("-") and a != "-"]
+    if unknown:
+        print(f"Unknown option: {unknown[0]}   (try `claude-c --help`)")
+        sys.exit(2)
+    # Unquoted multi-word names ("claude-c my project") arrive as separate
+    # argv entries; join them back before matching.
+    proj_arg = " ".join(rest).strip() or None
 
     boot_view = _KEEP_PROJECT
     if proj_arg:
