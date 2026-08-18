@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# power-profile-auto: put the CPU back to full speed when the charger goes in.
+#
+# THE BUG THIS FIXES
+# GNOME's `power-saver-profile-on-low-battery` (gsettings, default true) flips
+# power-profiles-daemon to "power-saver" when the battery runs low. It never
+# flips it back. Plug the laptop in, and the profile silently stays on
+# power-saver: EPP=power, every core pinned near 1200 MHz on a chip rated
+# 4600 MHz. Measured cost on this i7-12700H: the same single-core loop took
+# 1.35 s on power-saver and 0.54 s on balanced. Everything feels broken and
+# nothing in top, free or the pressure files explains why, because the machine
+# is not busy, it is just slow.
+#
+# DESIGN: edge-triggered, never level-triggered.
+# It acts ONLY on a battery -> AC transition (plus once at startup), and only
+# when the current profile is actually "power-saver". So a profile you chose
+# yourself, including deliberately picking power-saver while plugged in, is
+# left alone until the next time you physically plug the charger in.
+# Unplugging is not touched at all: GNOME's low-battery rule already owns that.
+set -uo pipefail
+
+AC=/sys/class/power_supply/ADP0/online
+TARGET=${POWER_PROFILE_ON_AC:-balanced}
+INTERVAL=${POWER_PROFILE_POLL:-5}
+
+[ -r "$AC" ] || { echo "no AC adapter at $AC; nothing to watch"; exit 0; }
+
+restore_if_saving() {
+  local cur
+  cur=$(powerprofilesctl get 2>/dev/null) || return 0
+  [ "$cur" = "power-saver" ] || return 0          # respect a deliberate choice
+  powerprofilesctl set "$TARGET" 2>/dev/null \
+    && echo "on AC and profile was power-saver -> set $TARGET"
+}
+
+prev=$(cat "$AC" 2>/dev/null || echo 0)
+# Startup: covers boot, and covers logging in already plugged in but stuck.
+[ "$prev" = "1" ] && restore_if_saving
+
+while :; do
+  sleep "$INTERVAL"
+  now=$(cat "$AC" 2>/dev/null) || continue
+  if [ "$now" = "1" ] && [ "$prev" != "1" ]; then
+    restore_if_saving                             # charger just went in
+  fi
+  prev=$now
+done

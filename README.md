@@ -75,6 +75,7 @@ In `bin/` (installed to `~/.local/bin`):
 - `rotate-bg.timer` + `rotate-bg.service` advance the wallpaper/terminal theme automatically every day at midnight.
 - `git-morning-check.timer` + `git-morning-check.service` run the git pending-work check every day at 08:00.
 - `power-menu-rescue.service` rescues a restart/power-off that GNOME blocked on its own inhibitor lock (see `polkit/README.md`).
+- `power-profile-auto.service` puts the CPU back to full speed when the charger goes in. GNOME's `power-saver-profile-on-low-battery` drops power-profiles-daemon to `power-saver` on a low battery and **never restores it**, so the machine silently runs at ~1200 MHz on a 4600 MHz chip long after being plugged back in. Nothing in `top`, `free` or the pressure files explains it, because the box is not busy, it is just slow (measured: a single-core loop took 1.35 s on power-saver vs 0.54 s on balanced). Edge-triggered on battery -> AC only, and only when the current profile really is `power-saver`, so a profile you picked yourself is never stomped.
 
 ## 🔊 Audio
 

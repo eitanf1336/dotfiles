@@ -1,0 +1,17 @@
+[Unit]
+Description=Restore the balanced power profile when the charger is plugged in
+Documentation=man:powerprofilesctl(1)
+After=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/power-profile-auto
+Restart=always
+RestartSec=10
+# It is a 5-second poll of one sysfs file. Keep it out of the way entirely.
+CPUWeight=10
+Nice=10
+MemoryHigh=32M
+
+[Install]
+WantedBy=default.target

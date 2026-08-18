@@ -1,8 +1,8 @@
-# memory-swap: stop the OOM crashes, freezes and desktop stutter on the 16 GB machine
+# memory-swap: stop the OOM crashes, freezes, stutter and slowness on this laptop
 
 The laptop has 16 GB RAM. It was OOM-killing Chrome constantly, sometimes
 thrashing into a hard freeze that needed a power-cycle, and even with RAM to
-spare it felt sluggish next to Windows. Three separate causes, all fixed here
+spare it felt sluggish next to Windows. Four separate causes, all fixed here
 (2026-07-12, 2026-07-15 and 2026-08-19).
 
 ## Cause 1: swap was far too small
@@ -122,6 +122,40 @@ If `cpu.weight` does not exist, the cpu controller is not delegated and every
   unbounded ONNX scoring loop: 12 of 20 threads and 1.9 GB, invisible to every
   "is anything listening?" check. `CPUQuota=` on the service bounds this class of
   bug permanently.
+
+## Cause 4: the CPU was pinned at a quarter speed (2026-08-19)
+
+The one that survived all three fixes above, and the one that actually felt worst.
+
+GNOME's `power-saver-profile-on-low-battery` (gsettings, default **true**) flips
+power-profiles-daemon to `power-saver` when the battery runs low. **It never
+flips it back.** Plug the laptop in and the profile stays there: `EPP=power`,
+all 20 cores pinned at **1200 MHz on a chip rated 4600 MHz**, at 69 C with
+`core_throttle_count=0`. Not thermal, not load, not memory.
+
+This is invisible to every normal check. `top`, `free`, `/proc/pressure/*` and
+`uptime` all look healthy, because the machine genuinely is not busy. It is just
+running at a quarter speed. Measured with the same single-core loop:
+
+| profile | time | clock under load |
+|---|---|---|
+| `power-saver` | 1.35 s | 1100 MHz (no boost at all) |
+| `balanced` | **0.54 s** | 2804 MHz |
+
+**Always check this first when "it is slow" and nothing is loaded:**
+
+```bash
+powerprofilesctl get
+grep '^cpu MHz' /proc/cpuinfo | head -3
+cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference
+```
+
+`bin/power-profile-auto` + `systemd/power-profile-auto.service` supply the half
+GNOME is missing: on a battery -> AC transition (and once at startup), if the
+profile is `power-saver`, set it back to `balanced`. It is **edge-triggered, not
+level-triggered**, and only touches `power-saver`, so choosing a profile yourself
+(including power-saver while plugged in) sticks until you physically replug.
+Unplugging is left entirely alone, since GNOME's low-battery rule owns that.
 
 ## Reproduce (fresh machine)
 

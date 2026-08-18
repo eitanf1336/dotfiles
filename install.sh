@@ -80,6 +80,7 @@ done
 # Units that are not timer-driven still need enabling explicitly.
 systemctl --user enable --now media-keep-awake.service 2>/dev/null || true
 systemctl --user enable --now power-menu-rescue.service 2>/dev/null || true
+systemctl --user enable --now power-profile-auto.service 2>/dev/null || true
 
 # power-menu-rescue is useless without its polkit rule (see polkit/README.md):
 # without it `systemctl reboot -i` asks for a password the service cannot type,
