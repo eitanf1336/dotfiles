@@ -52,7 +52,7 @@ while [ $# -gt 0 ]; do
     -n|--dry-run)  DRYRUN=1; shift;;
     --cancel)      MODE=cancel; shift;;
     --status)      MODE=status; shift;;
-    -h|--help)     sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    -h|--help)     sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) die "unknown option: $1 (try --help)";;
   esac
 done
