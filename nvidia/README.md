@@ -113,3 +113,41 @@ PipeWire. Companion to the D3cold fix above.
 sudo cp etc/udev/rules.d/90-nvidia-hdmi-audio-no-suspend.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 ```
+
+## Screens black after every resume (2026-08-19)
+
+Both Dell 27" panels on the dock came back dark from every suspend and only
+returned after physically unplugging and replugging the USB-C cable. The journal
+says it in one line, twice, once per dead screen:
+
+```
+gnome-shell[…]: Failed to create KMS output: No modes available
+```
+
+The two panels are MST children of the NVIDIA GPU (`card2-DP-6`, `card2-DP-7`;
+`card2-HDMI-A-1` and the built-in `card1-eDP-1` are unaffected). On resume mutter
+probes them before the DisplayPort link has finished coming up, the connector
+answers "connected, zero modes", and mutter gives up on that output and never
+looks again. Replugging works only because it fires a fresh hotplug event.
+
+It is not tied to a failed suspend: it happened on the clean 3.5-hour sleep too.
+
+### The fix
+
+`usr/local/sbin/reprobe-displays`, fired on resume by
+`usr/lib/systemd/system-sleep/95-reprobe-displays`. It looks for connectors that
+are `connected` with an empty `modes` file and writes `detect` to their sysfs
+`status`, which makes DRM re-probe the connector (re-reading the EDID) and emit
+the hotplug event mutter is waiting for. Verified that the NVIDIA DRM driver
+accepts that write. It retries for ~20s and touches nothing that already has
+modes, so a healthy resume is a silent no-op.
+
+`install.sh` puts both files in place via pkexec. Check it is live with:
+
+```bash
+ls -l /usr/local/sbin/reprobe-displays /usr/lib/systemd/system-sleep/95-reprobe-displays
+journalctl -u reprobe-displays.service -b        # what it did on the last resume
+```
+
+Manual escape hatches if it ever gives up: `Super+F5` (`fix-screen`, bounces the
+VT and forces a full modeset), or replug the dock.

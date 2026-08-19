@@ -101,6 +101,28 @@ else
     echo "      $REPO/polkit/etc/polkit-1/rules.d/49-force-shutdown-ignore-inhibit.rules /etc/polkit-1/rules.d/"
 fi
 
+# Every resume leaves the dock's two monitors "connected" with no modes, i.e.
+# black until the cable is replugged (nvidia/README.md, "Screens black after
+# every resume"). The repair has to run as root, so it goes in with pkexec too.
+echo "==> post-resume monitor repair (reprobe-displays)"
+if cmp -s "$REPO/nvidia/usr/local/sbin/reprobe-displays" /usr/local/sbin/reprobe-displays &&
+   cmp -s "$REPO/nvidia/usr/lib/systemd/system-sleep/95-reprobe-displays" \
+          /usr/lib/systemd/system-sleep/95-reprobe-displays; then
+    echo "    already installed"
+elif pkexec sh -c '
+        install -m 0755 -o root -g root "$1/nvidia/usr/local/sbin/reprobe-displays" \
+                /usr/local/sbin/reprobe-displays &&
+        install -m 0755 -o root -g root "$1/nvidia/usr/lib/systemd/system-sleep/95-reprobe-displays" \
+                /usr/lib/systemd/system-sleep/95-reprobe-displays' sh "$REPO"; then
+    echo "    installed /usr/local/sbin/reprobe-displays + its system-sleep hook"
+else
+    echo "    NOT installed — the external screens will keep coming back black."
+    echo "    Run it by hand:"
+    echo "      sudo install -m 0755 $REPO/nvidia/usr/local/sbin/reprobe-displays /usr/local/sbin/"
+    echo "      sudo install -m 0755 $REPO/nvidia/usr/lib/systemd/system-sleep/95-reprobe-displays \\"
+    echo "           /usr/lib/systemd/system-sleep/"
+fi
+
 echo "==> autostart entries -> $AUTOSTART"
 for f in "$REPO"/autostart/*.desktop; do
     ln -sf "$f" "$AUTOSTART/$(basename "$f")"

@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# reprobe-displays — bring back the monitors that come out of suspend
+# "connected" but with an empty mode list.
+#
+# THE SYMPTOM: after every resume, the two Dell 27" panels on the dock stay
+# black until the USB-C cable is unplugged and plugged back in. In the journal:
+#
+#   gnome-shell[…]: Failed to create KMS output: No modes available
+#   gnome-shell[…]: Failed to create KMS output: No modes available
+#
+# (exactly two, once per dead screen). Both hang off the NVIDIA GPU as
+# card2-DP-6 / card2-DP-7. Mutter probes them the instant the machine resumes,
+# the DP link is not up yet, the connector answers "connected, zero modes", and
+# mutter gives up and never looks again — so the screens are dark even though
+# the kernel thinks a monitor is there. Replugging works because it fires a
+# fresh hotplug event, which is the only thing that makes mutter re-probe.
+#
+# THE FIX: do the replug's job in software. Writing "detect" to a connector's
+# sysfs status makes DRM re-probe it (re-reading the EDID over the link) and
+# then emit a hotplug event, so mutter comes back and picks up the modes.
+#
+# Runs as root, detached, from /usr/lib/systemd/system-sleep/95-reprobe-displays.
+# It only ever touches connectors that are connected AND have no modes, so on a
+# resume where everything came back properly it does nothing at all.
+set -u
+
+ROUNDS=${REPROBE_ROUNDS:-6}     # how many (poke, wait) rounds before giving up
+PAUSE=${REPROBE_PAUSE:-3}       # seconds between them
+
+log() { printf 'reprobe-displays: %s\n' "$*"; }
+
+# Connectors that claim a monitor but cannot offer it a single mode.
+dead_outputs() {
+  local s d n
+  for s in /sys/class/drm/card*-*/status; do
+    d=${s%/status}; n=${d##*/}
+    case "$n" in *DVI-I-*) continue;; esac   # evdi's virtual stubs, never real
+    [ "$(cat "$s" 2>/dev/null)" = connected ] || continue
+    [ -s "$d/modes" ] && continue
+    printf '%s\n' "$d"
+  done
+}
+
+names() { local d; for d in "$@"; do printf '%s ' "${d##*/}"; done; }
+
+mapfile -t bad < <(dead_outputs)
+[ "${#bad[@]}" -eq 0 ] && exit 0        # nothing came back broken; stay quiet
+
+log "connected but modeless after resume: $(names "${bad[@]}")"
+
+for (( round = 1; round <= ROUNDS; round++ )); do
+  # First round is a grace period: give the link a chance to finish coming up
+  # on its own before poking it, since a probe mid-negotiation is wasted.
+  if [ "$round" -gt 1 ]; then
+    for d in "${bad[@]}"; do
+      # Braces so bash's own "permission denied" for the redirect is swallowed
+      # too, not just the command's stderr.
+      { echo detect > "$d/status"; } 2>/dev/null ||
+        log "could not write $d/status (need root?)"
+    done
+  fi
+  sleep "$PAUSE"
+
+  mapfile -t bad < <(dead_outputs)
+  if [ "${#bad[@]}" -eq 0 ]; then
+    log "all outputs have modes again after $round round(s)"
+    exit 0
+  fi
+done
+
+log "STILL modeless after $((ROUNDS * PAUSE))s: $(names "${bad[@]}")"
+log "replug the dock, or press Super+F5 (fix-screen)"
+exit 1

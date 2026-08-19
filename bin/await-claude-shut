@@ -20,6 +20,11 @@
 # During the grace countdown, press Ctrl+C to cancel. If Claude starts
 # working again mid-countdown, the shutdown auto-aborts and it resumes waiting.
 #
+# A suspend that bounces straight back out (the machine sleeps for a couple of
+# seconds and then wakes itself) is retried rather than reported as success;
+# $AWAIT_CLAUDE_SHUT_TRIES (3) and $AWAIT_CLAUDE_SHUT_BOUNCE (20 seconds) tune
+# how many attempts, and how short a nap counts as a bounce.
+#
 # Everything it does is also appended to ~/.local/state/await-claude-shut.log,
 # so a run that ended in a closed window can still be diagnosed afterwards.
 set -uo pipefail
@@ -47,7 +52,7 @@ while [ $# -gt 0 ]; do
     -n|--dry-run)  DRYRUN=1; shift;;
     --cancel)      MODE=cancel; shift;;
     --status)      MODE=status; shift;;
-    -h|--help)     sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    -h|--help)     sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) die "unknown option: $1 (try --help)";;
   esac
 done
@@ -158,6 +163,158 @@ suspended_since() {
   journalctl -k --since "@$1" -o cat 2>/dev/null | grep -q "PM: suspend entry"
 }
 
+# Wait for the machine to actually go under, and report how long it stayed
+# there. We are frozen for the whole nap, so a `sleep 2` that took a lot longer
+# than two seconds IS the nap: a measurement that survives the suspend, which a
+# journal timestamp does not (journald is frozen too, so every kernel line from
+# the sleep path is stamped with the moment of the *resume*).
+#   echoes the seconds slept; returns 1 if it never went under in time.
+watch_for_sleep() {
+  local t0=$1 waited=0 a b gap
+  # Test hook, like $AWAIT_CLAUDE_SHUT_SYSTEMCTL: claim the machine slept for N
+  # seconds ("none" = it never went under), so the bounce/retry path can be
+  # exercised without actually suspending anything.
+  if [ -n "${AWAIT_CLAUDE_SHUT_FAKE_SLEEP:-}" ]; then
+    [ "$AWAIT_CLAUDE_SHUT_FAKE_SLEEP" = none ] && return 1
+    echo "$AWAIT_CLAUDE_SHUT_FAKE_SLEEP"; return 0
+  fi
+  while [ "$waited" -lt 25 ]; do
+    a=$(date +%s); sleep 2; b=$(date +%s)
+    gap=$(( b - a )); waited=$(( waited + 2 ))
+    [ "$gap" -gt 3 ] && { echo "$(( gap - 2 ))"; return 0; }
+    suspended_since "$t0" && { echo 0; return 0; }
+  done
+  return 1
+}
+
+# A snapshot of the kernel's wakeup-source counters, one
+# "wakeupNN<TAB>name<TAB>count" per line. Diffing it across a suspend says who
+# did the waking. Keyed on the sysfs node, not the name: several ACPI devices
+# register two wakeup sources under the identical name (the power button and
+# the lid each have a live one and a dead one), and keying on the name silently
+# reads the dead twin's zero, which makes every source look like it just fired.
+wakeup_snapshot() {
+  local d n c
+  for d in /sys/class/wakeup/*/; do
+    n=$(cat "$d/name" 2>/dev/null) || continue
+    c=$(cat "$d/active_count" 2>/dev/null) || continue
+    printf '%s\t%s\t%s\n' "${d%/}" "$n" "$c"
+  done
+}
+
+# Which sources fired since the snapshot in $1, as "name(+n) name(+n) ".
+wakeup_since() {
+  local before=$1 k n c c0
+  [ -n "${AWAIT_CLAUDE_SHUT_FAKE_WOKE:-}" ] && { printf '%s ' "$AWAIT_CLAUDE_SHUT_FAKE_WOKE"; return 0; }
+  while IFS=$'\t' read -r k n c; do
+    [ -n "$k" ] || continue
+    c0=$(printf '%s\n' "$before" | awk -F'\t' -v k="$k" '$1==k {print $3; exit}')
+    [ "${c:-0}" -gt "${c0:-0}" ] && printf '%s(+%s) ' "$n" "$(( c - ${c0:-0} ))"
+  done < <(wakeup_snapshot)
+}
+
+# Wakeup sources that mean a person did it on purpose: the power button, the
+# lid, the built-in keyboard port, the Logitech receiver's devices. Everything
+# else waking the machine four seconds after it fell asleep is the box (or the
+# dock) talking to itself, and deserves another attempt.
+HUMAN_WAKE_RE='(^PNP0C0C|^PNP0C0D|^serio|^hidpp|[Kk]eyboard|[Mm]ouse|[Tt]ouchpad)'
+
+log_wake() {
+  local slept=$1 woke=$2 irq name
+  say "it slept for ${slept}s"
+  [ -n "$woke" ] && say "woken by: $woke"
+  irq=$(cat /sys/power/pm_wakeup_irq 2>/dev/null)
+  if [ -n "$irq" ]; then
+    name=$(grep -E "^[[:space:]]*${irq}:" /proc/interrupts 2>/dev/null | awk '{print $(NF-1), $NF}')
+    say "last wakeup IRQ: $irq ${name:+($name)}"
+  fi
+  return 0
+}
+
+# Coming out of suspend, the dock's monitors sometimes come back "connected"
+# with an empty mode list: a black screen until the cable is replugged, and
+# gnome-shell says "Failed to create KMS output: No modes available". Say so
+# out loud, so a dark screen is not mistaken for a failed suspend.
+check_outputs() {
+  local s d n dead=
+  for s in /sys/class/drm/card*-*/status; do
+    d=${s%/status}; n=${d##*/}
+    case "$n" in *DVI-I-*) continue;; esac   # evdi's virtual stubs, never real
+    [ "$(cat "$s" 2>/dev/null)" = connected ] || continue
+    [ -s "$d/modes" ] && continue
+    dead="$dead $n"
+  done
+  [ -z "$dead" ] && return 0
+  say "NOTE: these outputs came back with no modes (i.e. black):$dead"
+  if [ -x /usr/local/sbin/reprobe-displays ]; then
+    say "      the resume hook re-probes them; if they stay dark, press Super+F5."
+  else
+    say "      press Super+F5 (fix-screen), or replug the dock."
+  fi
+  notify "Screens came back blank" "No modes on:$dead - press Super+F5, or replug the dock."
+  return 0
+}
+
+# Verify a suspend that logind has already accepted.
+#   $1 t0 (epoch of the request)  $2 wakeup snapshot taken before it
+#   $3 1 if the accepted request needed -i
+# Returns 1 if the machine never went under (the caller then forces it).
+# Otherwise it always exits: 0 if the machine really slept, non-zero if it kept
+# bouncing straight back out. The retry is the whole point: the first attempt
+# is the one that gets killed by a wakeup that was already in flight, and the
+# second one almost always sticks.
+verify_suspend() {
+  local t0=$1 before=$2 forced=$3
+  local tries=${AWAIT_CLAUDE_SHUT_TRIES:-3}
+  local bounce=${AWAIT_CLAUDE_SHUT_BOUNCE:-20}
+  local attempt=1 slept woke out rc
+
+  while :; do
+    say "request accepted; waiting for the machine to actually go to sleep..."
+    slept=$(watch_for_sleep "$t0") || return 1
+
+    woke=$(wakeup_since "$before")
+    log_wake "$slept" "$woke"
+
+    if [ "$slept" -ge "$bounce" ]; then
+      say "confirmed: the system suspended, and has now resumed."
+      check_outputs
+      exit 0
+    fi
+
+    if [ -n "$woke" ] && printf '%s\n' ${woke} | grep -qE "$HUMAN_WAKE_RE"; then
+      say "...and you woke it back up yourself, so that was your call, not a dud suspend."
+      check_outputs
+      exit 0
+    fi
+
+    if [ "$attempt" -ge "$tries" ]; then
+      say "FAILED: the machine bounced straight back out of suspend $attempt times."
+      say "        Something re-arms a wakeup the moment it goes under; the sources"
+      say "        logged above are the place to start."
+      notify "Suspend keeps bouncing" \
+             "The machine woke itself $attempt times in a row. See $LOG"
+      check_outputs
+      exit 1
+    fi
+
+    attempt=$((attempt + 1))
+    say "only ${slept}s of sleep: it woke itself straight back up. Attempt $attempt of $tries..."
+    sleep 5                       # let whatever fired drain before trying again
+    before=$(wakeup_snapshot)
+    t0=$(date +%s)
+    say ">>> systemctl $ACTION (attempt $attempt)"
+    if [ "$forced" -eq 1 ]; then out=$(run_systemctl -i); else out=$(run_systemctl); fi
+    rc=$?
+    [ -n "$out" ] && say "systemctl said: $out"
+    if [ "$rc" -ne 0 ]; then
+      say "FAILED: attempt $attempt was refused (exit $rc). The machine is still awake."
+      notify "Claude suspend failed" "Retry $attempt was refused. See $LOG"
+      exit "$rc"
+    fi
+  done
+}
+
 # Run systemctl once. Echoes its output, returns its exit status.
 # Overridable so the refusal/escalation path can be tested without suspending
 # the machine (see the tests in the dotfiles repo).
@@ -177,7 +334,8 @@ do_shutdown() {
   trap - INT TERM
   log_blockers
 
-  local t0 out rc forced=0
+  local t0 out rc forced=0 wake_before
+  wake_before=$(wakeup_snapshot)
   t0=$(date +%s)
   say ">>> systemctl $ACTION"
   out=$(run_systemctl); rc=$?
@@ -212,15 +370,9 @@ do_shutdown() {
   local attempt
   for attempt in 1 2; do
     if [ "$ACTION" = suspend ]; then
-      say "request accepted; waiting for the machine to actually go to sleep…"
-      local waited=0
-      while [ "$waited" -lt 25 ]; do
-        sleep 2; waited=$((waited + 2))
-        if suspended_since "$t0"; then
-          say "confirmed: the system suspended, and has now resumed."
-          exit 0
-        fi
-      done
+      # Never returns unless the machine did not go under at all, in which case
+      # we fall through and force it with -i below.
+      verify_suspend "$t0" "$wake_before" "$forced"
     else
       # For poweroff/reboot/halt there is nothing to look for: if we are still
       # running half a minute later, it did not happen.
@@ -231,6 +383,7 @@ do_shutdown() {
     [ "$forced" -eq 1 ] && break
     say "nothing happened within the timeout. Something vetoed it; forcing with -i…"
     log_blockers
+    wake_before=$(wakeup_snapshot)
     t0=$(date +%s); forced=1
     out=$(run_systemctl -i); rc=$?
     [ -n "$out" ] && say "systemctl -i said: $out"

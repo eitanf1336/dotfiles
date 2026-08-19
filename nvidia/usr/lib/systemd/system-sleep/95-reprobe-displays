@@ -1,0 +1,15 @@
+#!/bin/sh
+# Fire the post-resume monitor repair (see /usr/local/sbin/reprobe-displays).
+#
+# Detached on purpose: system-sleep scripts run inline in the resume path, and
+# this one deliberately waits several seconds for the DP link to settle. Doing
+# that inline would hold up everything else that wants to run on resume.
+[ "$1" = post ] || exit 0
+
+systemd-run --no-block --collect --quiet \
+    --unit=reprobe-displays \
+    --description="Re-probe monitors that came back from suspend with no modes" \
+    /usr/local/sbin/reprobe-displays >/dev/null 2>&1 ||
+  setsid /usr/local/sbin/reprobe-displays >/dev/null 2>&1 &
+
+exit 0
