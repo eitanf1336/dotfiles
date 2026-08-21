@@ -117,6 +117,36 @@ def fallback_stop():
 def _bin(name): return os.path.join(HOME_BIN, name)
 def brightness(pct):
     if os.path.exists(_bin("brightness")): _run([_bin("brightness"), str(int(pct))], 5)
+
+# The ramp starts by dimming the screens to 15%. If the engine ever dies without
+# putting that back, the user is left staring at a near-black desktop with no idea
+# why -- so the pre-alarm level is saved up front and restored on every exit path.
+BRI_SCHEMA = "org.gnome.shell.extensions.displaylink-nightlight"
+BRI_SCHEMA_DIR = os.path.expanduser(
+    "~/.local/share/gnome-shell/extensions/displaylink-nightlight@eitan.local/schemas")
+def get_brightness_pct():
+    env = dict(os.environ, GSETTINGS_SCHEMA_DIR=BRI_SCHEMA_DIR)
+    try:
+        r = subprocess.run(["gsettings","get",BRI_SCHEMA,"brightness"],
+                           capture_output=True, text=True, timeout=5, env=env)
+        return int(round(float(r.stdout.strip()) * 100))
+    except Exception as e:
+        log(f"brightness read failed: {e}"); return None
+def restore_brightness():
+    if st["bri_saved"] is not None and not st["bri_restored"]:
+        st["bri_restored"] = True
+        brightness(st["bri_saved"])
+        log(f"brightness restored to {st['bri_saved']}%")
+def settle_brightness():
+    # On a normal dismiss the ramp has deliberately gone bright and should stay
+    # there -- but a dismiss two seconds in leaves the screens at the 15% floor,
+    # so never end darker than we found them.
+    st["bri_restored"] = True
+    if st["bri_saved"] is not None and st["lastbri"] < st["bri_saved"]:
+        brightness(st["bri_saved"])
+        log(f"brightness restored to {st['bri_saved']}% (dismissed mid-ramp)")
+    else:
+        log(f"brightness left at {st['lastbri']}% (ramp complete)")
 def force_display_on():
     _run(["gdbus","call","--session","--dest","org.gnome.ScreenSaver","--object-path",
           "/org/gnome/ScreenSaver","--method","org.gnome.ScreenSaver.SetActive","false"], 5)
@@ -157,7 +187,11 @@ log(f"ENGINE start mode={mode} WAKE_T={WAKE_T:.0f}s child_ramp={CHILD_RAMP:.0f}s
 # ---------- sequence state ----------
 st = {"rgb": (0.05,0.01,0.0), "phase": "calm", "t0": None, "childfull": False,
       "start": time.monotonic(), "done": False, "lastvol": -1.0, "lastbri": -1, "n": 0,
-      "calm_ok": False, "wake_ok": False, "idle_saved": None, "idle_restored": False}
+      "calm_ok": False, "wake_ok": False, "idle_saved": None, "idle_restored": False,
+      "bri_saved": None, "bri_restored": False}
+
+def restore_all():
+    restore_idle(); restore_brightness()
 
 KF = [(0.00,(0.05,0.01,0.00)),(0.25,(0.28,0.07,0.02)),(0.50,(0.70,0.30,0.08)),
       (0.72,(1.00,0.62,0.28)),(0.88,(1.00,0.85,0.60)),(1.00,(1.00,0.98,0.95))]
@@ -183,7 +217,7 @@ def dismiss(*a):
     if st["done"]: return True
     st["done"] = True
     log("DISMISSED by user")
-    restore_idle()
+    restore_idle(); settle_brightness()
     fallback_stop(); sp_ctl("Pause"); setvol(0.35)
     Gtk.main_quit()
     return True
@@ -241,10 +275,12 @@ try: subprocess.run(["notify-send","-u","critical","Sunrise Alarm","Good morning
 except Exception: pass
 force_display_on()
 st["idle_saved"] = get_idle_delay()
+st["bri_saved"] = get_brightness_pct()
 set_idle_delay(0)                       # keep the panels lit for the whole ramp
-log(f"idle-delay set to 0 for alarm (was {st['idle_saved']})")
-atexit.register(restore_idle)
-signal.signal(signal.SIGTERM, lambda *a: (restore_idle(), os._exit(0)))
+log(f"idle-delay set to 0 for alarm (was {st['idle_saved']}), brightness was {st['bri_saved']}%")
+atexit.register(restore_all)
+signal.signal(signal.SIGTERM, lambda *a: (restore_all(), os._exit(0)))
+signal.signal(signal.SIGINT,  lambda *a: (restore_all(), os._exit(0)))
 prep_audio(cfg)
 ensure_spotify()
 wins = make_windows()
