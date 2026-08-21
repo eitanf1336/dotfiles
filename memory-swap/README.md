@@ -39,8 +39,40 @@ of these hold, so it can never kill a live session:
 
 1. the exe really is under `~/.local/share/claude/versions/`
 2. the `bg-pty-host` is reparented to init/systemd (its daemon is gone)
-3. nothing is running inside it (its `bg-spare` child has no children)
+3. nothing is running inside it (its `bg-spare` child has no children), or it
+   is older than 4 hours (see below)
 4. it is older than 10 minutes
+
+### The leak mutated: rule 3 stopped firing (2026-08-21)
+
+Rule 3 quietly turned the reaper into a no-op. Orphaned spares no longer sit
+empty: they hold the **MCP servers** their dead session started (`whatsapp-mcp`
+and friends), which never exit on their own. So the `bg-spare` always had a
+child, "nothing is running inside it" was never true, and the timer reported
+`no orphaned Claude spares` every ten minutes for days while **7 orphan trees,
+28 processes, 934 MB RSS + 2.9 GB swap** aged up to 61 hours.
+
+Two fixes, both in `claude-spare-reaper`:
+
+* past `STALE_AGE` (4h) children no longer buy a reprieve. Our own process
+  ancestry is still absolute and is never reaped at any age.
+* the reaper now kills the **whole descendant tree**, not just the pair. The old
+  version collected `$pty` and its direct children only, so the MCP servers
+  underneath were merely reparented to systemd and the leak survived reaping.
+
+**Symptom that led here:** Spotify glitching. `pw-top -b` showed the *stream*
+(`spotify`) taking 9 xruns in ten minutes while the *sink* took zero, which is a
+stalled producer, not the DisplayLink dock. The producer was stalling because
+the box was in swap-thrash, and 2.9 GB of that swap was this leak.
+
+### Cause 2b: the desktop had no memory priority (2026-08-21)
+
+`user-dropins/app.slice.d/50-desktop-memory-protect.conf` sets `MemoryLow=3G` on
+`app.slice`. Spotify, Chrome and ZapZap live there; every Claude background job
+runs in a `vte-spawn` scope under `session.slice`. Without this, reclaim treats
+them as equals and a background job that wants 4 GB pushes the music you are
+listening to into swap. `MemoryLow` is best-effort, not a reservation, and never
+kills anything: the kernel just reclaims from everything else first.
 
 ### A warning about earlyoom `--prefer`
 

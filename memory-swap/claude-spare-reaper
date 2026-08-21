@@ -9,13 +9,13 @@
 # Safety: ALL of these must hold before anything is killed.
 #   1. exe lives under ~/.local/share/claude/versions/   (it really is Claude)
 #   2. the bg-pty-host is reparented to init/systemd      (its daemon is gone)
-#   3. nothing is running inside it (bg-spare has no children)
+#   3. nothing is running inside it (bg-spare has no children), OR the orphan is
+#      older than STALE_AGE - see the note at rule 3
 #   4. it is older than MIN_AGE seconds                   (never race a new session)
-# Rule 3 is the one that protects a LIVE session whose daemon happened to die.
-# Rule 2 alone is not enough.
 set -uo pipefail
 
 MIN_AGE=${MIN_AGE:-600}
+STALE_AGE=${STALE_AGE:-14400}   # 4h: past this, children no longer buy a reprieve
 UID_N=$(id -u)
 SYSD=$(pgrep -u "$UID_N" -x systemd 2>/dev/null | head -1)
 
@@ -26,6 +26,19 @@ while [ "${p:-0}" -gt 1 ] 2>/dev/null; do
   SELF[$p]=1
   p=$(awk '/^PPid:/{print $2}' "/proc/$p/status" 2>/dev/null)
 done
+
+# pid + every descendant, breadth-first. The old version only collected the
+# bg-spare itself, which left its grandchildren (MCP servers) alive and merely
+# reparented them to systemd - the leak survived the reaping.
+descendants() {
+  local queue=("$1") out=() cur k
+  while [ "${#queue[@]}" -gt 0 ]; do
+    cur=${queue[0]}; queue=("${queue[@]:1}")
+    out+=("$cur")
+    for k in $(pgrep -P "$cur" 2>/dev/null); do queue+=("$k"); done
+  done
+  printf '%s\n' "${out[@]}"
+}
 
 victims=()
 rss_k=0
@@ -49,15 +62,28 @@ for pty in $(pgrep -u "$UID_N" -f 'bg-pty-host' 2>/dev/null); do
   [ "$age" -ge "$MIN_AGE" ] || continue
 
   # 3. idle? (its bg-spare child must have no children of its own)
+  #
+  # Exception added 2026-08-21: past STALE_AGE, children stop granting a
+  # reprieve. What they are in practice is MCP servers the dead session
+  # started (whatsapp-mcp and friends); those never exit on their own, so this
+  # rule alone kept 7 orphan trees alive for up to 61 hours - 934 MB RSS plus
+  # 2.9 GB swap - which pushed the box into swap-thrash and made audio stutter.
+  # Our own ancestry is still absolute: it is never reaped at any age.
   kids=$(pgrep -P "$pty" 2>/dev/null)
   busy=0
   for k in $kids; do
-    [ -n "${SELF[$k]:-}" ] && busy=1 && break
-    [ -n "$(pgrep -P "$k" 2>/dev/null)" ] && busy=1 && break
+    if [ -n "${SELF[$k]:-}" ]; then busy=1; break; fi
+    if [ -n "$(pgrep -P "$k" 2>/dev/null)" ] && [ "$age" -lt "$STALE_AGE" ]; then busy=1; break; fi
   done
   [ "$busy" -eq 1 ] && continue
 
-  for q in $pty $kids; do
+  tree=$(descendants "$pty")
+  # belt and braces: if our own ancestry turned up anywhere in the tree, skip it
+  skip=0
+  for q in $tree; do [ -n "${SELF[$q]:-}" ] && skip=1 && break; done
+  [ "$skip" -eq 1 ] && continue
+
+  for q in $tree; do
     rss_k=$(( rss_k + $(awk '/^VmRSS:/{print $2}'  "/proc/$q/status" 2>/dev/null || echo 0) ))
     swap_k=$(( swap_k + $(awk '/^VmSwap:/{print $2}' "/proc/$q/status" 2>/dev/null || echo 0) ))
     victims+=("$q")
