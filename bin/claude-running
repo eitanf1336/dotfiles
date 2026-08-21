@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""claude-running — how many Claudes are running, and at which effort level.
+
+`claude-status` answers "is it safe to shut down". This answers "what is
+burning my quota right now, and how expensive is each one" — one row per live
+Claude, with its effort level and model, and a count per effort at the bottom.
+
+Effort is not in the process list for a background agent, so it is resolved in
+the order it actually gets decided:
+
+  1. --effort on the command line
+  2. the agent's own respawn flags (~/.claude/jobs/<id>/state.json)
+  3. effortLevel in ~/.claude/settings.json
+  4. Claude's own default
+
+Only real sessions are counted. The daemon, spare workers, pty hosts and
+`claude attach` viewers are plumbing: they hold no conversation and spend
+nothing, so they are never rows here.
+
+Usage:
+  claude-running          one row per live Claude + totals per effort
+  claude-running -q       just the totals, one line
+  claude-running -w       redraw every few seconds until Ctrl+C
+  claude-running -h
+"""
+import os
+import sys
+import json
+import time
+import subprocess
+from collections import Counter
+
+HOME = os.path.expanduser("~")
+JOBS = os.path.join(HOME, ".claude/jobs")
+SETTINGS = os.path.join(HOME, ".claude/settings.json")
+CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
+
+# Sub-commands that are machinery around sessions rather than sessions.
+PLUMBING = ("attach", "daemon", "mcp", "bg-spare", "bg-pty-host", "agents",
+            "stop", "logs", "install", "update", "doctor", "auth")
+
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+WINDOW = 1.2      # seconds of CPU sampling to tell a thinking chat from an idle one
+BUSY_JIFFIES = 1
+
+if sys.stdout.isatty() and os.environ.get("NO_COLOR") is None:
+    YEL, GRN, CYA, GRY, BLD, RST = ("\033[33m", "\033[32m", "\033[36m",
+                                    "\033[90m", "\033[1m", "\033[0m")
+else:
+    YEL = GRN = CYA = GRY = BLD = RST = ""
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def default_effort():
+    return (read_json(SETTINGS, {}) or {}).get("effortLevel") or "medium"
+
+
+def default_model():
+    return (read_json(SETTINGS, {}) or {}).get("model") or "default"
+
+
+def flag(tokens, name):
+    """The value of `--name X` in an argv list, if it is there."""
+    for i, tok in enumerate(tokens):
+        if tok == name and i + 1 < len(tokens):
+            return tokens[i + 1]
+        if tok.startswith(name + "="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+def proc_argv(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            argv = [a.decode("latin1", "replace") for a in fh.read().split(b"\0") if a]
+    except OSError:
+        return None
+    return argv or None
+
+
+def children_map():
+    kids = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/stat") as fh:
+                ppid = int(fh.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        kids.setdefault(ppid, []).append(int(pid))
+    return kids
+
+
+def roster_sessions():
+    """short id -> the pid actually running that session.
+
+    The daemon's roster records the pty *host* per session, not the session,
+    and a session claimed out of the spare pool keeps `bg-spare` in its own
+    argv forever — so neither the roster pid nor the command line identifies
+    it on its own. The session is the host's claude child; that is the link."""
+    data = read_json(os.path.join(HOME, ".claude/daemon/roster.json"), {}) or {}
+    kids = children_map()
+    out = {}
+    for short, w in (data.get("workers") or {}).items():
+        host = w.get("pid")
+        if not host:
+            continue
+        for kid in kids.get(host, []):
+            argv = proc_argv(kid)
+            if not argv:
+                continue
+            # A claimed spare renames itself to "claude bg-spare" — one argv
+            # element, space and all — so match the first word, not the string.
+            exe = os.path.basename(argv[0]).split()[0]
+            if exe == "claude" or exe.startswith("2."):
+                out[kid] = {"short": short, "sessionId": w.get("sessionId"),
+                            "cwd": w.get("cwd"), "toks": argv[1:]}
+                break
+    return out
+
+
+def headless_procs():
+    """`claude -p` one-shots. They are nobody's background agent, and they are
+    always working: a -p run exits the moment it is done."""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\0")
+        except OSError:
+            continue
+        if not argv or not argv[0]:
+            continue
+        exe = os.path.basename(argv[0].decode("latin1", "replace"))
+        # The installed build runs under its version number, not "claude".
+        if exe != "claude" and not exe.startswith("2."):
+            continue
+        toks = [a.decode("latin1", "replace") for a in argv[1:] if a]
+        if any(t in ("-p", "--print") for t in toks):
+            yield int(pid), toks
+
+
+def cpu_ticks(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            parts = fh.read().rsplit(")", 1)[1].split()
+        return int(parts[11]) + int(parts[12])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def rss_mb(pid):
+    try:
+        with open(f"/proc/{pid}/statm") as fh:
+            return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") // 2**20
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def agents():
+    try:
+        out = subprocess.run([CLAUDE, "agents", "--json"],
+                             capture_output=True, text=True, timeout=45)
+        data = json.loads(out.stdout or "[]")
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+
+
+def session_of(toks):
+    return flag(toks, "--session-id") or flag(toks, "--resume") or flag(toks, "-r")
+
+
+def collect():
+    by_pid = {a["pid"]: a for a in agents() if a.get("pid")}
+    dflt_e, dflt_m = default_effort(), default_model()
+    by_short = {a.get("id"): a for a in agents()}
+    rows = []
+
+    found = []                                   # (pid, toks, kind, short, meta)
+    for pid, rec in roster_sessions().items():
+        found.append((pid, rec["toks"], "agent", rec["short"], rec))
+    for pid, toks in headless_procs():
+        sid = session_of(toks) or ""
+        found.append((pid, toks, "-p", sid.split("-")[0] if sid else str(pid),
+                      {"sessionId": sid, "cwd": None}))
+
+    for pid, toks, kind, short, rec in found:
+        job = read_json(os.path.join(JOBS, short, "state.json"), {}) or {}
+        respawn = job.get("respawnFlags") or []
+        agent = by_short.get(short) or by_pid.get(pid) or {}
+
+        if kind == "-p":
+            busy = True                  # a -p run exits when it's done
+        elif agent:
+            busy = (agent.get("state") == "working"
+                    or agent.get("status") == "busy")
+        else:
+            busy = None                  # no daemon opinion: sample its CPU
+        rows.append({
+            "pid": pid, "short": short, "kind": kind, "busy": busy,
+            "effort": flag(toks, "--effort") or flag(respawn, "--effort") or dflt_e,
+            "model": flag(toks, "--model") or flag(respawn, "--model") or dflt_m,
+            "rss": rss_mb(pid),
+            "name": agent.get("name") or job.get("detail") or "",
+            "cwd": agent.get("cwd") or rec.get("cwd") or job.get("cwd") or "",
+            "t0": cpu_ticks(pid)})
+
+    # A -p run that resumed a session shares that session's id, and the agent
+    # it resumed can still be on the daemon's books — two real processes, two
+    # real chunks of RAM, one id. Show the pid on the -p one so the rows can
+    # be told apart.
+    taken = {r["short"] for r in rows if r["kind"] != "-p"}
+    for r in rows:
+        if r["kind"] == "-p" and r["short"] in taken:
+            r["short"] = f"pid {r['pid']}"
+
+    # An interactive chat looks identical whether it is thinking or sitting at
+    # the prompt; the difference is only visible as CPU over a short window.
+    if any(r["busy"] is None for r in rows):
+        time.sleep(WINDOW)
+        for r in rows:
+            if r["busy"] is None:
+                t1 = cpu_ticks(r["pid"])
+                r["busy"] = (r["t0"] is not None and t1 is not None
+                             and t1 - r["t0"] >= BUSY_JIFFIES)
+    return rows
+
+
+def totals_line(rows):
+    busy = [r for r in rows if r["busy"]]
+    counts = Counter(r["effort"] for r in busy)
+    if not rows:
+        return "no Claude sessions running."
+    order = [e for e in EFFORTS if counts[e]] + \
+            sorted(e for e in counts if e not in EFFORTS)
+    per = " · ".join(f"{counts[e]}×{e}" for e in order) or "none"
+    ram = sum(r["rss"] for r in rows) / 1024
+    return (f"{len(busy)} working ({per}), {len(rows) - len(busy)} idle · "
+            f"{ram:.1f} GB")
+
+
+def show(rows):
+    if not rows:
+        print("no Claude sessions running.")
+        return
+    print(f"{BLD}{'ID':<10}{'KIND':<7}{'STATE':<9}{'EFFORT':<8}"
+          f"{'MODEL':<16}{'RAM':>6}  WHAT{RST}")
+    for r in sorted(rows, key=lambda r: (not r["busy"], r["effort"])):
+        state = f"{YEL}working{RST}" if r["busy"] else f"{GRY}idle{RST}"
+        pad = 9 + len(state) - len("working" if r["busy"] else "idle")
+        what = r["name"] or r["cwd"].replace(HOME, "~")
+        print(f"{CYA}{r['short']:<10}{RST}{r['kind']:<7}{state:<{pad}}"
+              f"{r['effort']:<8}{r['model'].replace('claude-', ''):<16}"
+              f"{r['rss']:>5}M  {GRY}{what[:44]}{RST}")
+    print(f"\n{BLD}{totals_line(rows)}{RST}")
+
+
+def main():
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        print(__doc__.strip())
+        return 0
+    quiet = "-q" in argv or "--quiet" in argv
+    watch = "-w" in argv or "--watch" in argv
+    while True:
+        rows = collect()
+        if watch:
+            sys.stdout.write("\033[H\033[2J")
+        if quiet:
+            print(totals_line(rows))
+        else:
+            show(rows)
+        if not watch:
+            return 0
+        time.sleep(4)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
