@@ -74,6 +74,12 @@ them as equals and a background job that wants 4 GB pushes the music you are
 listening to into swap. `MemoryLow` is best-effort, not a reservation, and never
 kills anything: the kernel just reclaims from everything else first.
 
+`user-dropins/snap.spotify.spotify-.scope.d/50-audio-client-priority.conf` does
+the same job one level down, for Spotify specifically (`CPUWeight=3000`,
+`MemoryLow=512M`). Its snap scope is transient and gets a fresh UUID every
+launch, so the `-` prefix drop-in is the only way to reach it. Both take effect
+on `daemon-reload`, on the already-running scope, with no restart.
+
 ### A warning about earlyoom `--prefer`
 
 An earlier version of `etc/default/earlyoom` used `--prefer ^(chrome|...)$` and

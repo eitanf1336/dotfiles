@@ -25,7 +25,7 @@ echo "==> desktop-priority drop-ins -> $SYSD"
 # "Cause 3" for why this is what actually fixes desktop stutter under load.
 for d in org.gnome.Shell@ubuntu.service.d vte-spawn-.scope.d \
          pipewire.service.d wireplumber.service.d pipewire-pulse.service.d \
-         app.slice.d; do
+         app.slice.d snap.spotify.spotify-.scope.d; do
   [ -d "$HERE/user-dropins/$d" ] || continue
   install -d -m 0755 "$SYSD/$d"
   install -m 0644 "$HERE/user-dropins/$d"/*.conf "$SYSD/$d/"
