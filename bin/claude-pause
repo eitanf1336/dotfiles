@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+"""claude-pause — temporarily stop every working Claude agent (resume later).
+
+Two commands share this file (the name you call it by picks the behaviour):
+
+  claude-pause     stop the Claude agents that are actually working right now,
+                   remembering each one so it can be picked up again later.
+                   The conversations are kept; only the processes go away.
+
+  claude-resume    start them all again — both the ones claude-pause stopped
+                   AND every session whose last turn died on a usage limit
+                   ("You've hit your session limit"). Each one is resumed in
+                   its own session (same session id, same transcript) and told
+                   to carry on where it was cut off.
+
+Why it works this way: `claude` has no verb for handing a prompt to a live
+background agent (agents / attach / stop / logs is the whole surface), but
+`claude --resume <id> -p` continues a *stopped* session in place, keeping its
+id and appending to the same transcript. So resuming means: stop it if it is
+still registered, then re-run it headlessly with a "carry on" prompt.
+
+Resumes run under a small supervisor with a concurrency cap, because each
+Claude process costs the better part of a gigabyte and this machine OOMs.
+
+Usage:
+  claude-pause  [-n] [-a] [-l]
+      -n, --dry-run    show what would be stopped, stop nothing
+      -a, --all        also stop live-but-idle agents (default: working only)
+      -l, --list       list live agents and exit
+
+  claude-resume [-n] [-y] [-j N] [--since D] [--paused|--quota]
+                [--wait] [--force] [--status] [--foreground]
+      -n, --dry-run    show the plan, run nothing
+      -y, --yes        don't ask before resuming
+      -j, --jobs N     how many to run at once (default 2)
+          --since D    only quota-killed sessions from the last D days (7)
+          --paused     only the ones claude-pause stopped
+          --quota      only the ones a usage limit killed
+          --retry      re-run whatever failed last time (a failed resume
+                       leaves an error in the transcript, so the usual scan
+                       will not find it a second time)
+          --wait       if the limit is still maxed, wait for the reset
+          --force      resume even with no quota headroom left
+          --status     show how the last resume run is going, and exit
+          --follow     like --status, but keep watching
+          --foreground run the resumes here instead of detaching
+"""
+import os
+import re
+import sys
+import json
+import time
+import glob
+import errno
+import shutil
+import subprocess
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME",
+                                        os.path.join(HOME, ".local/state")),
+                         "claude-pause")
+PAUSED_FILE = os.path.join(STATE_DIR, "paused.json")
+RUN_FILE = os.path.join(STATE_DIR, "run.json")
+LOG_DIR = os.path.join(STATE_DIR, "logs")
+PROJECTS = os.path.join(HOME, ".claude/projects")
+CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
+
+# What we say to a session we are picking back up. The last sentence matters:
+# without it, a session that had actually finished burns a whole turn
+# re-deriving that it has nothing to do.
+CONTINUE_PROMPT = (
+    "You were interrupted before you finished: the previous turn was cut off "
+    "by a usage limit or by being paused, not by completing the work. Pick up "
+    "exactly where you stopped and finish the task you were given. Do not "
+    "start anything new and do not re-do work that is already done. If it "
+    "turns out everything was already finished, say so in one line and stop."
+)
+
+# A usage-limit death, as it appears in the transcript: an API error message
+# carrying status 429 whose text names a limit. 429s that are plain rate
+# limiting ("Too many requests") are NOT this and must not be swept up.
+LIMIT_RE = re.compile(
+    r"hit your (session|weekly|usage) limit|usage limit reached|"
+    r"limit\s*·\s*resets", re.I)
+
+# A real model id, as opposed to the placeholders Claude writes on messages it
+# generated locally rather than getting from the API.
+MODEL_RE = re.compile(r"^(claude-|opus|sonnet|haiku|fable)[\w.\[\]-]*$", re.I)
+
+# "the model you asked for doesn't exist any more", as opposed to any other
+# reason a resume can fail.
+BAD_MODEL_RE = re.compile(
+    r"unrecognized_model|not a model|issue with the selected model|"
+    r"model[^\n]{0,60}(not found|not exist|unknown|invalid|unrecognized|"
+    r"not available|no access)|(unknown|invalid|unrecognized) model", re.I)
+
+if sys.stdout.isatty() and os.environ.get("NO_COLOR") is None:
+    RED, YEL, GRN, CYA, GRY, BLD, RST = (
+        "\033[31m", "\033[33m", "\033[32m", "\033[36m",
+        "\033[90m", "\033[1m", "\033[0m")
+else:
+    RED = YEL = GRN = CYA = GRY = BLD = RST = ""
+
+
+def die(msg, code=1):
+    sys.stderr.write(f"{RED}error:{RST} {msg}\n")
+    sys.exit(code)
+
+
+def read_json(path, default):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(obj, fh, indent=1)
+    os.replace(tmp, path)
+
+
+# ---- what the daemon knows --------------------------------------------
+def agents():
+    """Every session the background daemon still has on its books.
+
+    `state` is the daemon's own word for it; a `pid` means there is a real
+    process behind it right now. A session with neither is just a remembered
+    conversation and costs nothing, which is why the default sweep ignores it.
+    """
+    try:
+        out = subprocess.run([CLAUDE, "agents", "--json"],
+                             capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    try:
+        data = json.loads(out.stdout or "[]")
+    except ValueError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def self_ids():
+    """The session running this command, so a sweep can't stop the shell it
+    was typed into. Claude exports both of these into every session's env."""
+    ids = set()
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if sid:
+        ids.add(sid)
+        ids.add(sid[:8])
+    job = os.environ.get("CLAUDE_JOB_DIR")
+    if job:
+        ids.add(os.path.basename(job.rstrip("/")))
+    return ids
+
+
+def is_self(a, mine):
+    return bool(mine & {a.get("sessionId"), a.get("id")})
+
+
+def alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except OSError as e:
+        return e.errno == errno.EPERM
+    return True
+
+
+def is_working(a):
+    return a.get("state") == "working" or a.get("status") == "busy"
+
+
+def is_live(a):
+    return is_working(a) or alive(a.get("pid"))
+
+
+def stop_agent(short):
+    """`claude stop` keeps the conversation and drops the process."""
+    try:
+        out = subprocess.run([CLAUDE, "stop", short],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    txt = (out.stdout + out.stderr).lower()
+    return out.returncode == 0 or "stopped" in txt or "no job matching" in txt
+
+
+# ---- transcripts -------------------------------------------------------
+def tail_records(path, nbytes=196608):
+    """The last few JSONL records of a transcript, parsed. Reading only the
+    tail keeps a full sweep of a few hundred sessions under a second."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - nbytes))
+            raw = fh.read()
+    except OSError:
+        return []
+    recs = []
+    for line in raw.decode("utf8", "replace").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            recs.append(json.loads(line))
+        except ValueError:
+            pass
+    return recs
+
+
+def msg_text(rec):
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") for p in content
+                        if isinstance(p, dict))
+    return ""
+
+
+def last_turn(recs):
+    """The last real conversational record, ignoring the bookkeeping ones
+    (summaries, file snapshots, hook events) that can trail a session."""
+    for rec in reversed(recs):
+        if rec.get("isApiErrorMessage") or rec.get("type") in ("user", "assistant"):
+            return rec
+    return None
+
+
+def session_meta(recs):
+    """Where the session ran, and which model it was really using.
+
+    Transcripts also carry placeholder models on locally-generated messages
+    ("<synthetic>"), and handing one of those back to `--model` fails the
+    resume before it ever reaches the API — so only real model ids count."""
+    cwd = model = None
+    for rec in reversed(recs):
+        if not cwd and rec.get("cwd"):
+            cwd = rec["cwd"]
+        if not model:
+            m = (rec.get("message") or {}).get("model")
+            if isinstance(m, str) and MODEL_RE.match(m):
+                model = m
+        if cwd and model:
+            break
+    return cwd, model
+
+
+def scan_quota_stopped(since_days):
+    """Sessions whose conversation ends on a usage-limit error.
+
+    Ending on one is the whole test: if the session got any turn afterwards,
+    it was already picked up and there is nothing to resume.
+    """
+    cutoff = time.time() - since_days * 86400
+    found = []
+    for path in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")):
+        if "/subagents/" in path:          # sub-agent runs, not sessions
+            continue
+        try:
+            if os.path.getmtime(path) < cutoff or os.path.getsize(path) == 0:
+                continue
+        except OSError:
+            continue
+        recs = tail_records(path)
+        rec = last_turn(recs)
+        if not rec or not rec.get("isApiErrorMessage"):
+            continue
+        text = msg_text(rec)
+        if rec.get("apiErrorStatus") != 429 or not LIMIT_RE.search(text):
+            continue
+        cwd, model = session_meta(recs)
+        found.append({
+            "sessionId": os.path.basename(path)[:-6],
+            "cwd": cwd or HOME,
+            "model": model,
+            "reason": "quota",
+            "detail": " ".join(text.split())[:70],
+            "at": rec.get("timestamp") or "",
+        })
+    found.sort(key=lambda j: j["at"])
+    return found
+
+
+# ---- quota ------------------------------------------------------------
+def limits():
+    """The live usage picture, borrowed from claude-limits."""
+    exe = shutil.which("claude-limits")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "--json"],
+                             capture_output=True, text=True, timeout=45)
+        return json.loads(out.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def blocking_limit(data, ceiling=98):
+    """The active limit that would make resuming pointless, if any."""
+    if not data:
+        return None
+    worst = None
+    for lim in data.get("limits") or []:
+        if not lim.get("is_active"):
+            continue
+        pct = lim.get("percent") or 0
+        if pct >= ceiling and (worst is None or pct > worst["percent"]):
+            worst = lim
+    return worst
+
+
+def reset_epoch(lim):
+    try:
+        return datetime.fromisoformat(lim["resets_at"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def fmt_eta(seconds):
+    seconds = max(0, int(seconds))
+    h, m = divmod(seconds // 60, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m"
+
+
+# ---- pause ------------------------------------------------------------
+def cmd_pause(argv):
+    dry = all_live = listing = False
+    for a in argv:
+        if a in ("-n", "--dry-run"):
+            dry = True
+        elif a in ("-a", "--all"):
+            all_live = True
+        elif a in ("-l", "--list"):
+            listing = True
+        elif a in ("-h", "--help"):
+            return usage()
+        else:
+            die(f"unknown option: {a} (try --help)")
+
+    mine = self_ids()
+    live = [a for a in agents() if is_live(a) and not is_self(a, mine)]
+    if listing:
+        if not live:
+            print("no live Claude agents.")
+        for a in live:
+            mark = f"{YEL}working{RST}" if is_working(a) else f"{GRY}idle{RST}"
+            print(f"  {CYA}{a.get('id','?')}{RST}  {mark:18} "
+                  f"{a.get('name') or GRY + '(unnamed)' + RST}")
+        return 0
+
+    targets = live if all_live else [a for a in live if is_working(a)]
+    if not targets:
+        extra = "" if all_live else f" {GRY}(idle ones are left alone; -a includes them){RST}"
+        print(f"nothing to pause — no Claude agent is working.{extra}")
+        return 0
+
+    print(f"{BLD}Pausing {len(targets)} Claude agent(s){RST}"
+          f"{'  (dry run)' if dry else ''}")
+    kept = read_json(PAUSED_FILE, {"paused": []})
+    known = {p["sessionId"] for p in kept["paused"]}
+    stopped = 0
+    for a in targets:
+        sid = a.get("sessionId")
+        short = a.get("id") or (sid or "")[:8]
+        name = a.get("name") or sid
+        state = "working" if is_working(a) else "idle"
+        print(f"  {CYA}{short}{RST}  {state:8} {name}")
+        if dry:
+            continue
+        if not stop_agent(short):
+            print(f"    {RED}couldn't confirm it stopped{RST}")
+            continue
+        stopped += 1
+        if sid and sid not in known:
+            kept["paused"].append({
+                "sessionId": sid,
+                "short": short,
+                "cwd": a.get("cwd") or HOME,
+                "name": a.get("name"),
+                "state": state,
+                "reason": "paused",
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            })
+            known.add(sid)
+    if not dry:
+        write_json(PAUSED_FILE, kept)
+        print(f"\n{GRN}paused {stopped}{RST} · bring them back with "
+              f"{BLD}claude-resume{RST}")
+    return 0
+
+
+# ---- resume -----------------------------------------------------------
+def transcript_path(sid):
+    hits = glob.glob(os.path.join(PROJECTS, "*", sid + ".jsonl"))
+    return hits[0] if hits else None
+
+
+def refresh(job):
+    """Re-read where a session lives and what model it used. Worth doing at
+    plan time rather than trusting a stored plan, since a retry can be days
+    later — and a stale model is what breaks a resume most often."""
+    path = transcript_path(job["sessionId"])
+    cwd, model = session_meta(tail_records(path)) if path else (None, None)
+    job["cwd"] = cwd or job.get("cwd") or HOME
+    job["model"] = model
+    job["empty"] = path is None
+    return job
+
+
+def retry_plan():
+    """The jobs from the last run that didn't come back clean. A resume that
+    failed leaves an error in the transcript, so the usual 'ends on a usage
+    limit' scan will never find it again — this is how you get a second go."""
+    plan = read_json(os.path.join(STATE_DIR, "plan.json"), [])
+    run = read_json(RUN_FILE, {"done": []})
+    ok = {d["sessionId"] for d in run.get("done", []) if d.get("ok")}
+    return [refresh(dict(j, reason=j.get("reason", "retry")))
+            for j in plan if j.get("sessionId") not in ok]
+
+
+def build_plan(opts):
+    if opts.get("retry"):
+        jobs = retry_plan()
+        live_now = {a.get("sessionId") for a in agents()}
+        mine = self_ids()
+        for j in jobs:
+            j["live"] = j["sessionId"] in live_now
+        return [j for j in jobs if not j["empty"]
+                and os.path.isdir(j["cwd"]) and j["sessionId"] not in mine]
+
+    jobs, seen = [], set()
+
+    if opts["want_paused"]:
+        for p in read_json(PAUSED_FILE, {"paused": []})["paused"]:
+            sid = p.get("sessionId")
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            path = transcript_path(sid)
+            cwd, model = session_meta(tail_records(path)) if path else (None, None)
+            jobs.append({
+                "sessionId": sid,
+                "short": p.get("short") or sid[:8],
+                "cwd": cwd or p.get("cwd") or HOME,
+                "model": model,
+                "reason": "paused",
+                "detail": p.get("name") or "",
+                "empty": path is None,
+            })
+
+    if opts["want_quota"]:
+        for q in scan_quota_stopped(opts["since"]):
+            sid = q["sessionId"]
+            if sid in seen:
+                continue
+            seen.add(sid)
+            jobs.append({
+                "sessionId": sid,
+                "short": sid[:8],
+                "cwd": q["cwd"],
+                "model": q["model"],
+                "reason": "quota",
+                "detail": q["detail"],
+                "empty": False,
+            })
+
+    # A session with no transcript never got a turn, so there is nothing to
+    # carry on with; and one whose directory is gone can't be run at all.
+    live_now = {a.get("sessionId"): a for a in agents()}
+    mine = self_ids()
+    for j in jobs:
+        j["live"] = j["sessionId"] in live_now
+        j["short"] = (live_now.get(j["sessionId"], {}).get("id")) or j["short"]
+    return [j for j in jobs
+            if not j["empty"] and os.path.isdir(j["cwd"])
+            and j["sessionId"] not in mine]
+
+
+def run_one(job):
+    """Resume one session in place: stop it if the daemon still holds it (a
+    registered background session refuses --resume), then hand it the prompt."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log = os.path.join(LOG_DIR, job["sessionId"][:8] + ".log")
+    if job.get("live"):
+        stop_agent(job["short"])
+        time.sleep(1.5)
+    base = [CLAUDE, "--resume", job["sessionId"], "-p", CONTINUE_PROMPT]
+    # Keep the model the session was actually using — but transcripts outlive
+    # model names, so a retired id gets one retry on the default model rather
+    # than becoming a silent no-resume. Only a *model* complaint retries; a
+    # failure for any other reason must not run the turn (and the bill) twice.
+    cmd = base[:1] + (["--model", job["model"]] if job.get("model") else []) \
+        + base[1:]
+    with open(log, "a") as fh:
+        for attempt in (1, 2):
+            fh.write(f"$ {' '.join(cmd[:5])} …\n")
+            fh.flush()
+            try:
+                p = subprocess.run(cmd, cwd=job["cwd"], capture_output=True,
+                                   text=True, timeout=6 * 3600)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                fh.write(f"\n[claude-resume] {e}\n")
+                return -1
+            out = (p.stdout or "") + (p.stderr or "")
+            fh.write(out + f"\n[claude-resume] exit {p.returncode}\n")
+            fh.flush()
+            if p.returncode == 0 or attempt == 2 or not BAD_MODEL_RE.search(out):
+                return p.returncode
+            fh.write("[claude-resume] retrying on the default model\n")
+            cmd = base
+
+
+def supervise(plan, jobs_max):
+    """Run the plan with a cap on how many Claudes exist at once. Each one is
+    most of a gigabyte, and this machine has been OOM-killed for less."""
+    state = {"started": time.time(), "total": len(plan), "done": [],
+             "running": [], "pid": os.getpid()}
+    write_json(RUN_FILE, state)
+    queue = list(plan)
+    running = {}                                  # pid -> job
+    while queue or running:
+        while queue and len(running) < jobs_max:
+            job = queue.pop(0)
+            pid = os.fork()
+            if pid == 0:
+                os._exit(0 if run_one(job) == 0 else 1)
+            running[pid] = job
+            state["running"] = [j["short"] for j in running.values()]
+            write_json(RUN_FILE, state)
+            time.sleep(2)                          # don't stampede the API
+        if not running:
+            break
+        pid, status = os.wait()
+        job = running.pop(pid, None)
+        if job:
+            state["done"].append({"short": job["short"],
+                                  "sessionId": job["sessionId"],
+                                  "ok": os.WIFEXITED(status)
+                                        and os.WEXITSTATUS(status) == 0})
+        state["running"] = [j["short"] for j in running.values()]
+        write_json(RUN_FILE, state)
+    state["finished"] = time.time()
+    state["running"] = []
+    write_json(RUN_FILE, state)
+
+
+def clear_paused(plan):
+    kept = read_json(PAUSED_FILE, {"paused": []})
+    done = {j["sessionId"] for j in plan}
+    kept["paused"] = [p for p in kept["paused"] if p.get("sessionId") not in done]
+    write_json(PAUSED_FILE, kept)
+
+
+def show_status(follow=False):
+    while True:
+        st = read_json(RUN_FILE, None)
+        if not st:
+            print("no resume run recorded yet.")
+            return 0
+        done, total = len(st["done"]), st["total"]
+        ok = sum(1 for d in st["done"] if d["ok"])
+        age = fmt_eta(time.time() - st["started"])
+        live = ", ".join(st["running"]) or "-"
+        tag = (f"{GRN}finished{RST}" if "finished" in st
+               else f"{YEL}running{RST}")
+        line = (f"{tag}  {done}/{total} done ({ok} clean)  "
+                f"running: {CYA}{live}{RST}  {GRY}started {age} ago{RST}")
+        if not follow:
+            print(line)
+            print(f"{GRY}logs: {LOG_DIR}{RST}")
+            return 0
+        sys.stdout.write("\r\033[K" + line)
+        sys.stdout.flush()
+        if "finished" in st:
+            print()
+            return 0
+        time.sleep(3)
+
+
+def cmd_resume(argv):
+    opts = {"dry": False, "yes": False, "jobs": 2, "since": 7,
+            "want_paused": True, "want_quota": True, "wait": False,
+            "force": False, "fg": False, "retry": False}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-n", "--dry-run"):
+            opts["dry"] = True
+        elif a in ("-y", "--yes"):
+            opts["yes"] = True
+        elif a in ("-j", "--jobs"):
+            i += 1
+            opts["jobs"] = max(1, int(argv[i]))
+        elif a == "--since":
+            i += 1
+            opts["since"] = float(argv[i])
+        elif a == "--all":
+            opts["since"] = 3650
+        elif a == "--paused":
+            opts["want_quota"] = False
+        elif a == "--quota":
+            opts["want_paused"] = False
+        elif a == "--retry":
+            opts["retry"] = True
+        elif a == "--wait":
+            opts["wait"] = True
+        elif a == "--force":
+            opts["force"] = True
+        elif a == "--status":
+            return show_status()
+        elif a == "--follow":
+            return show_status(follow=True)
+        elif a in ("-f", "--foreground"):
+            opts["fg"] = True
+        elif a == "--runner":                       # internal: the supervisor
+            i += 1
+            plan = read_json(argv[i], [])
+            supervise(plan, opts["jobs"])
+            return 0
+        elif a in ("-h", "--help"):
+            return usage()
+        else:
+            die(f"unknown option: {a} (try --help)")
+        i += 1
+
+    plan = build_plan(opts)
+    if not plan:
+        print("nothing to resume — no paused agents and no session ended on a "
+              "usage limit.")
+        return 0
+
+    print(f"{BLD}{len(plan)} session(s) to resume{RST}")
+    for j in plan:
+        tag = f"{YEL}quota{RST}" if j["reason"] == "quota" else f"{CYA}paused{RST}"
+        model = (j.get("model") or "default").replace("claude-", "")
+        print(f"  {j['short']}  {tag}  {model:24}"
+              f"{GRY}{j['cwd'].replace(HOME, '~')}{RST}  {j['detail'][:50]}")
+
+    lim = blocking_limit(limits())
+    if lim and not opts["force"]:
+        eta = reset_epoch(lim)
+        wait_s = (eta - time.time()) if eta else None
+        where = f", resets in {fmt_eta(wait_s)}" if wait_s and wait_s > 0 else ""
+        if opts["wait"] and wait_s and wait_s > 0:
+            print(f"\n{YEL}{lim['kind']} limit at {lim['percent']}%{RST} — "
+                  f"waiting {fmt_eta(wait_s)} for the reset…")
+            time.sleep(wait_s + 30)
+        else:
+            print(f"\n{YEL}holding off:{RST} the {lim['kind']} limit is at "
+                  f"{lim['percent']}%{where}.\nResuming now would just hit it "
+                  f"again — rerun with {BLD}--wait{RST} to wait it out, or "
+                  f"{BLD}--force{RST} to go anyway.")
+            return 3
+
+    if opts["dry"]:
+        print(f"\n{GRY}dry run — nothing started{RST}")
+        return 0
+    if not opts["yes"] and len(plan) > 1 and sys.stdin.isatty():
+        try:
+            if input(f"\nresume all {len(plan)}? [Y/n] ").strip().lower() \
+                    not in ("", "y", "yes"):
+                return 1
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 1
+
+    clear_paused(plan)
+    if opts["fg"]:
+        supervise(plan, opts["jobs"])
+        return show_status()
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    planfile = os.path.join(STATE_DIR, "plan.json")
+    write_json(planfile, plan)
+    subprocess.Popen(
+        [sys.executable, os.path.realpath(__file__), "resume",
+         "--jobs", str(opts["jobs"]), "--runner", planfile],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True)
+    print(f"\n{GRN}started{RST} — {opts['jobs']} at a time, in the background.\n"
+          f"  {BLD}claude-resume --follow{RST}   watch it\n"
+          f"  {GRY}{LOG_DIR}{RST}   what each one said")
+    return 0
+
+
+def usage():
+    print(__doc__.strip())
+    return 0
+
+
+def main():
+    argv = sys.argv[1:]
+    name = os.path.basename(sys.argv[0])
+    # Called through either name; `claude-pause resume …` also works, which is
+    # what the detached supervisor re-enters through.
+    if argv and argv[0] in ("pause", "resume"):
+        name, argv = "claude-" + argv[0], argv[1:]
+    if name.endswith("resume"):
+        return cmd_resume(argv)
+    return cmd_pause(argv)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
