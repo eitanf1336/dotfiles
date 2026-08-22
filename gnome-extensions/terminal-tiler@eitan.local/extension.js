@@ -636,8 +636,8 @@ export default class TerminalTilerExtension extends Extension {
                 return;
             const monitor = this._pending.shift();
             // Mutter may well have opened it on another screen. Move it first,
-            // so it really lives on the monitor whose column it is taking —
-            // otherwise _tile sees a stray and hands it to the other screen.
+            // so it really lives on the monitor whose column it is taking.
+            // Otherwise _tile sees a stray and hands it to the other screen.
             if (monitor < Main.layoutManager.monitors.length &&
                 win.get_monitor() !== monitor)
                 win.move_to_monitor(monitor);
@@ -666,7 +666,7 @@ export default class TerminalTilerExtension extends Extension {
             return;
         // A plain click on the title bar, or a nudge of a few pixels, ends as
         // a grab op too. Ejecting on those leaves a stray terminal parked on
-        // top of the columns that re-flow underneath it — which is exactly
+        // top of the columns that re-flow underneath it, which is exactly
         // what "the windows are on top of each other" looks like. So only a
         // deliberate move counts; anything smaller snaps back onto its slot.
         const arr = this._batches.get(monitor);
@@ -1021,8 +1021,8 @@ export default class TerminalTilerExtension extends Extension {
     // Re-flow every batch after each delay in `delays` (ms). Several passes,
     // because the chrome that defines the usable area (dock, panel) and
     // Mutter's own work-area recalculation both land asynchronously, some
-    // frames after the event that triggered them — measuring only once means
-    // measuring the screen as it was.
+    // frames after the event that triggered them, so measuring only once
+    // means measuring the screen as it was.
     _scheduleRetile(delays) {
         if (!this._retileIds)
             return;
