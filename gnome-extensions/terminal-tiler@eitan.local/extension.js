@@ -23,6 +23,10 @@ const GRAB_OP_WINDOW_FLAG_UNCONSTRAINED = 1024;
 // column-width change.
 const SLOT_EPS = 8;
 
+// A grab that leaves the frame within this many px of its slot was a click or
+// a nudge, not a deliberate move, so the window stays in its group.
+const EJECT_MIN = 40;
+
 export default class TerminalTilerExtension extends Extension {
     enable() {
         this._settings = this.getSettings();
@@ -41,6 +45,10 @@ export default class TerminalTilerExtension extends Extension {
         // begin and end) — its size changes are a deliberate drag, not an
         // external tiler we should fight, so the size-changed watcher skips it.
         this._grabWin = null;
+        // Pending delayed re-flows (GLib timeout ids), see _scheduleRetile.
+        this._retileIds = new Set();
+        // True while _regroup is re-flowing, so _tile does not recurse into it.
+        this._regrouping = false;
 
         Main.wm.addKeybinding(
             KEY,
@@ -150,9 +158,24 @@ export default class TerminalTilerExtension extends Extension {
         );
 
         // Re-flow when monitors are added/removed so stale geometry is fixed.
+        // One pass is not enough: on a hotplug the dock is destroyed and
+        // rebuilt asynchronously and Mutter recomputes work areas on an idle,
+        // so re-flowing right now measures the *old* screen. Repeat a beat
+        // later, and again once everything has settled.
         Main.layoutManager.connectObject(
             'monitors-changed',
-            () => this._retileAll(),
+            () => this._scheduleRetile([0, 800, 2500]),
+            this
+        );
+
+        // Struts changed: a dock appeared, vanished, changed monitor or size.
+        // Without this the columns keep whatever work area they were tiled
+        // against, which is how the first column ends up buried under the
+        // dock and stays there. Our own move_resize_frame never changes a
+        // strut, so this cannot feed back into itself.
+        global.display.connectObject(
+            'workareas-changed',
+            () => this._scheduleRetile([250]),
             this
         );
     }
@@ -175,11 +198,18 @@ export default class TerminalTilerExtension extends Extension {
             for (const win of arr)
                 win.disconnectObject(this);
 
+        if (this._retileIds) {
+            for (const id of this._retileIds)
+                GLib.Source.remove(id);
+            this._retileIds = null;
+        }
+
         this._batches = null;
         this._pending = null;
         this._settings = null;
         this._grabWin = null;
         this._maxed = null;
+        this._regrouping = false;
     }
 
     // ----- core action -------------------------------------------------------
@@ -605,6 +635,12 @@ export default class TerminalTilerExtension extends Extension {
             if (!this._isTerminal(win))
                 return;
             const monitor = this._pending.shift();
+            // Mutter may well have opened it on another screen. Move it first,
+            // so it really lives on the monitor whose column it is taking —
+            // otherwise _tile sees a stray and hands it to the other screen.
+            if (monitor < Main.layoutManager.monitors.length &&
+                win.get_monitor() !== monitor)
+                win.move_to_monitor(monitor);
             this._add(monitor, win);
             this._tile(monitor);
         };
@@ -628,6 +664,28 @@ export default class TerminalTilerExtension extends Extension {
         const monitor = this._monitorOf(win);
         if (monitor === null)
             return;
+        // A plain click on the title bar, or a nudge of a few pixels, ends as
+        // a grab op too. Ejecting on those leaves a stray terminal parked on
+        // top of the columns that re-flow underneath it — which is exactly
+        // what "the windows are on top of each other" looks like. So only a
+        // deliberate move counts; anything smaller snaps back onto its slot.
+        const arr = this._batches.get(monitor);
+        const live = arr ? arr.filter(w => this._isAlive(w)) : [];
+        const i = live.indexOf(win);
+        if (i >= 0) {
+            const cols = this._settings.get_string('orientation') !== 'rows';
+            const s = this._slotRect(this._workArea(monitor), i, live.length, cols);
+            const r = win.get_frame_rect();
+            const nudged =
+                Math.abs(r.x - s.x) <= EJECT_MIN &&
+                Math.abs(r.y - s.y) <= EJECT_MIN &&
+                Math.abs(r.width - s.w) <= EJECT_MIN &&
+                Math.abs(r.height - s.h) <= EJECT_MIN;
+            if (nudged) {
+                this._tile(monitor);
+                return;
+            }
+        }
         // User moved/resized a tiled window: eject it, keep its new geometry,
         // and re-flow whatever remains on that monitor.
         this._remove(win, monitor);
@@ -651,8 +709,13 @@ export default class TerminalTilerExtension extends Extension {
         // of its column, snap it straight back.
         win.connectObject(
             'unmanaging', () => {
-                this._remove(win, monitor);
-                this._tile(monitor);
+                // Look the monitor up again: a re-home (see _regroup) may have
+                // moved this window to another screen's batch since we added it.
+                const m = this._monitorOf(win);
+                if (m === null)
+                    return;
+                this._remove(win, m);
+                this._tile(m);
             },
             'size-changed', () => this._onSizeChanged(win),
             this);
@@ -702,6 +765,23 @@ export default class TerminalTilerExtension extends Extension {
         if (arr.length === 0) {
             this._batches.delete(monitor);
             return;
+        }
+
+        // Windows that now live on a different screen (a hotplug or a resume
+        // moved them, and Mutter renumbered the monitors under us) must not be
+        // laid out here: this batch and that screen's own batch would both
+        // divide the same monitor and the columns would land on top of each
+        // other. Hand everything to _regroup, which re-homes and re-flows.
+        if (!this._regrouping) {
+            const nMon = Main.layoutManager.monitors.length;
+            const strayed = arr.some(w => {
+                const m = w.get_monitor();
+                return m >= 0 && m < nMon && m !== monitor;
+            });
+            if (monitor >= nMon || strayed) {
+                this._regroup();
+                return;
+            }
         }
 
         const wa = this._workArea(monitor);
@@ -862,8 +942,99 @@ export default class TerminalTilerExtension extends Extension {
     }
 
     _retileAll() {
-        for (const monitor of [...this._batches.keys()])
-            this._tile(monitor);
+        this._regroup();
+    }
+
+    // Re-home every managed terminal into the batch of the monitor it is
+    // ACTUALLY on, then re-flow every batch.
+    //
+    // Batches are keyed by monitor index, and those indices are not stable:
+    // unplugging a screen (or one waking up late after a suspend) makes Mutter
+    // move the windows onto a surviving monitor and renumber the rest, while
+    // the batch keeps its old key. Two batches then divide one screen and the
+    // columns sit on top of each other. Rebuilding from where the windows
+    // really are fixes that, and re-orders each batch to match what is on
+    // screen so the columns keep their left-to-right identity.
+    _regroup() {
+        if (!this._batches || this._regrouping)
+            return;
+
+        const nMon = Main.layoutManager.monitors.length;
+        if (nMon === 0)
+            return;
+        const cols = this._settings.get_string('orientation') !== 'rows';
+        const rehomed = new Map();
+
+        for (const [key, arr] of this._batches) {
+            for (const win of arr) {
+                if (!this._isAlive(win)) {
+                    win.disconnectObject(this);
+                    continue;
+                }
+                let m = win.get_monitor();
+                // Off every screen for a moment (mid-unmap, or the monitor it
+                // was on has just left): keep it in the group rather than lose
+                // it, on the nearest still-existing screen. Tiling it there
+                // gives it a real monitor again.
+                if (m < 0 || m >= nMon)
+                    m = Math.max(0, Math.min(key, nMon - 1));
+                let dst = rehomed.get(m);
+                if (!dst)
+                    rehomed.set(m, dst = []);
+                if (!dst.includes(win))
+                    dst.push(win);
+            }
+        }
+
+        for (const arr of rehomed.values()) {
+            arr.sort((a, b) => cols
+                ? a.get_frame_rect().x - b.get_frame_rect().x
+                : a.get_frame_rect().y - b.get_frame_rect().y);
+        }
+
+        // A maximise follows its window to whatever screen it ended up on.
+        const maxed = new Map();
+        for (const win of this._maxed.values()) {
+            if (!this._isAlive(win))
+                continue;
+            const m = win.get_monitor();
+            if (rehomed.get(m)?.includes(win))
+                maxed.set(m, win);
+        }
+        this._maxed.clear();
+        for (const [m, win] of maxed)
+            this._maxed.set(m, win);
+
+        this._batches.clear();
+        for (const [m, arr] of rehomed)
+            this._batches.set(m, arr);
+
+        this._regrouping = true;
+        try {
+            for (const m of [...this._batches.keys()])
+                this._tile(m);
+        } finally {
+            this._regrouping = false;
+        }
+    }
+
+    // Re-flow every batch after each delay in `delays` (ms). Several passes,
+    // because the chrome that defines the usable area (dock, panel) and
+    // Mutter's own work-area recalculation both land asynchronously, some
+    // frames after the event that triggered them — measuring only once means
+    // measuring the screen as it was.
+    _scheduleRetile(delays) {
+        if (!this._retileIds)
+            return;
+        for (const ms of delays) {
+            const id = GLib.timeout_add(
+                GLib.PRIORITY_DEFAULT, Math.max(ms, 1), () => {
+                    this._retileIds?.delete(id);
+                    this._regroup();
+                    return GLib.SOURCE_REMOVE;
+                });
+            this._retileIds.add(id);
+        }
     }
 
     // ----- helpers -----------------------------------------------------------
