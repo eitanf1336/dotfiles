@@ -1,0 +1,14 @@
+[Unit]
+Description=The Dashboard (local analytics for every project)
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/MyProjects/TheDashboard
+ExecStart=/usr/bin/python3 -m dashboard.server
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

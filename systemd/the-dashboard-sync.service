@@ -1,0 +1,7 @@
+[Unit]
+Description=Pull every connected source into The Dashboard
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/MyProjects/TheDashboard
+ExecStart=/usr/bin/python3 -m dashboard sync

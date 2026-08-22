@@ -1,0 +1,10 @@
+[Unit]
+Description=Write due marketing drafts once a day
+
+[Timer]
+OnCalendar=*-*-* 09:30
+Persistent=true
+RandomizedDelaySec=20min
+
+[Install]
+WantedBy=timers.target

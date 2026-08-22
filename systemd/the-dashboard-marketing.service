@@ -1,0 +1,7 @@
+[Unit]
+Description=Write the marketing drafts that are due today
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/MyProjects/TheDashboard
+ExecStart=/usr/bin/python3 -c "from dashboard.marketing import generator; print(generator.run_due())"
