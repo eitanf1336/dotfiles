@@ -11,9 +11,11 @@ Categories=Office;Finance;Development;
 Actions=Money;Marketing;Users;Effort;
 Keywords=dashboard;analytics;revenue;expenses;users;projects;
 StartupNotify=true
-# Chrome --app windows are identified by the app_id Chrome derives from the URL,
-# never by --class. Same form that already works for the Guitar and Learning apps.
-StartupWMClass=chrome-localhost_7777__-Default
+# Chrome --app windows are identified by the app_id Chrome derives from the URL
+# host, never by --class. It is served from dashboard.localhost rather than plain
+# localhost because language-path-window.desktop claims "chrome-localhost__-Default"
+# for every port, and would otherwise lend this window the languages icon.
+StartupWMClass=chrome-dashboard.localhost__-Default
 
 [Desktop Action Money]
 Name=Money

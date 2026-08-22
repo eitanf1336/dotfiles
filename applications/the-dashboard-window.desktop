@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=The Dashboard
+GenericName=Project analytics
+Comment=Every project, every shekel, every user, in one place
+Exec=/home/eitan/bin/dashboard
+Icon=/home/eitan/code/MyProjects/TheDashboard/web/icons/icon-512.png
+Terminal=false
+Categories=Office;Finance;Development;
+StartupNotify=true
+# Hidden twin of the-dashboard.desktop, claiming the other spelling of the window
+# identity (with the port in it) so the dock icon is right whichever one this
+# Chrome uses. NoDisplay keeps one launcher in the app grid.
+NoDisplay=true
+StartupWMClass=chrome-dashboard.localhost_7777__-Default
