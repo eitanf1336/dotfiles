@@ -53,6 +53,16 @@ it and the status line leads with a matching chip.
   Ctrl+R       reload this script (pick up edits without restarting)
   q            quit
 
+Nothing leaves this board on its own unless it is filed **Done**. Reopening a
+finished chat starts a fresh background session, and Claude itself splits a full
+chat into a new session when it auto-compacts; the board links each of those to
+the chat it came from. It only FOLDS the older entry away when that chat is
+filed Done — anything In Progress / To Test / Later / Failed / Done — Not
+Committed / Uncategorized stays on the board next to its continuation, marked
+'⤷'. Unfinished work is never hidden automatically, and no chat file is ever
+deleted except by you, with 'd', after confirming. (The one knob:
+AUTO_FOLD_CATEGORIES near the top of this file.)
+
 Command line:
   chats.py                 open the board
   chats.py <proj>          open the board already filtered to that project, e.g.
@@ -213,6 +223,13 @@ CATEGORIES = [
     "Done",
 ]
 DISPLAY_ORDER = [UNCATEGORIZED] + CATEGORIES
+
+# The ONLY categories a chat may be auto-folded (hidden behind its continuation)
+# from. Everything else — In Progress, To Test, Later, Failed, Uncategorized, and
+# "Done — Not Committed" (its work isn't safe on a branch yet) — stays on the
+# board forever unless YOU delete it with 'd'. The board never removes unfinished
+# work on its own; a duplicate row is cheap, a chat you can't find is not.
+AUTO_FOLD_CATEGORIES = {"Done"}
 
 # color pair index per category (filled in setup_colors)
 CAT_COLOR = {
@@ -983,6 +1000,7 @@ class App:
         self.moved = load_moved()  # sessionId -> ts it was last (re)filed
         self.superseded_map = load_superseded()   # old id -> continuation id (bg-resume)
         self.superseded = set(self.superseded_map)  # old ids hidden after bg-resume
+        self.kept_superseded = set()  # superseded but NOT Done -> shown anyway ('⤷')
         self._autolink_tried = set()  # compact children we've already tried to link
         self._last_move = None     # (id, prev_cat, prev_ts) — for `u` undo
         self._search = ""          # last `/` query, so / repeats find the next hit
@@ -1289,6 +1307,7 @@ class App:
             return project_key_for(c, tags) if c else None
 
         hidden = set()
+        kept = set()   # superseded, but kept on the board because it isn't Done
         dead = set()
         for old in smap:
             chain = set()
@@ -1307,7 +1326,15 @@ class App:
                 # Only hide when old itself is on disk AND its continuation is in
                 # the same project — otherwise old would disappear from its view.
                 if old in by_id and pkey(head_file) == pkey(old):
-                    hidden.add(old)
+                    # …and ONLY when the chat is filed Done. Nothing that is still
+                    # In Progress / To Test / Later / Failed / Uncategorized may be
+                    # folded away automatically, no matter how good the replacement
+                    # looks: unfinished work must never leave the board on its own.
+                    # A non-Done predecessor stays visible, marked with '⤷'.
+                    if self.category_of(old) in AUTO_FOLD_CATEGORIES:
+                        hidden.add(old)
+                    else:
+                        kept.add(old)
             elif have_live and not reached_live:
                 dead.add(old)                    # continuation gone for good -> prune
         if dead:
@@ -1315,6 +1342,7 @@ class App:
             self.superseded_map = _json_update(
                 SUPERSEDED_STORE, lambda d: [d.pop(k, None) for k in dead])
         self.superseded = hidden
+        self.kept_superseded = kept
         self.all_chats = sorted(
             (c for c in cache.values() if c["id"] not in hidden),
             key=lambda c: c["mtime"], reverse=True)
@@ -2240,6 +2268,11 @@ class App:
                     t = "★ " + t
                 elif special:
                     t = "♡ " + t
+                if c["id"] in getattr(self, "kept_superseded", ()):
+                    # Superseded by a newer continuation, but not Done, so it was
+                    # kept instead of folded away. The arrow says "the newer copy
+                    # of this is on the board too" without hiding anything.
+                    t = "⤷ " + t
                 if _dwidth(t) > avail:
                     t = _clamp(t, max(0, avail - 1)) + "…"
                 # _bidi() keeps a Hebrew/RTL name from flipping the whole row;
