@@ -40,7 +40,7 @@ EOF
     gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'
     gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing'
     # RTC wake ~2 min before the alarm (needs root)
-    T=$(date -d "${HH}:${MM}" +%s); W=$((T-120))
+    T=$(date -d "${HH}:${MM}" +%s); W=$((T-180))
     WH=$(date -d "@$W" +%H); WM=$(date -d "@$W" +%M)
     echo "arming user timer @ ${HH}:${MM}, RTC wake @ ${WH}:${WM}"
     pkexec "$DIR/install_wake.sh" install "$WH" "$WM" || echo "WARN: RTC wake not installed (auth cancelled); alarm still fires if awake"
