@@ -73,6 +73,15 @@ echo "    installed sunrise-alarm (config lives in ~/.config/sunrise-alarm)"
 
 echo "==> systemd user units"
 cp "$REPO"/systemd/*.service "$REPO"/systemd/*.timer "$SYSD/" 2>/dev/null || true
+# Drop-ins that override units shipped by the distro (so they keep the distro's
+# unit and only add to it). Directories, not flat files, hence the second pass.
+if [ -d "$REPO/systemd/dropins" ]; then
+    for d in "$REPO"/systemd/dropins/*.d; do
+        [ -d "$d" ] || continue
+        mkdir -p "$SYSD/$(basename "$d")"
+        cp "$d"/*.conf "$SYSD/$(basename "$d")/" 2>/dev/null || true
+    done
+fi
 systemctl --user daemon-reload 2>/dev/null || true
 for t in "$REPO"/systemd/*.timer; do
     systemctl --user enable --now "$(basename "$t")" 2>/dev/null || true

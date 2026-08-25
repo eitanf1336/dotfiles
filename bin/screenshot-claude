@@ -236,8 +236,8 @@ def main():
     # Subscribe before the call so a fast response can't race past us.
     subscribe(predicted_path)
 
-    try:
-        ret = bus.call_sync(
+    def call_screenshot():
+        return bus.call_sync(
             DEST,
             PATH,
             IFACE,
@@ -251,10 +251,36 @@ def main():
             -1,
             None,
         )
+
+    try:
+        ret = call_screenshot()
     except GLib.Error as e:
-        log(f"call failed: {e}")
-        notify("Screenshot failed", str(e), icon="dialog-error", urgent=True)
-        sys.exit(1)
+        # "No such interface org.freedesktop.portal.Screenshot" does not mean the
+        # portal is missing, it means xdg-desktop-portal came up while the GNOME
+        # backend was down. It probes for backends exactly once, at startup, and
+        # caches the answer, so it stays permanently screenshot-less until both
+        # are bounced in the right order. Do that here rather than making the
+        # user find out from a dead keyboard shortcut.
+        if "org.freedesktop.portal.Screenshot" not in str(e):
+            log(f"call failed: {e}")
+            notify("Screenshot failed", str(e), icon="dialog-error", urgent=True)
+            sys.exit(1)
+        log(f"no Screenshot interface, restarting the portal stack: {e}")
+        try:
+            subprocess.run(["systemctl", "--user", "start",
+                            "xdg-desktop-portal-gnome.service"], check=False, timeout=15)
+            subprocess.run(["systemctl", "--user", "restart",
+                            "xdg-desktop-portal.service"], check=False, timeout=15)
+        except (FileNotFoundError, subprocess.SubprocessError) as se:
+            log(f"portal restart failed: {se}")
+        time.sleep(2)
+        try:
+            ret = call_screenshot()
+            log("recovered after portal restart")
+        except GLib.Error as e2:
+            log(f"call failed after portal restart: {e2}")
+            notify("Screenshot failed", str(e2), icon="dialog-error", urgent=True)
+            sys.exit(1)
 
     # The portal is free to hand back a request path other than the one we
     # predicted; the old code ignored it, so its Response never matched.
