@@ -11,11 +11,12 @@ On crossing the stop threshold it:
   2. WhatsApps the "My Claude" group
 It clears the flag again once usage falls back under the threshold (weekly reset).
 """
-import json, os, subprocess, sys, urllib.parse, urllib.request
+import json, os, shutil, subprocess, sys, urllib.parse, urllib.request
 from datetime import datetime
 
 STOP_AT   = float(os.environ.get("CLG_STOP_AT", "95"))
 WARN_AT   = float(os.environ.get("CLG_WARN_AT", "90"))
+BLIND_AT  = int(os.environ.get("CLG_BLIND_AT", "4"))   # consecutive failed reads before shouting
 DIR       = os.path.expanduser("~/.claude/limits-guard")
 PAUSE     = os.path.join(DIR, "PAUSE")
 STATE     = os.path.join(DIR, "state.json")
@@ -43,12 +44,31 @@ def wa(text):
 def main():
     os.makedirs(DIR, exist_ok=True)
     try:
-        raw = subprocess.run(["claude-limits", "--json"], capture_output=True,
-                             text=True, timeout=30, check=True).stdout
-        data = json.loads(raw)
+        state0 = json.load(open(STATE))
+    except Exception:
+        state0 = {}
+
+    cli = shutil.which("claude-limits") or os.path.expanduser("~/.local/bin/claude-limits")
+    try:
+        r = subprocess.run([cli, "--json"], capture_output=True,
+                           text=True, timeout=30, check=True)
+        data = json.loads(r.stdout)
     except Exception as e:
-        log(f"read FAILED: {e}")
+        # The usage endpoint rate-limits hard (HTTP 429). A guard that fails
+        # silently is worse than no guard, so count the failures and shout.
+        fails = int(state0.get("fails", 0)) + 1
+        state0["fails"] = fails
+        json.dump(state0, open(STATE, "w"))
+        log(f"read FAILED (#{fails}): {e}")
+        if fails == BLIND_AT:
+            wa("\U0001F916\U0001F916\U0001F916\n\nLimit guard is BLIND: the usage "
+               f"endpoint has refused {fails} reads in a row (rate limit or auth). "
+               "I cannot see your weekly %, so the automatic pause at 95% is NOT "
+               "protecting you right now.\n\n\U0001F916\U0001F916\U0001F916")
         return 0                      # never let a blip trigger a false pause
+
+    if state0.get("fails"):
+        log(f"read recovered after {state0['fails']} failures")
 
     week = (data.get("seven_day") or {}).get("utilization")
     if week is None:
@@ -86,7 +106,7 @@ def main():
 
     if week != last:
         log(f"weekly={week}%")
-    json.dump({"last": week, "warned": warned}, open(STATE, "w"))
+    json.dump({"last": week, "warned": warned, "fails": 0}, open(STATE, "w"))
     return 0
 
 
