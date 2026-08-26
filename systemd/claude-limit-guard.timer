@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll Claude usage limits every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=claude-limit-guard.service
+
+[Install]
+WantedBy=timers.target

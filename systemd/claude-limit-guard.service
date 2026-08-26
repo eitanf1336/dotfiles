@@ -1,0 +1,6 @@
+[Unit]
+Description=Claude weekly-limit guard (pause agents before the floor)
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/claude-limit-guard

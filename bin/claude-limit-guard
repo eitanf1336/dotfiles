@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""claude-limit-guard - poll the weekly usage limit every minute and slam the
+brakes when it gets close to the floor.
+
+Exists because a long-running agent only notices a limit between batches, and a
+single Fable batch can eat several points on its own. This runs outside every
+agent, so the check really is every minute.
+
+On crossing the stop threshold it:
+  1. writes ~/.claude/limits-guard/PAUSE  (agents are told to honour this file)
+  2. WhatsApps the "My Claude" group
+It clears the flag again once usage falls back under the threshold (weekly reset).
+"""
+import json, os, subprocess, sys, urllib.parse, urllib.request
+from datetime import datetime
+
+STOP_AT   = float(os.environ.get("CLG_STOP_AT", "95"))
+WARN_AT   = float(os.environ.get("CLG_WARN_AT", "90"))
+DIR       = os.path.expanduser("~/.claude/limits-guard")
+PAUSE     = os.path.join(DIR, "PAUSE")
+STATE     = os.path.join(DIR, "state.json")
+LOG       = os.path.join(DIR, "guard.log")
+GROUP_JID = "120363410856554324@g.us"
+BRIDGE    = os.environ.get("CWB_BRIDGE_SEND", "http://localhost:8080/api/send")
+
+
+def log(msg):
+    with open(LOG, "a") as f:
+        f.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
+
+
+def wa(text):
+    try:
+        payload = json.dumps({"recipient": GROUP_JID, "message": text, "store_local": True}).encode()
+        req = urllib.request.Request(BRIDGE, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            log(f"whatsapp -> {r.status}")
+    except Exception as e:
+        log(f"whatsapp FAILED: {e}")
+
+
+def main():
+    os.makedirs(DIR, exist_ok=True)
+    try:
+        raw = subprocess.run(["claude-limits", "--json"], capture_output=True,
+                             text=True, timeout=30, check=True).stdout
+        data = json.loads(raw)
+    except Exception as e:
+        log(f"read FAILED: {e}")
+        return 0                      # never let a blip trigger a false pause
+
+    week = (data.get("seven_day") or {}).get("utilization")
+    if week is None:
+        log("no seven_day utilization in payload")
+        return 0
+    week = float(week)
+
+    try:
+        state = json.load(open(STATE))
+    except Exception:
+        state = {}
+    last = state.get("last")
+    warned = bool(state.get("warned"))
+    paused = os.path.exists(PAUSE)
+
+    if week >= STOP_AT and not paused:
+        with open(PAUSE, "w") as f:
+            f.write(f"weekly={week}% at {datetime.now().isoformat(timespec='seconds')}\n")
+        wa(f"\U0001F916\U0001F916\U0001F916\n\nWeekly limit guard tripped: {week:.0f}% used, "
+           f"only {100 - week:.0f}% left.\n\nPAUSE flag is set, agents should be "
+           f"parking now. Nothing is lost, it can resume after the weekly reset.\n\n"
+           f"\U0001F916\U0001F916\U0001F916")
+        log(f"PAUSE set at {week}%")
+    elif week < STOP_AT and paused:
+        os.remove(PAUSE)
+        warned = False
+        wa(f"\U0001F916\U0001F916\U0001F916\n\nWeekly usage back down to {week:.0f}%. "
+           f"PAUSE flag cleared, agents may resume.\n\n\U0001F916\U0001F916\U0001F916")
+        log(f"PAUSE cleared at {week}%")
+    elif week >= WARN_AT and not warned and not paused:
+        warned = True
+        wa(f"\U0001F916\U0001F916\U0001F916\n\nHeads up: weekly usage at {week:.0f}%. "
+           f"Agents pause automatically at {STOP_AT:.0f}%.\n\n\U0001F916\U0001F916\U0001F916")
+        log(f"warned at {week}%")
+
+    if week != last:
+        log(f"weekly={week}%")
+    json.dump({"last": week, "warned": warned}, open(STATE, "w"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
