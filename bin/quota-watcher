@@ -620,6 +620,9 @@ def cmd_tick(argv):
         # longer each time so that a burst of 429s is not answered with a
         # burst of retries.
         fails = int(st.get("fails", 0)) + 1
+        if dry:
+            print(f"could not read the limit: {e}")
+            return 0                               # a dry run changes nothing
         set_state(fails=fails, next_poll_at=now + min(300, 60 * fails))
         log(f"read FAILED (#{fails}): {e}")
         if fails == 5:
