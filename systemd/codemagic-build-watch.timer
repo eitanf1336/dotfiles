@@ -1,0 +1,10 @@
+[Unit]
+Description=Poll Codemagic for free Mac minutes (fires the build once, then disables itself)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

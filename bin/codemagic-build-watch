@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Trigger the FocusRace iOS TestFlight build the moment Codemagic's free Mac
+minutes come back, then get out of the way.
+
+Why this exists: on 2026-08-27 the free personal tier (500 mac_mini_m2 minutes a
+month) ran out at 30204s of 30000s, so pushing to `ios-port` produced NO build at
+all - the webhook is accepted and silently drops the build. The version-label fix
+(TestFlight was labelling everything 0.1.30) is therefore committed but cannot
+reach a tester until minutes reset, which is the 1st of the month.
+
+So: poll the billing endpoint, and the first time there is real headroom, start
+one ios-testflight build on ios-port, WhatsApp Eitan, and disable the timer. It
+fires ONCE. Cancel it any time with:  systemctl --user disable --now codemagic-build-watch.timer
+"""
+import json, os, subprocess, sys, time
+
+TOKEN_FILE = os.path.expanduser("~/.config/claude/codemagic.json")
+STATE = os.path.expanduser("~/.local/state/codemagic-build-watch.json")
+LOG = os.path.expanduser("~/.local/state/codemagic-build-watch.log")
+APP_ID = "6a6b045b435ee2e5ed29e0d9"          # FocusRace on Codemagic
+WORKFLOW = "ios-testflight"
+BRANCH = "ios-port"
+WA_GROUP = "120363410856554324@g.us"          # "My Claude" WhatsApp group
+# An iOS archive + upload has taken 12-20 minutes; don't start one on fumes,
+# a build killed mid-archive burns the minutes and produces nothing.
+NEED_SECONDS = 25 * 60
+
+
+def log(msg):
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+
+
+def api(path, payload=None):
+    token = json.load(open(TOKEN_FILE))["token"]
+    cmd = ["curl", "-s", "-H", "x-auth-token: " + token,
+           "https://api.codemagic.io" + path]
+    if payload is not None:
+        cmd[1:1] = ["-X", "POST", "-H", "Content-Type: application/json",
+                    "-d", json.dumps(payload)]
+    r = subprocess.run(cmd, timeout=45, capture_output=True, text=True)
+    return json.loads(r.stdout or "{}")
+
+
+def whatsapp(text):
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "-X", "POST", "http://localhost:8080/api/send",
+             "-H", "Content-Type: application/json",
+             "-d", json.dumps({"recipient": WA_GROUP, "message": text})],
+            timeout=25, capture_output=True, text=True)
+        return '"success":true' in (r.stdout or "").replace(" ", "")
+    except Exception as e:
+        log("whatsapp send failed: %s" % e)
+        return False
+
+
+def free_minutes():
+    """(used_seconds, limit_seconds) on the free Mac tier."""
+    u = api("/user").get("user", {}).get("billing", {}).get("usage", {})
+    used = sum(v for k, v in u.get("currentPeriod", {}).get("buildTime", {}).items()
+               if k.endswith("_free"))
+    return used, u.get("freeLimit", {}).get("buildTime", 0)
+
+
+def main():
+    if not os.path.exists(TOKEN_FILE):
+        log("no codemagic token, nothing to do")
+        return 0
+
+    used, limit = free_minutes()
+    left = limit - used
+    if "--status" in sys.argv:
+        print("free Mac build time: %d/%d min used, %d min left"
+              % (used / 60, limit / 60, left / 60))
+        return 0
+
+    if left < NEED_SECONDS:
+        log("only %d min left of %d, waiting" % (left / 60, limit / 60))
+        return 0
+
+    r = api("/builds", {"appId": APP_ID, "workflowId": WORKFLOW, "branch": BRANCH})
+    if r.get("error"):
+        log("trigger refused: %s" % r)
+        return 0
+
+    build_id = r.get("buildId") or r.get("_id") or ""
+    log("triggered %s on %s: %s" % (WORKFLOW, BRANCH, build_id))
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    json.dump({"triggered": time.strftime("%Y-%m-%d %H:%M:%S"), "buildId": build_id},
+              open(STATE, "w"))
+    whatsapp(
+        "\U0001F916\U0001F916\U0001F916\n"
+        "Codemagic's free Mac minutes reset, so I started the FocusRace iOS build "
+        "(%d min of %d free available).\n\n"
+        "This is the first build carrying the version fix: TestFlight will finally "
+        "say 0.1.35 instead of 0.1.30.\n\n"
+        "https://codemagic.io/app/%s/build/%s\n\n"
+        "Nothing for you to do. I've switched the watcher off now that it has fired.\n"
+        "\U0001F916\U0001F916\U0001F916" % (left / 60, limit / 60, APP_ID, build_id))
+    subprocess.run(["systemctl", "--user", "disable", "--now",
+                    "codemagic-build-watch.timer"], capture_output=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

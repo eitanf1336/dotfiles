@@ -1,0 +1,7 @@
+[Unit]
+Description=Start the FocusRace iOS build once Codemagic's free Mac minutes reset
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/codemagic-build-watch
