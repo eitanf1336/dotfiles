@@ -17,6 +17,7 @@ Usage:
   claude-account rename <a> <b>  rename a saved account
   claude-account rm <name>       forget a saved account
   claude-account restore         undo the last switch
+  claude-account sync            fold the live tokens back into the active slot
 
 Options:
   -f, --force    switch even while Claude is mid-task
@@ -657,6 +658,77 @@ def cmd_add(args):
     return 0
 
 
+def cmd_sync(args):
+    """Fold the live tokens back into the slot that is currently active.
+
+    Claude Code refreshes its OAuth token roughly every eight hours, and the
+    server rotates the refresh token when it does: the previous one stops
+    working. `use` already folds the live tokens back into the slot it is
+    leaving, which covers a deliberate switch - but any refresh that happens
+    afterwards leaves the parked copy holding a refresh token that has since
+    been rotated away. Restore that slot later and its token is rejected, so
+    Claude Code asks you to log in again. With a single account there was no
+    snapshot to go stale, which is why this only started with two.
+
+    Running this whenever the live credentials change keeps the active slot's
+    copy current, so a slot is never restored with a dead token. It only ever
+    copies files - no network, no token refresh, nothing to rate-limit."""
+    quiet = "-q" in args or "--quiet" in args
+    name = active_name()
+    if not name:
+        if not quiet:
+            info(f"{DIM}No active slot - nothing to sync.{RST}")
+        return 0
+    if not have_live_creds():
+        if not quiet:
+            info(f"{YEL}Nobody is logged in - nothing to sync.{RST}")
+        return 0
+    if not os.path.isdir(slot(name)):
+        if not quiet:
+            info(f"{YEL}Active slot '{name}' no longer exists.{RST}")
+        return 0
+
+    # Never write over a slot that isn't the login we actually have. The
+    # identity in ~/.claude.json is the same marker `use` swaps, and reading
+    # it costs nothing.
+    live_email = identity_email(live_identity())
+    meta = read_json(slot_meta(name), {}) or {}
+    slot_email = meta.get("email") or identity_email(
+        read_json(slot_identity(name), {}) or {})
+    if live_email and slot_email and live_email != slot_email:
+        info(f"{YEL}Live login ({live_email}) is not slot '{name}' "
+             f"({slot_email}) - refusing to overwrite it.{RST}")
+        return 1
+
+    try:
+        with open(CRED, "rb") as fh:
+            live_bytes = fh.read()
+    except OSError as e:
+        info(f"{YEL}Can't read the live credentials: {e}{RST}")
+        return 1
+    try:
+        with open(slot_cred(name), "rb") as fh:
+            same = fh.read() == live_bytes
+    except OSError:
+        same = False
+    if same:
+        if not quiet:
+            info(f"{DIM}'{name}' is already up to date.{RST}")
+        return 0
+
+    atomic_write(slot_cred(name), live_bytes.decode(), 0o600)
+    ident = live_identity()
+    if ident:
+        write_json(slot_identity(name), ident, 0o600)
+    meta["savedAt"] = time.time()
+    if live_email:
+        meta["email"] = live_email
+    write_json(slot_meta(name), meta, 0o600)
+    if not quiet:
+        info(f"{GRN}Refreshed tokens folded into '{name}'.{RST}")
+    return 0
+
+
 def cmd_rm(args):
     pos = [a for a in args if not a.startswith("-")]
     if not pos:
@@ -754,6 +826,7 @@ COMMANDS = {
     "rename": cmd_rename, "mv": cmd_rename,
     "whoami": cmd_whoami, "who": cmd_whoami, "status": cmd_whoami,
     "restore": cmd_restore, "undo": cmd_restore,
+    "sync": cmd_sync,
 }
 
 

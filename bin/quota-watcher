@@ -363,16 +363,31 @@ def send_to_sessions(targets, text, tag):
 
 
 # ---- quota -------------------------------------------------------------
+# How old a reading may be and still be worth parking sessions over. claude-limits
+# now serves its last good reading when the endpoint is refusing, which keeps this
+# watcher from going blind - but a reading from half an hour ago says nothing
+# useful about a 5-hour window that may have moved a long way since.
+MAX_READING_AGE = 600
+
+
 def limits():
-    """The live usage picture. The endpoint rate-limits hard on bursts, and
-    this box already has claude-limit-guard polling it, so one transient
-    failure is worth a second try before it counts as a blind read."""
+    """The live usage picture. The endpoint rate-limits hard on bursts, so
+    claude-limits caches: a repeat read inside its TTL costs nothing, and a
+    read taken during a 429 comes back from cache tagged with its age. A
+    reading too old to act on is treated as no reading at all."""
     exe = shutil.which("claude-limits") or os.path.join(HOME, ".local/bin/claude-limits")
     for attempt in (1, 2):
         try:
             out = subprocess.run([exe, "--json"], capture_output=True,
                                  text=True, timeout=45, check=True)
-            return json.loads(out.stdout)
+            data = json.loads(out.stdout)
+            meta = data.get("_claude_limits") or {}
+            age = float(meta.get("age_seconds") or 0)
+            if meta.get("cached") and age > MAX_READING_AGE:
+                raise RuntimeError(
+                    f"only a {int(age // 60)}m-old reading available "
+                    f"({meta.get('error_detail') or 'endpoint refusing'})")
+            return data
         except Exception:
             if attempt == 2:
                 raise

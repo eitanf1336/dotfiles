@@ -1,0 +1,9 @@
+[Unit]
+Description=Keep the active Claude account slot's saved tokens current
+Documentation=man:claude-account(1)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-account sync -q
+# File comparison only: no network, nothing to rate-limit.
+Nice=10

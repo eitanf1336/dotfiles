@@ -1,0 +1,15 @@
+[Unit]
+Description=Fold refreshed Claude tokens back into the active account slot
+
+# Claude Code refreshes its OAuth token every few hours and the server rotates
+# the refresh token when it does, which silently invalidates the copy parked in
+# the account slot. Restoring that slot later would then force a fresh login.
+# Ten minutes keeps the parked copy close enough that this cannot happen.
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

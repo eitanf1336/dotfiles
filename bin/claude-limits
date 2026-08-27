@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""claude-limits — show Claude's current usage limits (5-hour session + weekly).
+"""claude-limits - show Claude's current usage limits (5-hour session + weekly).
 
 Reads the same data Claude Code's /usage screen shows, straight from the
 Anthropic OAuth usage endpoint, using the token in ~/.claude/.credentials.json.
 Prints a colored bar per active limit with how full it is and when it resets.
+
+The endpoint rate-limits hard - once it refuses it refuses for the best part of
+an hour - so every good reading is cached on disk and reused. A reading that
+can't be taken right now is shown from cache with its age instead of vanishing,
+and the reason it couldn't be taken is named rather than always blamed on a
+stale token.
 
 Usage:
   claude-limits            pretty summary of every limit
@@ -12,7 +18,11 @@ Usage:
   claude-limits -a         one line per saved account, to see who has headroom
   claude-limits -q         one compact line (highest-utilization limit)
   claude-limits --json     raw JSON from the API
+  claude-limits --fresh    ignore the cache and force a live read
   claude-limits -h
+
+Env:
+  CLAUDE_LIMITS_TTL   seconds a cached reading counts as current (default 90)
 """
 import os
 import sys
@@ -25,6 +35,12 @@ from datetime import datetime, timezone
 CRED = os.path.expanduser("~/.claude/.credentials.json")
 URL = "https://api.anthropic.com/api/oauth/usage"
 UA = "claude-cli/2.1.197 (claude-limits)"
+
+CACHE_DIR = os.path.expanduser("~/.claude/usage-cache")
+try:
+    CACHE_TTL = float(os.environ.get("CLAUDE_LIMITS_TTL") or 90)
+except ValueError:
+    CACHE_TTL = 90.0
 
 use_color = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 if use_color:
@@ -82,15 +98,150 @@ def load_token(account=None):
     return oauth.get("accessToken"), oauth, expired
 
 
+class UsageError(Exception):
+    """A read that didn't happen, and why. `kind` is one of:
+
+    ratelimited  the endpoint is refusing (429). It refuses for ~an hour, so
+                 retrying is pointless; `retry_at` says when it's worth asking.
+    auth         401/403 - this token really is stale.
+    network      no answer at all: offline, DNS, timeout.
+    http         some other status.
+    """
+
+    def __init__(self, kind, detail="", retry_at=None):
+        super().__init__(detail or kind)
+        self.kind = kind
+        self.detail = detail
+        self.retry_at = retry_at
+
+    def describe(self, account=None):
+        """One short phrase, honest about what actually went wrong."""
+        if self.kind == "ratelimited":
+            left = (self.retry_at or 0) - time.time()
+            when = f", try again in {int(left // 60) + 1}m" if left > 0 else ""
+            return f"usage endpoint is rate-limiting{when}"
+        if self.kind == "auth":
+            who = account or "<account>"
+            return f"token rejected; run `claude-account use {who}` to refresh"
+        if self.kind == "network":
+            return f"can't reach the endpoint ({self.detail})"
+        return self.detail or "endpoint error"
+
+
+# ------------------------------------------------------------------- caching
+# The endpoint's 429s last the best part of an hour and this box polls it from
+# several places (quota-watcher every minute, claude-limit-guard, failover).
+# Every good reading is therefore kept on disk: within TTL it is served instead
+# of asking again, and when a read fails it is shown with its age instead of
+# the command going blank.
+
+def cache_path(account):
+    return os.path.join(CACHE_DIR, (account or "_live") + ".json")
+
+
+def cache_read(account):
+    """(data, age_seconds, retry_at) - any of them None if not recorded."""
+    blob = None
+    try:
+        with open(cache_path(account)) as fh:
+            blob = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None, None, None
+    data = blob.get("data")
+    at = blob.get("at")
+    age = (time.time() - at) if isinstance(at, (int, float)) else None
+    return data, age, blob.get("retry_at")
+
+
+def cache_write(account, data=None, retry_at=None):
+    """Record a good reading, a cooldown, or both. Never fatal."""
+    try:
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+        prev = {}
+        try:
+            with open(cache_path(account)) as fh:
+                prev = json.load(fh) or {}
+        except (OSError, json.JSONDecodeError):
+            pass
+        if data is not None:
+            prev["data"] = data
+            prev["at"] = time.time()
+        if retry_at is not None:
+            prev["retry_at"] = retry_at
+        path = cache_path(account)
+        tmp = f"{path}.tmp-{os.getpid()}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(prev))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def fetch(token):
+    """One live read. Raises UsageError with the real reason on failure."""
     req = urllib.request.Request(URL, headers={
         "Authorization": "Bearer " + token,
         "anthropic-beta": "oauth-2025-04-20",
         "Content-Type": "application/json",
         "User-Agent": UA,
     })
-    with urllib.request.urlopen(req, timeout=25) as r:
-        return json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            try:
+                wait = int(e.headers.get("Retry-After") or 0)
+            except (TypeError, ValueError):
+                wait = 0
+            raise UsageError("ratelimited", "HTTP 429",
+                             time.time() + (wait or 600))
+        if e.code in (401, 403):
+            raise UsageError("auth", f"HTTP {e.code}")
+        raise UsageError("http", f"HTTP {e.code}")
+    except urllib.error.URLError as e:
+        raise UsageError("network", str(getattr(e, "reason", e)))
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        raise UsageError("network", str(e))
+
+
+def get_usage(account=None, ttl=None, fresh=False):
+    """(data, age, error). `age` is None for a live read, seconds for a cached
+    one. `error` is set when the live read failed - `data` may still be a
+    cached reading, and is None only when there is nothing to show at all."""
+    ttl = CACHE_TTL if ttl is None else ttl
+    cached, age, retry_at = cache_read(account)
+
+    if not fresh and cached is not None and age is not None and age < ttl:
+        return cached, age, None
+
+    # Inside a known cooldown, asking again just burns another refusal.
+    if retry_at and time.time() < retry_at and not fresh:
+        err = UsageError("ratelimited", "cooling down", retry_at)
+        return cached, age, err
+
+    token, _oauth, _expired = load_token(account)
+    if not token:
+        return cached, age, UsageError("auth", "no access token")
+    try:
+        data = fetch(token)
+    except UsageError as e:
+        if e.kind == "ratelimited":
+            cache_write(account, retry_at=e.retry_at)
+        return cached, age, e
+    cache_write(account, data=data, retry_at=0)
+    return data, None, None
+
+
+def fmt_age(age):
+    if age is None:
+        return ""
+    if age < 90:
+        return f"{int(age)}s ago"
+    if age < 5400:
+        return f"{int(age // 60)}m ago"
+    return f"{int(age // 3600)}h ago"
 
 
 def color_for(percent, severity=None):
@@ -186,9 +337,10 @@ ALL_COLS = ("Session (5h)", "Weekly (all)")
 CELL_W = 22  # visible width of one cell: bar(10) + " " + "100%" + " " + reset(6)
 
 
-def show_all(quiet=False):
+def show_all(quiet=False, fresh=False):
     """One line per saved account, 5h next to weekly, so you can see at a
-    glance which account has room before switching."""
+    glance which account has room before switching. A row that couldn't be
+    read live falls back to its last cached reading, tagged with its age."""
     names = account_names()
     if not names:
         die(f"{YEL}No saved accounts.{RST} "
@@ -204,15 +356,12 @@ def show_all(quiet=False):
         head = "  ".join(c.ljust(CELL_W) for c in ALL_COLS)
         print(f"   {' ' * width}  {DIM}{head}{RST}")
     for n in names:
-        token, _oauth, _expired = load_token(n)
         mark = f"{GRN}*{RST}" if n == active else " "
-        try:
-            rows = collect(fetch(token)) if token else []
-        except (urllib.error.URLError, OSError, json.JSONDecodeError):
-            rows = []
+        data, age, err = get_usage(n, fresh=fresh)
+        rows = collect(data) if data else []
         if not rows:
-            print(f" {mark} {n.ljust(width)}  {GRY}unavailable (stale token; "
-                  f"run `claude-account use {n}` to refresh){RST}")
+            why = err.describe(n) if err else "no limits reported"
+            print(f" {mark} {n.ljust(width)}  {GRY}no reading ({why}){RST}")
             continue
         by = {}
         for label, pct, sev, reset in rows:
@@ -228,7 +377,13 @@ def show_all(quiet=False):
             # bar is 10 visible chars, then " NNN% ", then the reset
             cells.append(f"{bar(pct, 10)} {c}{pct:3.0f}%{RST} "
                          f"{SOFT}{short_reset(reset).ljust(6)}{RST}")
-        print(f" {mark} {n.ljust(width)}  " + "  ".join(cells))
+        # Say so when these numbers are remembered rather than just read.
+        tag = ""
+        if err is not None:
+            tag = f"  {GRY}({fmt_age(age) or 'cached'}; {err.describe(n)}){RST}"
+        elif age is not None and age >= CACHE_TTL:
+            tag = f"  {GRY}({fmt_age(age)}){RST}"
+        print(f" {mark} {n.ljust(width)}  " + "  ".join(cells) + tag)
     if not quiet:
         print()
 
@@ -240,48 +395,70 @@ def main():
         return
     quiet = "-q" in args or "--quiet" in args
     as_json = "--json" in args
+    fresh = "--fresh" in args or "--no-cache" in args
     if "--all" in args or "-a" in args:
-        return show_all(quiet)
+        return show_all(quiet, fresh)
     account = next((a for a in args if not a.startswith("-")), None)
 
-    token, oauth, expired = load_token(account)
-    if not token:
-        die(f"{RED}No access token found — run `claude` to log in.{RST}")
-    try:
-        data = fetch(token)
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            hint = " (token expired)" if expired else ""
+    data, age, err = get_usage(account, fresh=fresh)
+    if data is None:
+        who = f" for '{account}'" if account else ""
+        if err and err.kind == "auth":
             if account:
-                die(f"{RED}Auth rejected for '{account}'{hint}.{RST}\n"
+                die(f"{RED}Token rejected{who}.{RST}\n"
                     f"Its saved token has gone stale. Run "
                     f"`claude-account use {account}` once to refresh it.")
-            die(f"{RED}Auth rejected{hint}.{RST} "
+            die(f"{RED}Token rejected.{RST} "
                 "Refresh it by running `claude` once, then retry.")
-        die(f"{RED}Usage endpoint returned HTTP {e.code}.{RST}")
-    except urllib.error.URLError as e:
-        die(f"{RED}Network error:{RST} {e.reason}")
+        if err and err.kind == "ratelimited":
+            die(f"{YEL}No reading{who}:{RST} {err.describe(account)}.\n"
+                f"{DIM}Nothing cached yet either. This is the endpoint "
+                f"throttling, not a login problem.{RST}")
+        die(f"{RED}No reading{who}:{RST} "
+            f"{err.describe(account) if err else 'endpoint returned nothing'}.")
 
     if as_json:
-        print(json.dumps(data, indent=2))
+        # Callers (quota-watcher, claude-failover) act on these numbers, so the
+        # payload has to say whether they were just read or merely remembered.
+        out = dict(data)
+        out["_claude_limits"] = {
+            "cached": err is not None or (age is not None and age >= CACHE_TTL),
+            "age_seconds": round(age, 1) if age is not None else 0.0,
+            "error": err.kind if err else None,
+            "error_detail": err.describe(account) if err else None,
+        }
+        print(json.dumps(out, indent=2))
         return
 
     rows = collect(data)
     if not rows:
         die(f"{YEL}No usage limits reported.{RST}")
+    # Only for the plan name in the header; never worth failing over.
+    try:
+        with open(cred_path(account)) as fh:
+            oauth = json.load(fh).get("claudeAiOauth") or {}
+    except (OSError, KeyError, json.JSONDecodeError, SystemExit):
+        oauth = {}
 
     if quiet:
         label, pct, sev, reset = max(rows, key=lambda r: r[1])
         c = color_for(pct, sev)
         tail = fmt_reset(reset)
         tail = " · " + tail.replace(f"{DIM}", "").replace(f"{RST}", "") if tail else ""
-        print(f"{c}{pct:.0f}%{RST} {label}{tail}")
+        stale = f" ({fmt_age(age)})" if err is not None or (
+            age is not None and age >= CACHE_TTL) else ""
+        print(f"{c}{pct:.0f}%{RST} {label}{tail}{stale}")
         return
 
     tier = (oauth.get("subscriptionType") or "").capitalize()
     tierline = f" {DIM}·{RST} {BLD}Claude {tier}{RST}" if tier else ""
     who = f" {DIM}({account}){RST}" if account else ""
     print(f"{BLD}Claude usage limits{RST}{who}{tierline}\n")
+    if err is not None:
+        print(f"  {YEL}Last known reading, {fmt_age(age) or 'from cache'}{RST} "
+              f"{DIM}({err.describe(account)}){RST}\n")
+    elif age is not None and age >= CACHE_TTL:
+        print(f"  {DIM}cached {fmt_age(age)}; --fresh to re-read{RST}\n")
     width = max(len(r[0]) for r in rows)
     for label, pct, sev, reset in rows:
         c = color_for(pct, sev)
