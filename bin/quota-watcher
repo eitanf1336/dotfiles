@@ -85,9 +85,10 @@ The shared 5-hour Claude quota is down to about {remaining:.0f}% left, and this 
 
 What to do, in this order:
 1. Finish the tool call you are in the middle of, or abandon it, whichever leaves less mess. Do not start another one.
-2. Leave the work pickup-able cold: save files, commit if that is your habit, and stop anything you left running that should not outlive you.
-3. In your reply, write one short paragraph saying exactly where you stopped, what you had established, and what the very next step is. This is the note you will be handed back later, so write it for someone with no memory of the last hour.
-4. End your turn. Do not start new work and do not spawn subagents.
+2. Leave the work pickup-able cold: save files, commit if that is your habit.
+3. Deal with anything you have running in the background. A background shell command does NOT survive this: your process is what dies, so the command is either killed with it or left orphaned with nobody reading its output, and the session that resumes you will be told only that it cannot prove the command finished. So either wait for it if it is close, or kill it and say so, and name its output file in your note either way.
+4. In your reply, write one short paragraph saying exactly where you stopped, what you had established, and what the very next step is. This is the note you will be handed back later, so write it for someone with no memory of the last hour.
+5. End your turn. Do not start new work and do not spawn subagents.
 
 {comeback}
 
@@ -126,7 +127,8 @@ You were not finished, and you did not fail. You were parked on purpose so you w
 {where}Pick up where you stopped:
 1. Read back over the end of this conversation, including the stopping note you left if you left one, and re-establish what you were doing and why.
 2. Do not trust your old picture of the world without checking it: time has passed, files may have moved, a build may be stale, and anything you had running is gone.
-3. Finish the task you were originally given. Do not start anything new and do not redo work that is already done.
+3. If you are told a background shell command from the previous session has no completion record, that is this pause and not a bug: it was cut off mid-flight. Read its output file for whatever it managed before deciding anything, rather than assuming it finished or blindly running it again.
+4. Finish the task you were originally given. Do not start anything new and do not redo work that is already done.
 
 If it turns out everything was already finished, say so in one line and stop."""
 
