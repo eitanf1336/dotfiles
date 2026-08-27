@@ -1,0 +1,991 @@
+#!/usr/bin/env python3
+"""quota-watcher - park every Claude before the 5h quota runs out, resume after the reset.
+
+Runs forever as a systemd user timer (once a minute, spending no tokens to
+look). The loop it drives, for as long as it is armed:
+
+    armed    watching the 5-hour limit on the live account
+      |  headroom drops to the threshold (default 10% left)
+      v
+    warning  every live Claude is *asked* to park: a message explaining why,
+             what to write down, and that it will be brought back. 5 min grace.
+      |  the grace runs out, or everyone parked early
+      v
+    paused   every live Claude is stopped for real and remembered
+      |  the window resets  -- or, with --rotate, another account has quota
+      v
+    armed    everyone is resumed where they left off, with a welcome-back note
+
+With --rotate it does not just wait: it moves the whole machine to the next
+Claude account that still has headroom (claude-account) and resumes everyone
+there straight away, coming back round as each account resets.
+
+It never ends on its own. `quota-watcher --stop` is the only way out, and it
+brings the parked sessions back on the way out.
+
+Usage:
+  quota-watcher [PCT] [--rotate A B ...]   arm it; park when under PCT% is left (10)
+  quota-watcher --stop [--leave-paused]    disarm, and resume what it parked
+  quota-watcher --status                   where it is in the cycle, and who is parked
+  quota-watcher --targets                  the Claudes it would park right now
+  quota-watcher --tick [-n]                one poll (what the timer runs); -n = dry run
+
+Options:
+  --rotate A B ...   account names (claude-account slots) to cycle through when
+                     the live one runs dry. Order is preference order.
+  --grace SECONDS    how long to be polite before forcing it (default 300)
+  --margin PCT       headroom an account needs before we switch to it (default 10)
+  --working-only     leave live-but-idle agents alone (default: park them too)
+"""
+import errno
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+DIR = os.path.join(HOME, ".claude/quota-watcher")
+CONF = os.path.join(DIR, "config.json")
+STATE = os.path.join(DIR, "state.json")
+LOG = os.path.join(DIR, "watcher.log")
+COURIER_LOG = os.path.join(DIR, "courier.log")
+RESUME_LOG = os.path.join(DIR, "resume.log")
+PAUSED_FILE = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")),
+    "claude-pause", "paused.json")
+
+CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
+UNIT = "quota-watcher.timer"
+GROUP_JID = "120363410856554324@g.us"          # the "My Claude" self-group
+BRIDGE = os.environ.get("CWB_BRIDGE_SEND", "http://localhost:8080/api/send")
+
+# The model that carries the polite message. It only has to read a list and
+# call a tool, and it is spending the very quota we are trying to protect.
+COURIER_MODEL = os.environ.get("QW_COURIER_MODEL", "haiku")
+
+if sys.stdout.isatty() and os.environ.get("NO_COLOR") is None:
+    RED, YEL, GRN, CYA, GRY, BLD, RST = (
+        "\033[31m", "\033[33m", "\033[32m", "\033[36m",
+        "\033[90m", "\033[1m", "\033[0m")
+else:
+    RED = YEL = GRN = CYA = GRY = BLD = RST = ""
+
+
+# ---- the things we say -------------------------------------------------
+def park_message(remaining, threshold, comeback, grace_min):
+    """What a live Claude is asked to do. Deliberately blunt about the
+    deadline: an agent that reads this as advisory gets killed mid-stream."""
+    return f"""Quota watcher: please reach a safe stopping point now and end your turn.
+
+The shared 5-hour Claude quota is down to about {remaining:.0f}% left, and this machine parks every session at {threshold:.0f}% so that none of us dies mid-sentence. Nothing has gone wrong and nothing is being thrown away.
+
+What to do, in this order:
+1. Finish the tool call you are in the middle of, or abandon it, whichever leaves less mess. Do not start another one.
+2. Leave the work pickup-able cold: save files, commit if that is your habit, and stop anything you left running that should not outlive you.
+3. In your reply, write one short paragraph saying exactly where you stopped, what you had established, and what the very next step is. This is the note you will be handed back later, so write it for someone with no memory of the last hour.
+4. End your turn. Do not start new work and do not spawn subagents.
+
+{comeback}
+
+If you are still streaming in {grace_min} minutes you will be stopped anyway, wherever you happen to be. The note above is what makes that unnecessary."""
+
+
+def wrapup_message(remaining, eta):
+    """For a Claude open in one of his terminals. It is not ours to kill and
+    there is nothing to resume it into, so it gets the truth: this one is on
+    you."""
+    return f"""Quota watcher: please wrap up, the 5-hour Claude quota is nearly gone.
+
+There is about {remaining:.0f}% left and everything else on this machine is being parked right now. You are an interactive session, so the watcher will NOT stop you and will NOT resume you: this window belongs to the user, and the wrap-up is yours to do.
+
+1. Finish the tool call you are in the middle of, or abandon it, whichever leaves less mess.
+2. Save files and stop anything you left running that should not outlive this turn.
+3. Say in one short paragraph where you stopped and what the next step is, so the user can pick it up.
+4. End your turn and stay idle until the quota comes back ({eta}).
+
+If you keep working you are spending the last of the shared quota, and your calls will start failing outright rather than stopping cleanly."""
+
+
+STAND_DOWN = """Quota watcher: stand down, the quota recovered and you are not being parked.
+
+Headroom on the 5-hour limit came back before the grace period ran out, so ignore the parking notice you just got. Carry on with what you were doing. If you already wrote a stopping note, no harm done, just keep going from it."""
+
+
+def resume_prompt(switched_to=None):
+    where = (f"You have also been moved onto a different Claude account "
+             f"({switched_to}), which is where the fresh quota came from. That "
+             f"changes nothing about your work.\n\n" if switched_to else "")
+    return f"""Welcome back. The quota watcher has resumed you.
+
+You were not finished, and you did not fail. You were parked on purpose so you would not burn the last of the shared quota mid-task. Your files, this conversation and your working directory are exactly as you left them.
+
+{where}Pick up where you stopped:
+1. Read back over the end of this conversation, including the stopping note you left if you left one, and re-establish what you were doing and why.
+2. Do not trust your old picture of the world without checking it: time has passed, files may have moved, a build may be stale, and anything you had running is gone.
+3. Finish the task you were originally given. Do not start anything new and do not redo work that is already done.
+
+If it turns out everything was already finished, say so in one line and stop."""
+
+
+# ---- small helpers -----------------------------------------------------
+def log(msg):
+    os.makedirs(DIR, exist_ok=True)
+    with open(LOG, "a") as fh:
+        fh.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
+
+
+def read_json(path, default):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(obj, fh, indent=1)
+    os.replace(tmp, path)
+
+
+def die(msg, code=1):
+    sys.stderr.write(f"{RED}error:{RST} {msg}\n")
+    sys.exit(code)
+
+
+def fmt_eta(seconds):
+    seconds = max(0, int(seconds))
+    h, m = divmod(seconds // 60, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m"
+
+
+def notify(title, body):
+    """Best-effort shouting: the desktop, and the WhatsApp self-group."""
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "quota-watcher", title, body],
+                       capture_output=True)
+    try:
+        payload = json.dumps(
+            {"recipient": GROUP_JID,
+             "message": f"\U0001F916\U0001F916\U0001F916\n\n{title}\n\n{body}"
+                        f"\n\n\U0001F916\U0001F916\U0001F916",
+             "store_local": True}).encode()
+        req = urllib.request.Request(BRIDGE, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            log(f"whatsapp -> {r.status}")
+    except Exception as e:
+        log(f"whatsapp FAILED: {e}")
+
+
+# ---- what is alive right now -------------------------------------------
+def alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except OSError as e:
+        return e.errno == errno.EPERM
+    return True
+
+
+def agents():
+    try:
+        out = subprocess.run([CLAUDE, "agents", "--json"],
+                             capture_output=True, text=True, timeout=60)
+        data = json.loads(out.stdout or "[]")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def is_working(a):
+    return a.get("state") == "working" or a.get("status") == "busy"
+
+
+def is_bg(a):
+    """Background agents carry a short `id`; an interactive session (a Claude
+    open in one of his terminals) carries only a pid and a name."""
+    return a.get("kind") != "interactive" and bool(a.get("id"))
+
+
+def short_of(a):
+    return a.get("id") or (a.get("sessionId") or "")[:8]
+
+
+def label(a):
+    return a.get("name") or short_of(a) or "(unnamed)"
+
+
+def stoppable(a, kill_interactive=False):
+    """A background agent can be stopped and resumed in place, so parking one
+    costs nothing. An interactive session is a window the user is sitting in
+    front of: stopping it takes his terminal with it and there is nothing to
+    resume into, so by default it is only ever *asked* to park."""
+    return is_bg(a) or kill_interactive
+
+
+def live_sessions(working_only=False):
+    """Sessions worth parking: a real process behind them, not already
+    finished. A `state: done` agent still holding a pid is spending nothing,
+    and resuming it later would only waste a turn, so it is left alone."""
+    out = []
+    for a in agents():
+        if a.get("state") == "done":
+            continue
+        if not (is_working(a) or alive(a.get("pid"))):
+            continue
+        if working_only and not is_working(a):
+            continue
+        out.append(a)
+    return out
+
+
+def stop_agent(a):
+    """`claude stop` keeps the conversation and drops the process. It only
+    speaks for background sessions, so an interactive one (which we only get
+    here when the user asked for --kill-interactive) falls back to a TERM."""
+    if is_bg(a):
+        try:
+            out = subprocess.run([CLAUDE, "stop", short_of(a)],
+                                 capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        txt = (out.stdout + out.stderr).lower()
+        return out.returncode == 0 or "stopped" in txt or "no job matching" in txt
+    pid = a.get("pid")
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 15)
+        return True
+    except OSError as e:
+        log(f"could not TERM interactive {label(a)} ({pid}): {e}")
+        return False
+
+
+def stop_all(targets, kill_interactive=False):
+    return sum(1 for a in targets
+               if stoppable(a, kill_interactive) and stop_agent(a))
+
+
+def remember_paused(targets):
+    """Hand the parked sessions to claude-resume, in the file it already reads.
+    Sessions that parked themselves when asked go in here too - nothing else
+    would ever find them again, because a clean stop leaves no error to scan
+    for. claude-resume re-reads each session's real cwd and model at plan
+    time, so a thin record here is enough."""
+    kept = read_json(PAUSED_FILE, {"paused": []})
+    known = {p.get("sessionId") for p in kept.get("paused", [])}
+    added = 0
+    for a in targets:
+        sid = a.get("sessionId")
+        if not sid or sid in known:
+            continue
+        kept.setdefault("paused", []).append({
+            "sessionId": sid,
+            "short": a.get("id") or sid[:8],
+            "cwd": a.get("cwd") or HOME,
+            "name": a.get("name"),
+            "state": "working" if is_working(a) else "idle",
+            "reason": "quota-watcher",
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+        known.add(sid)
+        added += 1
+    write_json(PAUSED_FILE, kept)
+    return added
+
+
+def n_parked():
+    return len(read_json(PAUSED_FILE, {"paused": []}).get("paused", []))
+
+
+# ---- the courier -------------------------------------------------------
+def send_to_sessions(targets, text, tag):
+    """Deliver a message into live sessions.
+
+    There is no shell verb for handing a prompt to a running Claude, but a
+    Claude *session* can do it with SendMessage. So we spend one cheap headless
+    turn as a courier. Detached and best-effort on purpose: this fires when the
+    quota is nearly gone, and the forced stop later must not depend on it."""
+    if not targets:
+        return
+    # SendMessage addresses sessions by NAME. The [ref] that ListAgents prints
+    # is its own identifier and has nothing to do with the short id in
+    # `claude agents --json`, so handing those over addresses nobody.
+    names = [label(a) for a in targets]
+    refs = " | ".join(names)
+    listed = "\n".join(f"   - {n}" for n in names)
+    prompt = (
+        "You are a courier. Do exactly this, then stop.\n"
+        "1. Call ListAgents.\n"
+        "2. Each of these sessions, named exactly like this, must receive a "
+        f"message:\n{listed}\n"
+        "   For each name, call SendMessage with `to` set to that name exactly "
+        "as written above. Only if the tool comes back saying the name is "
+        "ambiguous, retry that one as `name [ref]` using the ref ListAgents "
+        "printed for it. Skip any name that is not in the listing at all. "
+        "Do not message anything that is not on that list, and do not message "
+        "yourself.\n"
+        "3. The message text is everything between the BEGIN and END lines "
+        "below. Send it verbatim, unchanged, to every one of them.\n"
+        "4. Reply with a single line: how many you sent, and which refs you "
+        "could not address.\n"
+        "Do not do anything else. Do not read or write files. Do not run "
+        "commands. Do not add anything of your own to the message.\n"
+        "---BEGIN MESSAGE---\n" + text + "\n---END MESSAGE---\n")
+    os.makedirs(DIR, exist_ok=True)
+    with open(COURIER_LOG, "a") as fh:
+        fh.write(f"\n=== {datetime.now().isoformat(timespec='seconds')} {tag}"
+                 f" -> {refs}\n")
+        fh.flush()
+        try:
+            p = subprocess.Popen(
+                [CLAUDE, "-p", "--model", COURIER_MODEL,
+                 "--allowedTools", "ListAgents,SendMessage"],
+                stdin=subprocess.PIPE, stdout=fh, stderr=fh,
+                cwd=HOME, start_new_session=True)
+            p.stdin.write(prompt.encode())
+            p.stdin.close()                        # fed, and left to run on
+        except OSError as e:
+            fh.write(f"[quota-watcher] courier failed to start: {e}\n")
+            return
+    log(f"courier dispatched ({tag}) to {len(targets)} session(s)")
+
+
+# ---- quota -------------------------------------------------------------
+def limits():
+    """The live usage picture. The endpoint rate-limits hard on bursts, and
+    this box already has claude-limit-guard polling it, so one transient
+    failure is worth a second try before it counts as a blind read."""
+    exe = shutil.which("claude-limits") or os.path.join(HOME, ".local/bin/claude-limits")
+    for attempt in (1, 2):
+        try:
+            out = subprocess.run([exe, "--json"], capture_output=True,
+                                 text=True, timeout=45, check=True)
+            return json.loads(out.stdout)
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(4)
+
+
+def five_hour(data):
+    fh = (data or {}).get("five_hour") or {}
+    util = fh.get("utilization")
+    if util is None:
+        return None, None
+    resets = None
+    try:
+        resets = datetime.fromisoformat(fh["resets_at"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        pass
+    return 100.0 - float(util), resets
+
+
+def weekly_blocked(data, ceiling=98):
+    """A weekly limit at the ceiling makes resuming pointless - the sessions
+    would come back only to die on their next call."""
+    for lim in (data or {}).get("limits") or []:
+        if lim.get("group") == "weekly" and (lim.get("percent") or 0) >= ceiling:
+            return lim
+    return None
+
+
+def worst_reset(data, default=None):
+    """When the thing that is actually blocking us frees up."""
+    best = None
+    for lim in (data or {}).get("limits") or []:
+        try:
+            t = datetime.fromisoformat(lim["resets_at"]).timestamp()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (lim.get("percent") or 0) >= 90 and (best is None or t > best):
+            best = t
+    return best if best is not None else default
+
+
+# ---- accounts ----------------------------------------------------------
+def account_cli():
+    return shutil.which("claude-account") or os.path.join(HOME, ".local/bin/claude-account")
+
+
+def accounts_json():
+    try:
+        out = subprocess.run([account_cli(), "list", "--json"],
+                             capture_output=True, text=True, timeout=30)
+        return json.loads(out.stdout or "{}")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {}
+
+
+def active_account():
+    return accounts_json().get("active")
+
+
+def switch_account(name):
+    """Move the whole machine to another login. Only ever called with nothing
+    live: switching under a working session would put the rest of its task on
+    someone else's bill, which is exactly what claude-account's busy guard is
+    there to stop. -f is belt and braces for a stray idle chat."""
+    try:
+        r = subprocess.run([account_cli(), "use", name, "-f", "-q"],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"switch to {name} FAILED: {e}")
+        return False
+    ok = r.returncode == 0
+    log(f"switch to {name}: {'ok' if ok else 'rc=' + str(r.returncode)} "
+        f"{(r.stdout + r.stderr).strip()[:120]}")
+    return ok
+
+
+def wake_credentials():
+    """A parked slot's access token may have gone stale while it sat there.
+    claude-limits deliberately never refreshes one (refresh tokens rotate, and
+    writing a new one would break Claude Code's own auth), but Claude Code
+    itself refreshes on demand - so the cheapest way to freshen a slot is to
+    make it answer one trivial question. If the account is actually out of
+    quota this fails, which is a useful answer too."""
+    try:
+        subprocess.run([CLAUDE, "-p", "--model", COURIER_MODEL],
+                       input=b"Reply with the single word OK and nothing else.",
+                       capture_output=True, timeout=120, cwd=HOME)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def account_headroom():
+    """(remaining%, resets_at, weekly_blocker) for the account that is live
+    right now, refreshing a stale token once before giving up."""
+    for attempt in (1, 2):
+        try:
+            data = limits()
+        except Exception as e:
+            if attempt == 1:
+                log(f"limits unreadable ({e}) - waking the credentials")
+                wake_credentials()
+                continue
+            return None, None, None
+        rem, resets = five_hour(data)
+        if rem is None and attempt == 1:
+            wake_credentials()
+            continue
+        return rem, resets, weekly_blocked(data)
+    return None, None, None
+
+
+def rotate(cfg, st):
+    """Move to the next account with real headroom. Returns its name, or None
+    if every candidate is dry (state records when each one frees up, so the
+    next attempt can wait for the earliest of them instead of thrashing)."""
+    names = cfg.get("rotate") or []
+    if not names:
+        return None
+    margin = float(cfg.get("margin", 10))
+    need = min(90.0, float(cfg.get("threshold", 10)) + margin)
+    now = time.time()
+    exhausted = dict(st.get("exhausted") or {})
+    started_on = active_account()
+    saved = accounts_json()
+    known = {a["name"]: a for a in saved.get("accounts") or []}
+    cached_until = {}
+    for a in saved.get("accounts") or []:
+        u = a.get("usage") or {}
+        if (u.get("percent") or 0) >= 99 and not a.get("active"):
+            try:
+                cached_until[a["name"]] = datetime.fromisoformat(
+                    u["resets_at"]).timestamp()
+            except (KeyError, TypeError, ValueError):
+                pass
+
+    for name in names:
+        if name == started_on:
+            continue                               # the one we are fleeing
+        if name not in known:
+            log(f"rotate: no saved account called {name!r}, skipping")
+            continue
+        until = max(exhausted.get(name, 0), cached_until.get(name, 0))
+        if until > now:
+            log(f"rotate: {name} is dry for another {fmt_eta(until - now)}")
+            continue
+        if not switch_account(name):
+            exhausted[name] = now + 900             # try again in 15 min
+            continue
+        rem, resets, weekly = account_headroom()
+        if rem is None:
+            log(f"rotate: {name} would not report its usage - backing out")
+            exhausted[name] = now + 1800
+            if started_on:
+                switch_account(started_on)
+            continue
+        if weekly:
+            log(f"rotate: {name} weekly at {weekly['percent']}% - not usable")
+            exhausted[name] = (worst_reset({"limits": [weekly]}, now + 3600))
+            if started_on:
+                switch_account(started_on)
+            continue
+        if rem <= need:
+            log(f"rotate: {name} only has {rem:.0f}% left (need {need:.0f}%)")
+            exhausted[name] = resets or (now + 3600)
+            if started_on:
+                switch_account(started_on)
+            continue
+        if started_on:
+            exhausted[started_on] = st.get("resets_at") or (now + 3600)
+        exhausted.pop(name, None)
+        st["exhausted"] = exhausted
+        write_json(STATE, st)
+        log(f"rotate: switched to {name} with {rem:.0f}% left")
+        return name
+
+    st["exhausted"] = exhausted
+    # Come back when the first of them frees up, rather than every minute.
+    due = [t for t in list(exhausted.values()) + list(cached_until.values())
+           if t > now]
+    st["retry_rotate_at"] = min(due) if due else now + 600
+    write_json(STATE, st)
+    return None
+
+
+# ---- config / state ----------------------------------------------------
+def conf():
+    return read_json(CONF, {})
+
+
+def state():
+    return read_json(STATE, {"phase": "armed"})
+
+
+def set_state(**kw):
+    st = state()
+    st.update(kw)
+    write_json(STATE, st)
+    return st
+
+
+def do_resume(switched_to=None):
+    """Wake everything claude-pause is holding, with the welcome-back note.
+    Returns the claude-resume exit code (3 = it is holding off on a limit)."""
+    env = dict(os.environ, CLAUDE_RESUME_PROMPT=resume_prompt(switched_to))
+    exe = shutil.which("claude-resume") or os.path.join(HOME, ".local/bin/claude-resume")
+    os.makedirs(DIR, exist_ok=True)
+    with open(RESUME_LOG, "a") as fh:
+        fh.write(f"\n=== {datetime.now().isoformat(timespec='seconds')} "
+                 f"resuming{' on ' + switched_to if switched_to else ''}\n")
+        fh.flush()
+        try:
+            return subprocess.run([exe, "--paused", "-y", "-j", "2"],
+                                  env=env, stdout=fh, stderr=fh,
+                                  timeout=600).returncode
+        except (OSError, subprocess.TimeoutExpired) as e:
+            fh.write(f"[quota-watcher] resume failed: {e}\n")
+            return 1
+
+
+# ---- the tick ----------------------------------------------------------
+def cmd_tick(argv):
+    dry = any(a in ("-n", "--dry-run") for a in argv)
+    cfg = conf()
+    if not cfg.get("enabled"):
+        return 0
+
+    threshold = float(cfg.get("threshold", 10))
+    grace = int(cfg.get("grace", 300))
+    working_only = bool(cfg.get("working_only"))
+    rotating = bool(cfg.get("rotate"))
+    st = state()
+    phase = st.get("phase", "armed")
+    now = time.time()
+
+    # The timer ticks every minute so that the interesting moments are sharp,
+    # but asking the usage endpoint every minute all day is what makes it
+    # start refusing. Far from the threshold, once every 5 minutes is plenty.
+    last_seen = st.get("remaining")
+    if not dry and phase == "armed" and last_seen is not None \
+            and float(last_seen) > threshold + 25 \
+            and now - float(st.get("polled_at") or 0) < 300:
+        return 0
+
+    try:
+        data = limits()
+    except Exception as e:
+        # The usage endpoint rate-limits hard. A blind read must never be read
+        # as "quota is fine" OR as "quota is gone" - it just waits.
+        fails = int(st.get("fails", 0)) + 1
+        set_state(fails=fails)
+        log(f"read FAILED (#{fails}): {e}")
+        if fails == 5:
+            notify("Quota watcher is blind",
+                   "The usage endpoint has refused 5 reads in a row, so I "
+                   "cannot see the 5-hour limit. Nothing is being parked "
+                   "right now.")
+        return 0
+    remaining, resets_at = five_hour(data)
+    if remaining is None:
+        log("no five_hour utilization in payload")
+        return 0
+    if not dry:
+        st = set_state(fails=0, polled_at=now, remaining=remaining)
+    eta = fmt_eta(resets_at - now) if resets_at else "the next reset"
+    if dry:
+        print(f"phase={phase}  {remaining:.0f}% left  threshold={threshold:.0f}%"
+              f"  resets in {eta}"
+              f"  account={active_account() or '?'}"
+              f"{'  rotate=' + ','.join(cfg['rotate']) if rotating else ''}")
+
+    # ---- armed: watching -------------------------------------------------
+    if phase == "armed":
+        if remaining > threshold:
+            return 0
+        # Never trip in the first 90s after a resume: the sessions we just woke
+        # have not registered yet, and we would park them before a single turn.
+        if now - float(st.get("last_resume_at") or 0) < 90:
+            return 0
+        targets = live_sessions(working_only)
+        if not targets:
+            log(f"{remaining:.0f}% left, nothing live to park")
+            return 0
+        if dry:
+            print(f"would warn {len(targets)}: "
+                  f"{', '.join(short_of(a) for a in targets)}")
+            return 0
+        comeback = (
+            "You will be stopped and then resumed automatically: either on "
+            "another Claude account that still has quota, within a few minutes, "
+            f"or once this one resets ({eta}). Either way it is this same "
+            "session, with your full history, and you will be told to carry on "
+            "from that note."
+            if rotating else
+            f"You will be stopped and resumed automatically once the quota "
+            f"resets ({eta}), in this same session, with your full history "
+            f"intact, and told to carry on from that note.")
+        kill_int = bool(cfg.get("kill_interactive"))
+        parkable = [a for a in targets if stoppable(a, kill_int)]
+        untouched = [a for a in targets if not stoppable(a, kill_int)]
+        send_to_sessions(parkable,
+                         park_message(remaining, threshold, comeback,
+                                      max(1, grace // 60)), "park")
+        send_to_sessions(untouched, wrapup_message(remaining, eta), "wrap-up")
+        set_state(phase="warning", warned_at=now,
+                  targets=[{"sessionId": a.get("sessionId"), "id": a.get("id"),
+                            "kind": a.get("kind"), "name": a.get("name")}
+                           for a in parkable],
+                  resets_at=resets_at, remaining=remaining,
+                  account=active_account())
+        log(f"WARNING at {remaining:.0f}% left, {len(parkable)} asked to park, "
+            f"{len(untouched)} interactive asked to wrap up")
+        notify(f"Claude quota at {remaining:.0f}% left",
+               f"{len(parkable)} session(s) asked to park. Forcing it in "
+               f"{max(1, grace // 60)} min. "
+               + ("Rotating to another account after that."
+                  if rotating else f"Resume is automatic in {eta}."))
+        return 0
+
+    # ---- warning: being polite ------------------------------------------
+    if phase == "warning":
+        if remaining > threshold:
+            # The window reset, or something freed up. Call it off.
+            if not dry:
+                send_to_sessions(live_sessions(working_only), STAND_DOWN,
+                                 "stand-down")
+                set_state(phase="armed", targets=[])
+            log(f"stand-down at {remaining:.0f}% left")
+            return 0
+
+        kill_int = bool(cfg.get("kill_interactive"))
+        still = [a for a in live_sessions(working_only)
+                 if stoppable(a, kill_int)]
+        elapsed = now - float(st.get("warned_at") or now)
+        if still and elapsed < grace:
+            if dry:
+                print(f"{len(still)} still live, "
+                      f"{fmt_eta(grace - elapsed)} of grace left")
+            return 0
+        if dry:
+            print(f"would park {len(still)} now")
+            return 0
+
+        # Everything still live, plus the ones that parked themselves when
+        # asked - those are only findable through the warning list, because a
+        # clean stop leaves no usage error behind to scan for.
+        by_sid = {a.get("sessionId"): a for a in still}
+        record = list(still) + [
+            dict(t, cwd=HOME) for t in (st.get("targets") or [])
+            if isinstance(t, dict) and t.get("sessionId") not in by_sid]
+        remember_paused(record)
+        stopped = stop_all(still, kill_int)
+        st = set_state(phase="paused", paused_at=now, resets_at=resets_at,
+                       parked=[a.get("sessionId") for a in record], targets=[],
+                       account=active_account())
+        log(f"PAUSED: {stopped} stopped, {len(record)} remembered, "
+            f"{remaining:.0f}% left, reset in {eta}")
+        notify("Claude sessions parked",
+               f"{len(record)} session(s) parked at {remaining:.0f}% quota left"
+               f" ({stopped} needed forcing).")
+        # Nothing to wait for if another account can take them right now.
+        if rotating:
+            return try_rotate_and_resume(cfg, st, now)
+        return 0
+
+    # ---- paused: waiting for headroom -----------------------------------
+    if phase == "paused":
+        want = st.get("resets_at")
+        if remaining > threshold and not (want and now < float(want)) \
+                and not weekly_blocked(data):
+            return finish_resume(cfg, st, None, remaining, now)
+        if rotating and now >= float(st.get("retry_rotate_at") or 0):
+            if dry:
+                print("would try rotating to another account now")
+                return 0
+            return try_rotate_and_resume(cfg, st, now)
+        return 0
+
+    return 0
+
+
+def try_rotate_and_resume(cfg, st, now):
+    """Find an account with quota and put everyone back on it. Staying parked
+    is a perfectly good outcome - the next tick tries again."""
+    if not n_parked():
+        set_state(phase="armed", account=active_account())
+        return 0
+    kill_int = bool(cfg.get("kill_interactive"))
+    live = [a for a in live_sessions() if stoppable(a, kill_int)]
+    if live:                                       # never switch under anyone
+        remember_paused(live)
+        stop_all(live, kill_int)
+    name = rotate(cfg, state())
+    if not name:
+        st = state()
+        due = float(st.get("retry_rotate_at") or 0)
+        log(f"no account has headroom - waiting {fmt_eta(due - now)}")
+        return 0
+    rem, _, _ = account_headroom()
+    return finish_resume(cfg, state(), name, rem, now)
+
+
+def finish_resume(cfg, st, switched_to, remaining, now):
+    n = n_parked()
+    rc = do_resume(switched_to)
+    if rc == 3:
+        log("claude-resume is holding off on a limit - will retry")
+        return 0
+    cycles = int(st.get("cycles", 0)) + 1
+    set_state(phase="armed", last_resume_at=now, cycles=cycles, parked=[],
+              account=active_account(), retry_rotate_at=0)
+    where = f" on account {switched_to}" if switched_to else ""
+    log(f"RESUMED {n} session(s){where} at "
+        f"{remaining if remaining is not None else -1:.0f}% left (cycle {cycles})")
+    notify("Claude sessions resumed",
+           f"{n} parked session(s) were told to carry on{where}"
+           f"{f' ({remaining:.0f}% quota free)' if remaining is not None else ''}. "
+           f"Watching again at {float(cfg.get('threshold', 10)):.0f}%.")
+    return 0
+
+
+# ---- start / stop / status ---------------------------------------------
+def systemctl(*args):
+    return subprocess.run(["systemctl", "--user", *args],
+                          capture_output=True, text=True)
+
+
+def cmd_start(argv):
+    threshold, grace, margin, working_only, rot = 10.0, 300, 10.0, False, []
+    kill_interactive = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--grace":
+            i += 1
+            grace = int(argv[i])
+        elif a == "--margin":
+            i += 1
+            margin = float(argv[i])
+        elif a == "--working-only":
+            working_only = True
+        elif a == "--kill-interactive":
+            kill_interactive = True
+        elif a in ("--rotate", "-r"):
+            i += 1
+            while i < len(argv) and not argv[i].startswith("-"):
+                rot.append(argv[i])
+                i += 1
+            i -= 1
+        elif a.startswith("-"):
+            die(f"unknown option: {a} (try --help)")
+        else:
+            try:
+                threshold = float(a.rstrip("%"))
+            except ValueError:
+                die(f"unknown argument: {a} (try --help)")
+        i += 1
+    if not 0 < threshold < 100:
+        die("the threshold is a percentage of quota LEFT, between 0 and 100")
+
+    if rot:
+        saved = {a["name"] for a in accounts_json().get("accounts") or []}
+        missing = [n for n in rot if n not in saved]
+        if missing:
+            die(f"no saved account called {', '.join(missing)} — "
+                f"claude-account list shows: {', '.join(sorted(saved)) or '(none)'}")
+        live = active_account()
+        if live and live not in rot:
+            rot.append(live)                       # so the cycle comes back here
+
+    write_json(CONF, {"enabled": True, "threshold": threshold, "grace": grace,
+                      "margin": margin, "working_only": working_only,
+                      "kill_interactive": kill_interactive, "rotate": rot,
+                      "armed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                      "armed_account": active_account()})
+    write_json(STATE, {"phase": "armed", "cycles": 0})
+    r = systemctl("enable", "--now", UNIT)
+    if r.returncode != 0:
+        die(f"could not enable {UNIT}: {r.stderr.strip()}")
+    log(f"ARMED at {threshold:.0f}% left, grace {grace}s, "
+        f"{'working only' if working_only else 'all live sessions'}"
+        f"{', rotate ' + ','.join(rot) if rot else ''}")
+    print(f"{GRN}quota-watcher armed{RST} — parking every Claude when the "
+          f"5-hour quota drops below {BLD}{threshold:.0f}% left{RST}.")
+    print(f"  {GRY}{grace // 60} min of grace after the polite message, then "
+          f"they are stopped for real.{RST}")
+    if rot:
+        print(f"  {GRY}then it rotates through {BLD}{' → '.join(rot)}{RST}"
+              f"{GRY} and resumes on whichever has more than "
+              f"{threshold + margin:.0f}% left.{RST}")
+    if not kill_interactive:
+        print(f"  {GRY}Chats you have open in a terminal are asked to wrap up "
+              f"but never killed ({BLD}--kill-interactive{RST}{GRY} changes "
+              f"that).{RST}")
+    print(f"  {GRY}It loops forever: {BLD}quota-watcher --stop{RST}{GRY} is the "
+          f"only way out.{RST}")
+    return cmd_status([])
+
+
+def cmd_stop(argv):
+    leave = "--leave-paused" in argv
+    st = state()
+    systemctl("disable", "--now", UNIT)
+    cfg = conf()
+    cfg["enabled"] = False
+    write_json(CONF, cfg)
+    log("DISARMED")
+    print(f"{YEL}quota-watcher disarmed{RST} — nothing is watching the quota now.")
+
+    if n_parked() and not leave:
+        print(f"  bringing back {n_parked()} parked session(s)…")
+        do_resume(None)
+    elif n_parked():
+        print(f"  {GRY}{n_parked()} session(s) are still parked — "
+              f"{BLD}claude-resume{RST}{GRY} brings them back.{RST}")
+    was, now_on = cfg.get("armed_account"), active_account()
+    if was and now_on and was != now_on:
+        print(f"  {GRY}note: rotation left you on account {BLD}{now_on}{RST}"
+              f"{GRY} (you armed it on {was}) — "
+              f"{BLD}claude-account use {was}{RST}{GRY} to go back.{RST}")
+    write_json(STATE, {"phase": "armed", "cycles": st.get("cycles", 0)})
+    return 0
+
+
+def cmd_status(argv):
+    cfg, st = conf(), state()
+    if not cfg.get("enabled"):
+        print(f"{GRY}quota-watcher is off.{RST}  arm it with "
+              f"{BLD}quota-watcher [PCT] [--rotate A B]{RST}")
+        return 0
+    threshold = float(cfg.get("threshold", 10))
+    phase = st.get("phase", "armed")
+    colour = {"armed": GRN, "warning": YEL, "paused": RED}.get(phase, "")
+    timer = systemctl("is-active", UNIT).stdout.strip()
+    try:
+        rem, resets = five_hour(limits())
+        quota = (f"{rem:.0f}% left, resets in "
+                 f"{fmt_eta(resets - time.time()) if resets else '?'}")
+    except Exception:
+        quota = (f"{RED}unreadable right now{RST} {GRY}(the usage endpoint is "
+                 f"rate-limiting; the watcher retries and never parks on a "
+                 f"blind read){RST}")
+
+    print(f"{BLD}quota-watcher{RST}  {colour}{phase}{RST}  "
+          f"{GRY}(timer {timer}, {st.get('cycles', 0)} cycle(s) so far){RST}")
+    print(f"  account        {active_account() or '?'}")
+    print(f"  5-hour quota   {quota}")
+    print(f"  parks at       {threshold:.0f}% left, after "
+          f"{int(cfg.get('grace', 300)) // 60} min of grace"
+          f"{'  (working sessions only)' if cfg.get('working_only') else ''}")
+    if cfg.get("rotate"):
+        print(f"  rotates        {' → '.join(cfg['rotate'])}  "
+              f"{GRY}(needs {threshold + float(cfg.get('margin', 10)):.0f}% "
+              f"free to switch in){RST}")
+        dry = {k: v for k, v in (st.get("exhausted") or {}).items()
+               if v > time.time()}
+        for k, v in dry.items():
+            print(f"    {GRY}{k}: dry for another {fmt_eta(v - time.time())}{RST}")
+    if phase == "warning":
+        left = int(cfg.get("grace", 300)) - (time.time() - float(st.get("warned_at") or 0))
+        print(f"  {YEL}asked {len(st.get('targets') or [])} session(s) to park"
+              f"{RST} — forcing it in {fmt_eta(left)}")
+    parked = read_json(PAUSED_FILE, {"paused": []}).get("paused", [])
+    if parked:
+        print(f"  {CYA}parked{RST}         {len(parked)} session(s) waiting to come back")
+        for p in parked[:8]:
+            print(f"    {GRY}{p.get('short', '?')}  {p.get('name') or '(unnamed)'}{RST}")
+    live = live_sessions(bool(cfg.get("working_only")))
+    if live:
+        kill_int = bool(cfg.get("kill_interactive"))
+        print(f"  live now       {len(live)}:")
+        for a in live:
+            mark = "" if stoppable(a, kill_int) else f"  {GRY}(interactive — asked, never killed){RST}"
+            print(f"    {GRY}{short_of(a)}  {label(a)}{RST}{mark}")
+    print(f"  {GRY}log: {LOG}{RST}")
+    return 0
+
+
+def cmd_targets(argv):
+    live = live_sessions(bool(conf().get("working_only")))
+    if not live:
+        print("nothing live to park.")
+        return 0
+    kill_int = bool(conf().get("kill_interactive"))
+    for a in live:
+        mark = f"{YEL}working{RST}" if is_working(a) else f"{GRY}idle{RST}"
+        how = "park" if stoppable(a, kill_int) else f"{GRY}ask only{RST}"
+        print(f"  {CYA}{short_of(a):9}{RST} {mark:18} {how:18} {label(a)}")
+    return 0
+
+
+def usage():
+    print(__doc__.strip())
+    return 0
+
+
+TABLE = {"start": cmd_start, "on": cmd_start, "arm": cmd_start,
+         "stop": cmd_stop, "off": cmd_stop, "disarm": cmd_stop,
+         "status": cmd_status, "tick": cmd_tick, "targets": cmd_targets}
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        return cmd_status([])
+    if argv[0] in ("-h", "--help", "help"):
+        return usage()
+    # Both spellings work; the slash command uses the flags.
+    first = argv[0].lstrip("-").lower()
+    if first in TABLE:
+        return TABLE[first](argv[1:])
+    return cmd_start(argv)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

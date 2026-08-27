@@ -69,7 +69,9 @@ CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
 # What we say to a session we are picking back up. The last sentence matters:
 # without it, a session that had actually finished burns a whole turn
 # re-deriving that it has nothing to do.
-CONTINUE_PROMPT = (
+# quota-watcher (and anything else driving a resume) can override this with
+# CLAUDE_RESUME_PROMPT, to explain why *that* pause happened.
+CONTINUE_PROMPT = os.environ.get("CLAUDE_RESUME_PROMPT") or (
     "You were interrupted before you finished: the previous turn was cut off "
     "by a usage limit or by being paused, not by completing the work. Pick up "
     "exactly where you stopped and finish the task you were given. Do not "

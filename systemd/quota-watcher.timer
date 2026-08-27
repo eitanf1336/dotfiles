@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll the Claude 5-hour quota every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=quota-watcher.service
+
+[Install]
+WantedBy=timers.target

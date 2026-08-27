@@ -1,0 +1,13 @@
+[Unit]
+Description=Quota watcher (park Claude sessions before the 5h limit, resume after)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/quota-watcher tick
+# A tick can spend real time: switching accounts, waking a stale token, and
+# handing the resumes to claude-resume.
+TimeoutStartSec=900
+# The courier and the resume supervisor are deliberately detached and outlive
+# the tick. The default control-group kill would take them with it.
+KillMode=process
