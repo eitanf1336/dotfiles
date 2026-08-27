@@ -725,11 +725,14 @@ def cmd_tick(argv):
         st = set_state(phase="paused", paused_at=now, resets_at=resets_at,
                        parked=[a.get("sessionId") for a in record], targets=[],
                        account=active_account())
-        log(f"PAUSED: {stopped} stopped, {len(record)} remembered, "
-            f"{remaining:.0f}% left, reset in {eta}")
+        obeyed = len(record) - len(still)
+        log(f"PAUSED: {len(record)} parked ({obeyed} had already stopped "
+            f"themselves, {stopped} needed forcing), {remaining:.0f}% left, "
+            f"reset in {eta}")
         notify("Claude sessions parked",
-               f"{len(record)} session(s) parked at {remaining:.0f}% quota left"
-               f" ({stopped} needed forcing).")
+               f"{len(record)} session(s) parked at {remaining:.0f}% quota "
+               f"left. {obeyed} stopped themselves when asked, {stopped} had "
+               f"to be forced.")
         # Nothing to wait for if another account can take them right now.
         if rotating:
             return try_rotate_and_resume(cfg, st, now)
@@ -797,6 +800,61 @@ def systemctl(*args):
                           capture_output=True, text=True)
 
 
+# The units live here rather than only in the dotfiles repo because
+# `systemctl --user disable` deletes a *symlinked* unit outright, so a
+# symlink into the repo survives exactly one --stop. They are written as real
+# files, and rewritten whenever they drift, so arming always works.
+SERVICE_UNIT = """[Unit]
+Description=Quota watcher (park Claude sessions before the 5h limit, resume after)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/quota-watcher tick
+# A tick can spend real time: switching accounts, waking a stale token, and
+# handing the resumes to claude-resume.
+TimeoutStartSec=900
+# The courier and the resume supervisor are deliberately detached and outlive
+# the tick. The default control-group kill would take them with it.
+KillMode=process
+"""
+
+TIMER_UNIT = """[Unit]
+Description=Poll the Claude 5-hour quota every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=quota-watcher.service
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def ensure_units():
+    d = os.path.join(HOME, ".config/systemd/user")
+    os.makedirs(d, exist_ok=True)
+    changed = False
+    for name, body in (("quota-watcher.service", SERVICE_UNIT),
+                       ("quota-watcher.timer", TIMER_UNIT)):
+        path = os.path.join(d, name)
+        try:
+            if not os.path.islink(path) and open(path).read() == body:
+                continue
+        except OSError:
+            pass
+        if os.path.islink(path):
+            os.unlink(path)
+        with open(path, "w") as fh:
+            fh.write(body)
+        changed = True
+    if changed:
+        systemctl("daemon-reload")
+    return changed
+
+
 def cmd_start(argv):
     threshold, grace, margin, working_only, rot = 10.0, 300, 10.0, False, []
     kill_interactive = False
@@ -846,6 +904,7 @@ def cmd_start(argv):
                       "armed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                       "armed_account": active_account()})
     write_json(STATE, {"phase": "armed", "cycles": 0})
+    ensure_units()
     r = systemctl("enable", "--now", UNIT)
     if r.returncode != 0:
         die(f"could not enable {UNIT}: {r.stderr.strip()}")
