@@ -605,22 +605,22 @@ def cmd_tick(argv):
     phase = st.get("phase", "armed")
     now = time.time()
 
-    # The timer ticks every minute so that the interesting moments are sharp,
-    # but asking the usage endpoint every minute all day is what makes it
-    # start refusing. Far from the threshold, once every 5 minutes is plenty.
-    last_seen = st.get("remaining")
-    if not dry and phase == "armed" and last_seen is not None \
-            and float(last_seen) > threshold + 25 \
-            and now - float(st.get("polled_at") or 0) < 300:
+    # The timer ticks every minute so the interesting moments are sharp, but
+    # asking the usage endpoint every minute all day is exactly what makes it
+    # start refusing - and it refuses for a while once it does. So each tick
+    # decides for itself when the next read is worth making.
+    if not dry and now < float(st.get("next_poll_at") or 0):
         return 0
 
     try:
         data = limits()
     except Exception as e:
-        # The usage endpoint rate-limits hard. A blind read must never be read
-        # as "quota is fine" OR as "quota is gone" - it just waits.
+        # The endpoint rate-limits hard. A blind read must never be read as
+        # "quota is fine" OR as "quota is gone" - it just waits, and it waits
+        # longer each time so that a burst of 429s is not answered with a
+        # burst of retries.
         fails = int(st.get("fails", 0)) + 1
-        set_state(fails=fails)
+        set_state(fails=fails, next_poll_at=now + min(300, 60 * fails))
         log(f"read FAILED (#{fails}): {e}")
         if fails == 5:
             notify("Quota watcher is blind",
@@ -633,7 +633,11 @@ def cmd_tick(argv):
         log("no five_hour utilization in payload")
         return 0
     if not dry:
-        st = set_state(fails=0, polled_at=now, remaining=remaining)
+        # Close to the line, or already acting on it, look every minute.
+        # Nowhere near it, five is plenty and much kinder to the endpoint.
+        soon = phase != "armed" or remaining <= threshold + 25
+        st = set_state(fails=0, remaining=remaining,
+                       next_poll_at=now + (60 if soon else 300))
     eta = fmt_eta(resets_at - now) if resets_at else "the next reset"
     if dry:
         print(f"phase={phase}  {remaining:.0f}% left  threshold={threshold:.0f}%"
@@ -968,9 +972,16 @@ def cmd_status(argv):
         quota = (f"{rem:.0f}% left, resets in "
                  f"{fmt_eta(resets - time.time()) if resets else '?'}")
     except Exception:
-        quota = (f"{RED}unreadable right now{RST} {GRY}(the usage endpoint is "
-                 f"rate-limiting; the watcher retries and never parks on a "
-                 f"blind read){RST}")
+        # Falling back to what the watcher last saw is far more useful than an
+        # error: the endpoint refusing a read is normal and self-correcting.
+        seen = st.get("remaining")
+        age = time.time() - float(st.get("next_poll_at") or time.time())
+        quota = (f"{seen:.0f}% left {GRY}(last reading, ~{fmt_eta(abs(age) + 60)} "
+                 f"old — the usage endpoint is rate-limiting right now; the "
+                 f"watcher backs off and never parks on a blind read){RST}"
+                 if seen is not None else
+                 f"{RED}not read yet{RST} {GRY}(the usage endpoint is "
+                 f"rate-limiting; the watcher backs off and retries){RST}")
 
     print(f"{BLD}quota-watcher{RST}  {colour}{phase}{RST}  "
           f"{GRY}(timer {timer}, {st.get('cycles', 0)} cycle(s) so far){RST}")
