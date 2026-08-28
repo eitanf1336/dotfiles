@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep the laptop awake while Claude is actually working (idle inhibitor)
+Documentation=man:systemd-inhibit(1)
+
+[Service]
+Type=simple
+ExecStart=%h/bin/claude-keep-awake
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

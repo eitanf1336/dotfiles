@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Hold an idle inhibitor for exactly as long as Claude is really working.
+
+The laptop is set to suspend after an hour idle, which is correct when nobody
+is using it and wrong when a long agent run is halfway through a document. On
+2026-08-28 an overnight run was cut short this way, so a job that needed all
+night got an hour.
+
+"Really working" is not "a claude process exists": a terminal sitting at a
+prompt, or a parked session, must not keep the machine awake. `claude-status`
+already draws that line and reports it in its exit code:
+
+    1  something is actively computing (working agent, busy chat, headless run)
+    2  only open-but-idle sessions exist
+    0  all clear
+
+So this polls that and holds the inhibitor only on 1.
+
+It inhibits `idle`, not `sleep`: that stops the idle timer from firing, so the
+machine never suspends BY ITSELF, while a deliberate suspend from the menu or
+`systemctl suspend` still works. Blocking `sleep` would fight the user, which
+is not what was asked for.
+
+Same shape as media-keep-awake.service, which inhibits idle only while
+something is actually playing.
+"""
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+POLL = 30                     # seconds between checks
+STATUS = os.path.expanduser("~/bin/claude-status")
+WHY = "Claude is working; do not suspend on idle"
+
+_inhibitor = None             # the held systemd-inhibit child, or None
+
+
+def working() -> bool:
+    """True only while something is actually computing."""
+    try:
+        rc = subprocess.run([STATUS, "-q"], stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, timeout=30).returncode
+    except Exception:
+        # If the check itself is broken, do not hold the machine awake
+        # forever on a guess: let it idle as it normally would.
+        return False
+    return rc == 1
+
+
+def hold():
+    global _inhibitor
+    if _inhibitor and _inhibitor.poll() is None:
+        return
+    _inhibitor = subprocess.Popen(
+        ["systemd-inhibit", "--what=idle", "--who=Claude", f"--why={WHY}",
+         "--mode=block", "sleep", "infinity"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+    print("holding: Claude is working", flush=True)
+
+
+def release():
+    global _inhibitor
+    if not _inhibitor:
+        return
+    if _inhibitor.poll() is None:
+        _inhibitor.terminate()
+        try:
+            _inhibitor.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _inhibitor.kill()
+    _inhibitor = None
+    print("released: nothing computing", flush=True)
+
+
+def bye(*_):
+    release()
+    sys.exit(0)
+
+
+def main():
+    if not shutil.which("systemd-inhibit"):
+        print("systemd-inhibit not available", file=sys.stderr)
+        return 1
+    if not os.access(STATUS, os.X_OK):
+        print(f"{STATUS} is not executable", file=sys.stderr)
+        return 1
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, bye)
+    while True:
+        try:
+            hold() if working() else release()
+        except Exception as e:                      # never die on a bad poll
+            print(f"poll failed, retrying: {e}", flush=True)
+        time.sleep(POLL)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
