@@ -1,0 +1,43 @@
+#!/bin/bash
+# dns-unhijack: DNS is dead for git/apt/curl but Chrome works? This is why.
+#
+# The Technion VPN agent (Perimeter81 / Harmony SASE) installs a nat OUTPUT rule
+# that redirects every outbound UDP:53 packet to its own resolver on
+# 127.0.0.1:5354. When the VPN is not connected nothing listens there, so every
+# DNS query gets an ICMP port-unreachable and every glibc app reports "could not
+# resolve host". Chrome is unaffected because it does DNS-over-HTTPS, which is
+# exactly why the breakage looks like "only the terminal has no internet".
+#
+# Pinning a nameserver in /etc/resolv.conf does NOT help: the packets are
+# hijacked on the way out, whatever server they were addressed to.
+#
+# This removes the stale rule. The VPN re-installs it (with its resolver
+# actually running) the next time you connect, so this is safe to run any time.
+set -uo pipefail
+
+if ss -lun 2>/dev/null | grep -q '127.0.0.1:5354'; then
+    echo "the VPN's DNS resolver is listening on 5354, so the rule is live and correct."
+    echo "nothing to do (are you connected to the VPN?)"
+    exit 0
+fi
+
+RULE=(-t nat -D OUTPUT -p udp -m udp --dport 53 -m mark ! --mark 0x81
+      -j DNAT --to-destination 127.0.0.1:5354)
+
+if [ "$(id -u)" -ne 0 ]; then
+    U=$(id -u)
+    export DISPLAY="${DISPLAY:-:0}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$U}"
+    export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$U/bus}"
+    echo "a password dialog will pop up to remove the rule..."
+    pkexec iptables "${RULE[@]}" || { echo "could not remove the rule"; exit 1; }
+else
+    iptables "${RULE[@]}" || { echo "could not remove the rule"; exit 1; }
+fi
+
+echo -n "checking... "
+if getent hosts github.com >/dev/null 2>&1; then
+    echo "DNS works again."
+else
+    echo "rule removed, but names still do not resolve. Check: resolvectl status"
+fi
