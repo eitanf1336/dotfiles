@@ -412,6 +412,30 @@ def stop_member(m, live):
     return ok
 
 
+CHAT_STORE = os.path.join(HOME, ".claude/chats")
+# What claude-c keys by session id. A --bg resume mints a new one, so without
+# this the chat drops out of its category and its project and he cannot find it
+# in the board any more - which is exactly how it looks when a chat "vanishes".
+CHAT_FILES = ("categories.json", "chat_projects.json", "names.json")
+
+
+def inherit_chat_metadata(old_sid, new_sid):
+    carried = []
+    for fn in CHAT_FILES:
+        path = os.path.join(CHAT_STORE, fn)
+        data = read_json(path, None)
+        if not isinstance(data, dict) or old_sid not in data:
+            continue
+        if data.get(new_sid) == data[old_sid]:
+            continue
+        data[new_sid] = data[old_sid]
+        write_json(path, data)
+        carried.append(f"{fn.split('.')[0]}={data[old_sid]}")
+    if carried:
+        log(f"claude-c: carried {', '.join(carried)} to {new_sid[:8]}")
+    return carried
+
+
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 BACKGROUNDED = re.compile(r"backgrounded\s*[^0-9a-f]*([0-9a-f]{8})")
 
@@ -469,7 +493,10 @@ def revive(m, prompt, cfg, live):
     for _ in range(6):
         for a in agent_list():
             if a.get("id") == short and is_main_chat(a):
+                old_sid = m["sid"]
                 m["short"], m["sid"] = short, a.get("sessionId") or m["sid"]
+                if m["sid"] != old_sid:
+                    inherit_chat_metadata(old_sid, m["sid"])
                 m["last_size"] = transcript_size(m["sid"])
                 log(f"{m['short']} ({m['name']}): revived as a background "
                     f"agent, attempt {m['attempts']}")
