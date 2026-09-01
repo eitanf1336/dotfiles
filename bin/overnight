@@ -1470,6 +1470,68 @@ def cmd_report(argv):
     return 0
 
 
+def cmd_check(argv):
+    """One health pass, for a watchdog to poll. Prints ALERT lines for anything
+    that needs a person (or a Claude) to look, and one OK line otherwise."""
+    cfg, st = conf(), state()
+    alerts = []
+    if not cfg.get("enabled"):
+        print("OK overnight is off")
+        return 0
+    for unit in ("overnight.timer", "overnight-guard.timer"):
+        if systemctl("is-active", unit).stdout.strip() != "active":
+            alerts.append(f"ALERT {unit} is not active")
+    agents = [a for a in agent_list() if is_main_chat(a) and is_live(a)]
+    by_id = {a.get("id"): a for a in agents}
+    names = {}
+    for a in agents:
+        names.setdefault(a.get("name"), []).append(a.get("id"))
+    mine = {m["name"] for m in st.get("members", [])
+            if m.get("status") not in ("done", "stuck")}
+    for name, ids in names.items():
+        if name in mine and len(ids) > 1:
+            alerts.append(f"ALERT two live agents called {name!r}: "
+                          f"{', '.join(ids)}")
+    live = by_sid(agents)
+    now = time.time()
+    working = 0
+    for m in st.get("members", []):
+        if m.get("status") in ("done", "stuck"):
+            continue
+        if m["short"] not in by_id and st.get("phase") == "armed":
+            alerts.append(f"ALERT {m['name']} ({m['short']}) is not in the "
+                          f"agent list - he cannot open it")
+        elif member_working(m, live):
+            working += 1
+        elif now - float(m.get("last_working") or now) > 20 * 60 \
+                and st.get("phase") == "armed":
+            alerts.append(f"ALERT {m['name']} has not worked in "
+                          f"{fmt_eta(now - m['last_working'])} and was not "
+                          f"revived")
+    phase = st.get("phase", "armed")
+    if phase == "paused" and now - float(st.get("paused_at") or now) > 25 * 60:
+        alerts.append(f"ALERT parked for "
+                      f"{fmt_eta(now - float(st.get('paused_at')))} with "
+                      f"nothing resumed")
+    rem = None
+    try:
+        rem, _ = qw.five_hour(qw.limits())
+    except Exception:
+        pass
+    if rem is not None and phase == "armed" \
+            and rem <= float(cfg.get("floor", 5)) and working:
+        alerts.append(f"ALERT {rem:.0f}% quota left and {working} chat(s) are "
+                      f"still working - the park did not fire")
+    for a in alerts:
+        print(a)
+    if not alerts:
+        print(f"OK phase={phase} working={working}/{len(pending(st))} "
+              f"quota={'%.0f%%' % rem if rem is not None else '?'} "
+              f"account={qw.active_account() or '?'} "
+              f"done={sum(1 for m in st.get('members', []) if m.get('status') == 'done')}")
+    return 0
+
+
 def usage():
     print(__doc__.strip())
     return 0
@@ -1478,7 +1540,7 @@ def usage():
 TABLE = {"start": cmd_start, "on": cmd_start, "arm": cmd_start,
          "stop": cmd_stop, "off": cmd_stop, "add": cmd_add,
          "status": cmd_status, "tick": cmd_tick, "heal": cmd_heal,
-         "report": cmd_report}
+         "report": cmd_report, "check": cmd_check}
 
 
 def main():
