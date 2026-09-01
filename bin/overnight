@@ -360,8 +360,22 @@ def finished_note(sid):
     return " ".join((m.group(1) or "").split())[:200] or "(no summary given)"
 
 
+def ours_alive(m):
+    """Is the revival we started still running? Checked against the command
+    line, not just the pid: state survives a reboot, and a recycled pid that
+    happens to match would otherwise look like a chat hard at work forever."""
+    pid = m.get("pid")
+    if not pid or not qw.alive(pid):
+        return False
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as fh:
+            return b"claude" in fh.read()
+    except OSError:
+        return False
+
+
 def member_working(m, live):
-    if m.get("pid") and qw.alive(m["pid"]):
+    if ours_alive(m):
         return True                                # our own revival, mid-turn
     a = live.get(m["sid"])
     if not a:
@@ -372,7 +386,7 @@ def member_working(m, live):
 
 
 def member_live(m, live):
-    if m.get("pid") and qw.alive(m["pid"]):
+    if ours_alive(m):
         return True
     a = live.get(m["sid"])
     return bool(a and is_live(a))
@@ -382,7 +396,7 @@ def member_live(m, live):
 def stop_member(m, live):
     """Drop the process, keep the conversation."""
     ok = False
-    if m.get("pid") and qw.alive(m["pid"]):
+    if ours_alive(m):
         try:
             os.kill(int(m["pid"]), 15)
             ok = True
@@ -727,7 +741,7 @@ def refresh(st, live):
         if member_working(m, live):
             m["last_working"] = now
             m["status"] = "running"
-        if m.get("pid") and not qw.alive(m["pid"]):
+        if m.get("pid") and not ours_alive(m):
             m["pid"] = None
 
 
@@ -742,8 +756,7 @@ def supervise(cfg, st, live):
     stall = float(cfg.get("stall", 7)) * 60
     wedged = float(cfg.get("wedged", 45)) * 60
     cap = int(cfg.get("attempts", 10))
-    running = sum(1 for m in st.get("members", [])
-                  if m.get("pid") and qw.alive(m["pid"]))
+    running = sum(1 for m in st.get("members", []) if ours_alive(m))
     for m in pending(st):
         if running >= int(cfg.get("jobs", 2)):
             return
