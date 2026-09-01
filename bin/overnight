@@ -384,7 +384,11 @@ def member_working(m, live):
     if not a:
         return False
     if a.get("kind") == "interactive":
-        return qw.alive(a.get("pid"))              # a headless run in flight
+        # A terminal session carries no state: it looks identical whether it is
+        # thinking or sitting at an empty prompt. Its transcript is the only
+        # honest tell, so growth stands in for "busy" here.
+        return qw.alive(a.get("pid")) and \
+            time.time() - float(m.get("last_growth") or 0) < 300
     return cp.is_working(a)
 
 
@@ -409,6 +413,19 @@ def stop_member(m, live):
     a = live.get(m["sid"])
     if a and is_main_chat(a) and is_live(a):
         ok = cp.stop_agent(a.get("id") or m["short"]) or ok
+    elif a and a.get("kind") == "interactive" and qw.alive(a.get("pid")):
+        # A chat he attached to and then left. `claude stop` does not speak for
+        # it, so it would sit outside the quota cycle and die on the limit with
+        # nothing to resume. It is a member: it gets stopped like one, and the
+        # next revive brings it back as a proper background agent under its own
+        # name. Only ever a chat this supervisor was told to look after.
+        try:
+            os.kill(int(a["pid"]), 15)
+            log(f"{m['short']} ({m['name']}): stopped an attached terminal "
+                f"session so it can be parked and resumed")
+            ok = True
+        except OSError as e:
+            log(f"{m['short']}: could not stop interactive {a['pid']}: {e}")
     return ok
 
 
@@ -793,6 +810,21 @@ def adopt_new(cfg, st):
     it gets brought back with them."""
     if not cfg.get("adopt_new", True):
         return []
+    now = time.time()
+    revived = []
+    for m in st.get("members", []):
+        if m.get("status") not in ("done", "stuck"):
+            continue
+        a = by_sid().get(m["sid"])
+        if a and is_live(a) and transcript_size(m["sid"]) > (m.get("last_size") or 0):
+            # He gave it more work after it signed off. It is back in the group,
+            # and it has to earn its OVERNIGHT-DONE again.
+            m.update(status="running", note="", attempts=0, last_working=now,
+                     last_growth=now, last_size=transcript_size(m["sid"]))
+            revived.append(f"{m['short']} ({m['name']})")
+    if revived:
+        log("back under supervision after more work: " + ", ".join(revived))
+
     known = {m["sid"] for m in st.get("members", [])}
     # A chat keeps its name across a resume but not its session id, so the name
     # is what stops the same conversation being adopted twice and ending up
@@ -1389,6 +1421,21 @@ def cmd_add(argv):
     if missed:
         die(f"no chat matching {', '.join(missed)}")
     st = state()
+    now = time.time()
+    revived = []
+    for m in st.get("members", []):
+        if m.get("status") not in ("done", "stuck"):
+            continue
+        a = by_sid().get(m["sid"])
+        if a and is_live(a) and transcript_size(m["sid"]) > (m.get("last_size") or 0):
+            # He gave it more work after it signed off. It is back in the group,
+            # and it has to earn its OVERNIGHT-DONE again.
+            m.update(status="running", note="", attempts=0, last_working=now,
+                     last_growth=now, last_size=transcript_size(m["sid"]))
+            revived.append(f"{m['short']} ({m['name']})")
+    if revived:
+        log("back under supervision after more work: " + ", ".join(revived))
+
     known = {m["sid"] for m in st.get("members", [])}
     added = [make_member(a) for a in hits if a.get("sessionId") not in known]
     if not added:
