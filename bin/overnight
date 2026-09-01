@@ -917,10 +917,14 @@ def supervise(cfg, st, live):
     stall = float(cfg.get("stall", 7)) * 60
     wedged = float(cfg.get("wedged", 45)) * 60
     cap = int(cfg.get("attempts", 10))
-    running = sum(1 for m in st.get("members", [])
-                  if member_working(m, live))
+    # How many revivals this tick may START. Counting everything that happens
+    # to be working instead was a real bug: with two chats busy, nothing idle
+    # was ever picked back up. A separate cap keeps the box off its knees.
+    started = 0
+    live_now = sum(1 for m in st.get("members", []) if member_working(m, live))
+    room = max(0, int(cfg.get("max_live", 6)) - live_now)
     for m in pending(st):
-        if running >= int(cfg.get("jobs", 2)):
+        if started >= int(cfg.get("jobs", 2)) or room <= 0:
             return
         if now < float(m.get("retry_after") or 0):
             continue
@@ -955,7 +959,8 @@ def supervise(cfg, st, live):
                   else nudge_prompt(reason))
         if revive(m, prompt, cfg, live):
             m["status"] = "running"
-            running += 1
+            started += 1
+            room -= 1
 
 
 def park_all(cfg, st, live, reason):
@@ -1270,7 +1275,7 @@ def parse_start(argv):
     cfg = {"threshold": 12.0, "grace": 180, "margin": 10.0, "stall": 7.0,
            "wedged": 45.0, "attempts": 10, "jobs": 2, "rotate": [],
            "all_live": False, "yolo": False, "adopt_new": True,
-           "quiet": False, "floor": 5.0}
+           "quiet": False, "floor": 5.0, "max_live": 6}
     targets = []
     i = 0
     while i < len(argv):
