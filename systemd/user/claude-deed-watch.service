@@ -1,0 +1,15 @@
+[Unit]
+Description=Watch the deed portal for client activity and notify the desktop
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/MyLittleProjects/DeedPortal
+EnvironmentFile=%h/.config/deed-portal/credentials
+ExecStart=%h/code/MyLittleProjects/DeedPortal/pipeline/venv/bin/python \
+  %h/code/MyLittleProjects/DeedPortal/pipeline/watch_daemon.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
