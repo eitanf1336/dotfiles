@@ -174,6 +174,8 @@ CONTRACT = f"""
 
 This chat is being looked after by `overnight` while the user sleeps. That means: if you stop, you will be started again; if the quota runs out you will be parked and brought back, possibly on a different Claude account. Nobody is reading your output until morning, so do not wait for the user and do not ask a question you can answer yourself by looking.
 
+Sub-agents are yours to account for. Anything you dispatch spends the same quota you do and dies with you when you are parked, so keep them short, never leave one running while you sit idle, and stop them the moment you are asked to park.
+
 There is exactly one way to end: when the task you were given is genuinely finished, make the LAST line of your reply
 
     {SENTINEL}: <one sentence saying what you finished and where it lives>
@@ -220,11 +222,12 @@ def park_message(remaining, threshold, eta, grace_min, rotating):
 The shared 5-hour Claude quota is down to about {remaining:.0f}% left, and this machine parks every session at {threshold:.0f}% so that none of us dies mid-sentence. Nothing has gone wrong and nothing is being thrown away.
 
 What to do, in this order:
-1. Finish the tool call you are in the middle of, or abandon it, whichever leaves less mess. Do not start another one.
-2. Leave the work pickup-able cold: save files, commit if that is your habit.
-3. Deal with anything running in the background. It does NOT survive this: your process is what dies. Wait for it if it is close, or kill it and say so, and name its output file either way.
-4. Write one short paragraph saying exactly where you stopped, what you had established, and what the very next step is. This is the note you will be handed back, so write it for someone with no memory of the last hour.
-5. End your turn. Do not start new work and do not spawn subagents.
+1. STOP YOUR SUB-AGENTS FIRST, before anything else. Any Agent/Task call you have running is spending the same quota you are being parked to protect, and it dies with you in a few minutes anyway - so its work is lost either way. End them now, do not dispatch another, and do not wait for one to come back.
+2. Finish the tool call you are in the middle of, or abandon it, whichever leaves less mess. Do not start another one.
+3. Leave the work pickup-able cold: save files, commit if that is your habit.
+4. Deal with anything running in the background. It does NOT survive this: your process is what dies. Wait for it if it is close, or kill it and say so, and name its output file either way.
+5. Write one short paragraph saying exactly where you stopped, what you had established, and what the very next step is. This is the note you will be handed back, so write it for someone with no memory of the last hour.
+6. End your turn. Do not start new work and do not spawn subagents.
 
 {comeback} It is this same session, with your full history, and you will be told to carry on from that note.
 
@@ -409,39 +412,75 @@ def stop_member(m, live):
     return ok
 
 
-def revive(m, prompt, cfg, live):
-    """Continue the session in place: same id, same transcript, one more turn.
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+BACKGROUNDED = re.compile(r"backgrounded\s*[^0-9a-f]*([0-9a-f]{8})")
 
-    A session the daemon still holds refuses --resume, so it is stopped first.
-    The process is detached on purpose - a tick must never sit for hours
-    holding a whole night's work inside a systemd job that will time out."""
+
+def revive(m, prompt, cfg, live):
+    """Put a member back to work as a REAL background agent.
+
+    This must never be `--resume -p`. A --print run has no interactive session
+    for `claude agents` to attach to, so a chat woken that way vanishes out of
+    the agent list and comes back under a generated name: from the outside it
+    reads as "the supervisor ate my chat". `--bg --resume` continues the same
+    conversation as an attachable job, and -n keeps its name. Claude Code says
+    so itself if you get it wrong, which is how this was found.
+
+    A --bg resume mints a new session id for the continued conversation, so the
+    member is re-pointed at it here - otherwise the next tick would supervise a
+    session nobody is running any more."""
     if member_live(m, live):
         stop_member(m, live)
         time.sleep(1.5)
     os.makedirs(LOGS, exist_ok=True)
     logfile = os.path.join(LOGS, f"{m['short']}.log")
-    cmd = [CLAUDE]
+    cmd = [CLAUDE, "--bg", "--resume", m["sid"], "-n", m["name"]]
     if m.get("model"):
         cmd += ["--model", m["model"]]
     if cfg.get("yolo"):
         cmd += ["--dangerously-skip-permissions"]
-    cmd += ["--resume", m["sid"], "-p", prompt]
+    cmd += [prompt]
     if not os.path.isdir(m.get("cwd") or ""):
         m["cwd"] = HOME
     try:
         with open(logfile, "a") as fh:
             fh.write(f"\n=== {datetime.now().isoformat(timespec='seconds')} "
                      f"revive #{m['attempts'] + 1}\n")
-            p = subprocess.Popen(cmd, cwd=m["cwd"], stdin=subprocess.DEVNULL,
-                                 stdout=fh, stderr=fh, start_new_session=True)
-    except OSError as e:
+            r = subprocess.run(cmd, cwd=m["cwd"], stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=240)
+            out = (r.stdout or "") + (r.stderr or "")
+            fh.write(out + f"\n[overnight] exit {r.returncode}\n")
+    except (OSError, subprocess.TimeoutExpired) as e:
         log(f"{m['short']}: revive FAILED: {e}")
         return False
-    m["pid"] = p.pid
     m["attempts"] += 1
     m["last_working"] = time.time()
     m["last_growth"] = time.time()
-    log(f"{m['short']} ({m['name']}): revived, attempt {m['attempts']}, pid {p.pid}")
+    m["pid"] = None
+
+    hit = BACKGROUNDED.search(ANSI.sub("", out))
+    if not hit:
+        log(f"{m['short']} ({m['name']}): revive did not report a background "
+            f"job - see {logfile}")
+        return r.returncode == 0
+    short = hit.group(1)
+    # Follow the conversation to wherever it now lives, and prove it really is
+    # a background job under its own name before calling this a success.
+    for _ in range(6):
+        for a in agent_list():
+            if a.get("id") == short and is_main_chat(a):
+                m["short"], m["sid"] = short, a.get("sessionId") or m["sid"]
+                m["last_size"] = transcript_size(m["sid"])
+                log(f"{m['short']} ({m['name']}): revived as a background "
+                    f"agent, attempt {m['attempts']}")
+                return True
+        time.sleep(2)
+    log(f"{short} ({m['name']}): WOKEN BUT NOT ATTACHABLE - it is not in the "
+        f"agent list. He cannot open it; this must never happen.")
+    notify("Overnight: a chat came back unattachable",
+           f"{m['name']} was resumed but is not showing as a background agent. "
+           f"Its work is safe in session {m['sid'][:8]}.")
+    m["short"] = short
     return True
 
 
@@ -493,6 +532,37 @@ def courier(members, text, tag, live):
 
 
 # ---- accounts -----------------------------------------------------------
+def fresh_headroom():
+    """(remaining%, resets_at, weekly_blocker) for the account that is live RIGHT
+    NOW, read past the cache.
+
+    This is not a detail. claude-limits caches a good reading for 90 seconds,
+    and an account switch takes about four - so a plain read straight after a
+    switch hands back the OLD account's number under the new account's name.
+    That is exactly how a fresh account with 99% free got written off as dry
+    and the whole group sat parked for nothing."""
+    exe = shutil.which("claude-limits") or os.path.join(HOME, ".local/bin/claude-limits")
+    for attempt in (1, 2):
+        try:
+            out = subprocess.run([exe, "--json", "--fresh"], capture_output=True,
+                                 text=True, timeout=60, check=True)
+            data = json.loads(out.stdout)
+            meta = data.get("_claude_limits") or {}
+            if meta.get("cached"):
+                raise RuntimeError("only a cached reading came back")
+            rem, resets = qw.five_hour(data)
+            if rem is None:
+                raise RuntimeError("no five_hour utilization in the payload")
+            return rem, resets, qw.weekly_blocked(data)
+        except Exception as e:
+            log(f"fresh read of the live account failed ({e})"
+                + (" - waking the credentials" if attempt == 1 else ""))
+            if attempt == 1:
+                qw.wake_credentials()               # a parked slot's token goes stale
+                time.sleep(2)
+    return None, None, None
+
+
 def rotate(cfg, st):
     """Move to the next account that really has headroom.
 
@@ -517,7 +587,7 @@ def rotate(cfg, st):
         if not qw.switch_account(name):
             exhausted[name] = now + 900
             continue
-        rem, resets, weekly = qw.account_headroom()      # wakes the token first
+        rem, resets, weekly = fresh_headroom()   # past the cache, or it lies
         bad = None
         if rem is None:
             bad, until = "would not report its usage", now + 1800
@@ -697,10 +767,19 @@ def adopt_new(cfg, st):
     if not cfg.get("adopt_new", True):
         return []
     known = {m["sid"] for m in st.get("members", [])}
+    # A chat keeps its name across a resume but not its session id, so the name
+    # is what stops the same conversation being adopted twice and ending up
+    # with two agents editing the same repo.
+    names = {m.get("name") for m in st.get("members", [])
+             if m.get("status") not in ("done", "stuck")}
     added = []
     for a in candidates(all_live=bool(cfg.get("all_live"))):
         sid = a.get("sessionId")
         if sid in known or sid in (st.get("declined") or []):
+            continue
+        if a.get("name") in names:
+            log(f"not adopting {a.get('id')}: already looking after a chat "
+                f"called {a.get('name')!r}")
             continue
         m = make_member(a)
         # It arrived while everyone else was parked: park it too, or it will
@@ -718,6 +797,29 @@ def adopt_new(cfg, st):
                                          bool(cfg.get("rotate"))),
                     "adopt", by_sid())
     return added
+
+
+def reap_duplicates(st):
+    """Exactly one live agent per chat.
+
+    A resume can leave the old job registered and running - two agents then
+    edit the same repo from the same history, which is worse than either one
+    stopping. Only chats this supervisor already tracks are touched, and only
+    the copy that is not the tracked one.
+    """
+    mine = {m["name"]: m["short"] for m in st.get("members", [])
+            if m.get("status") not in ("done", "stuck")}
+    killed = []
+    for a in agent_list():
+        if not is_main_chat(a) or not is_live(a):
+            continue
+        name = a.get("name")
+        if name in mine and a.get("id") != mine[name]:
+            if cp.stop_agent(a.get("id")):
+                killed.append(f"{a.get('id')} ({name})")
+    if killed:
+        log("stopped duplicate agent(s): " + ", ".join(killed))
+    return killed
 
 
 def refresh(st, live):
@@ -756,7 +858,8 @@ def supervise(cfg, st, live):
     stall = float(cfg.get("stall", 7)) * 60
     wedged = float(cfg.get("wedged", 45)) * 60
     cap = int(cfg.get("attempts", 10))
-    running = sum(1 for m in st.get("members", []) if ours_alive(m))
+    running = sum(1 for m in st.get("members", [])
+                  if member_working(m, live))
     for m in pending(st):
         if running >= int(cfg.get("jobs", 2)):
             return
@@ -824,6 +927,36 @@ def wake_all(cfg, st, switched_to=None):
     return woken
 
 
+def effective_threshold(cfg, st, now_hint=None):
+    """How much headroom is actually needed to park safely.
+
+    A flat percentage is not enough. Four Opus chats went from 10% to 3% during
+    a five minute grace period: by the time they were stopped there was almost
+    nothing left to resume onto. So the trigger moves with the measured burn
+    rate - whatever the group is spending per minute, the grace period has to
+    fit inside the remainder, with the floor still standing underneath."""
+    base = float(cfg.get("threshold", 12))
+    floor = float(cfg.get("floor", 5))
+    grace_min = int(cfg.get("grace", 180)) / 60.0
+    burn = float(st.get("burn") or 0)              # percent per minute
+    return max(base, min(60.0, floor + burn * (grace_min + 1)))
+
+
+def note_burn(st, remaining, now):
+    """Percent per minute, smoothed. Readings can be minutes apart and the
+    endpoint sometimes refuses one, so a single gap must not spike it."""
+    prev_t, prev_r = st.get("burn_at"), st.get("burn_from")
+    st["burn_at"], st["burn_from"] = now, remaining
+    if not prev_t or prev_r is None:
+        return
+    dt = (now - float(prev_t)) / 60.0
+    if dt < 0.5 or dt > 20:
+        return
+    rate = max(0.0, (float(prev_r) - remaining) / dt)
+    old = float(st.get("burn") or rate)
+    st["burn"] = round(old * 0.5 + rate * 0.5, 3)
+
+
 # ---- the tick -----------------------------------------------------------
 def cmd_tick(argv):
     dry = any(a in ("-n", "--dry-run") for a in argv)
@@ -837,14 +970,15 @@ def cmd_tick(argv):
     live = by_sid()
     if not dry:
         adopt_new(cfg, st)
+        reap_duplicates(st)
         live = by_sid()
     refresh(st, live)
 
     if not pending(st):
         return finish(cfg, st, "every chat reported itself finished")
 
-    threshold = float(cfg.get("threshold", 12))
-    grace = int(cfg.get("grace", 300))
+    threshold = effective_threshold(cfg, st, now_hint=time.time())
+    grace = int(cfg.get("grace", 180))
     rotating = bool(cfg.get("rotate"))
     phase = st.get("phase", "armed")
     now = time.time()
@@ -856,6 +990,9 @@ def cmd_tick(argv):
         try:
             data = qw.limits()
             remaining, resets_at = qw.five_hour(data)
+            if remaining is not None:
+                note_burn(st, remaining, now)
+                threshold = effective_threshold(cfg, st)
             st["fails"] = 0
             st["remaining"] = remaining
             soon = phase != "armed" or (remaining is not None
@@ -905,8 +1042,14 @@ def cmd_tick(argv):
                 save(st)
             log("stand-down, the quota recovered")
             return 0
+        floor = float(cfg.get("floor", 5))
+        out_of_time = remaining is not None and remaining <= floor
+        if out_of_time and not dry:
+            log(f"only {remaining:.0f}% left - forcing the park now instead of "
+                f"waiting out the grace")
         still = [m for m in pending(st) if member_live(m, live)]
-        if still and now - float(st.get("warned_at") or now) < grace:
+        if still and not out_of_time \
+                and now - float(st.get("warned_at") or now) < grace:
             if dry:
                 print(f"{len(still)} still live, "
                       f"{fmt_eta(grace - (now - st['warned_at']))} of grace left")
@@ -958,7 +1101,7 @@ def try_rotate(cfg, st, now):
         log(f"no account has headroom - waiting "
             f"{fmt_eta(float(st.get('retry_rotate_at') or now) - now)}")
         return 0
-    rem, _, _ = qw.account_headroom()
+    rem, _, _ = fresh_headroom()
     return finish_resume(cfg, st, name, rem, now)
 
 
@@ -1065,10 +1208,10 @@ def finish(cfg, st, why):
 
 # ---- commands -----------------------------------------------------------
 def parse_start(argv):
-    cfg = {"threshold": 12.0, "grace": 300, "margin": 10.0, "stall": 7.0,
+    cfg = {"threshold": 12.0, "grace": 180, "margin": 10.0, "stall": 7.0,
            "wedged": 45.0, "attempts": 10, "jobs": 2, "rotate": [],
            "all_live": False, "yolo": False, "adopt_new": True,
-           "quiet": False}
+           "quiet": False, "floor": 5.0}
     targets = []
     i = 0
     while i < len(argv):
@@ -1080,11 +1223,11 @@ def parse_start(argv):
                 i += 1
             i -= 1
         elif a in ("--grace", "--stall", "--wedged", "--attempts", "--jobs",
-                   "--margin", "--park-at"):
+                   "--margin", "--park-at", "--floor"):
             key = {"--park-at": "threshold"}.get(a, a.lstrip("-"))
             i += 1
             cfg[key] = float(argv[i]) if key in ("threshold", "margin", "stall",
-                                                 "wedged") else int(argv[i])
+                                                 "wedged", "floor") else int(argv[i])
         elif a == "--all-live":
             cfg["all_live"] = True
         elif a == "--quiet":
@@ -1291,8 +1434,13 @@ def cmd_status(argv):
           f"{RST}")
     print(f"  account        {qw.active_account() or '?'}")
     print(f"  5-hour quota   {quota}")
-    print(f"  parks at       {float(cfg.get('threshold', 12)):.0f}% left, "
-          f"after {int(cfg.get('grace', 300)) // 60} min of grace")
+    eff = effective_threshold(cfg, st)
+    burn = float(st.get("burn") or 0)
+    print(f"  parks at       {eff:.0f}% left"
+          + (f" {GRY}(floor {float(cfg.get('floor', 5)):.0f}% + {burn:.1f}%/min "
+             f"burn){RST}" if eff > float(cfg.get("threshold", 12)) else "")
+          + f", after {int(cfg.get('grace', 180)) // 60} min of grace"
+          + f"{GRY} (skipped below {float(cfg.get('floor', 5)):.0f}%){RST}")
     if cfg.get("rotate"):
         print(f"  rotates        {' → '.join(cfg['rotate'])}")
         for k, v in (st.get("exhausted") or {}).items():
