@@ -1555,8 +1555,13 @@ def cmd_check(argv):
     for unit in ("overnight.timer", "overnight-guard.timer"):
         if systemctl("is-active", unit).stdout.strip() != "active":
             alerts.append(f"ALERT {unit} is not active")
-    agents = [a for a in agent_list() if is_main_chat(a) and is_live(a)]
+    everything = agent_list()
+    agents = [a for a in everything if is_main_chat(a) and is_live(a)]
     by_id = {a.get("id"): a for a in agents}
+    # A chat he has open in a terminal is live and openable, it is just not a
+    # background job. Alerting on that would cry wolf every time he attaches.
+    attached = {a.get("sessionId") for a in everything
+                if a.get("kind") == "interactive" and qw.alive(a.get("pid"))}
     names = {}
     for a in agents:
         names.setdefault(a.get("name"), []).append(a.get("id"))
@@ -1572,7 +1577,8 @@ def cmd_check(argv):
     for m in st.get("members", []):
         if m.get("status") in ("done", "stuck"):
             continue
-        if m["short"] not in by_id and st.get("phase") == "armed":
+        if m["short"] not in by_id and m["sid"] not in attached \
+                and st.get("phase") == "armed":
             alerts.append(f"ALERT {m['name']} ({m['short']}) is not in the "
                           f"agent list - he cannot open it")
         elif member_working(m, live):
