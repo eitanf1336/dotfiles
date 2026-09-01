@@ -15,16 +15,24 @@ screens (eDP-1, dock DP-8/DP-9) keep their pointer, which is why only one screen
 looks broken.
 
 Nothing clears that latch from outside the compositor. Tested and useless:
-Super+F5 (fix-screen), nudging cursor-size or the cursor theme, and forcing a
-modeset on the screen. Only restarting gnome-shell brings the pointer back, and
-on Wayland that means logging out.
+Super+F5 (fix-screen), unplugging and replugging the screen, nudging cursor-size
+or the cursor theme, and forcing a modeset. Restarting gnome-shell does cure it,
+but on Wayland that means logging out.
+
+The way to get the pointer back WITHOUT logging out is --soft (verified working
+2026-09-01): turn GNOME's magnifier on at mag-factor 1.0. Nothing is magnified,
+the desktop looks identical, but the whole stage now goes through the zoom
+region, so gnome-shell paints the pointer as an ordinary scene element on every
+screen instead of asking the NVIDIA card for a hardware cursor plane.
 
 Usage:
     fix-cursor            diagnose: is the GPU healthy again, and what to do
+    fix-cursor --soft     get the pointer back now, no logout (the cure)
+    fix-cursor --soft off undo it, restoring the old zoom factor
     fix-cursor --nudge    re-realize the cursor sprite (harmless, rarely enough)
     fix-cursor --blink    force a modeset on the primary screen (did not help in
                           the 2026-08-16 case, kept for a different flavour)
-    fix-cursor --logout   log out now, which is the actual cure
+    fix-cursor --logout   log out, the heavier cure that also works
 """
 
 import ctypes
@@ -131,6 +139,47 @@ def blink():
     apply({primary: cur[0]})
 
 
+STATE = os.path.expanduser("~/.local/state/fix-cursor-mag-factor")
+MAG_APP = ("org.gnome.desktop.a11y.applications", "screen-magnifier-enabled")
+MAG = "org.gnome.desktop.a11y.magnifier"
+
+
+def gs_get(schema, key):
+    return subprocess.run(["gsettings", "get", schema, key],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+def gs_set(schema, key, value):
+    subprocess.run(["gsettings", "set", schema, key, value], check=True)
+
+
+def soft(turn_on=True):
+    """Draw the pointer through the 1.0x magnifier instead of the HW cursor plane."""
+    if turn_on:
+        if gs_get(*MAG_APP) != "true":                 # remember his real zoom factor
+            os.makedirs(os.path.dirname(STATE), exist_ok=True)
+            with open(STATE, "w") as fh:
+                fh.write(gs_get(MAG, "mag-factor"))
+        gs_set(MAG, "mag-factor", "1.0")
+        gs_set(MAG, "lens-mode", "false")
+        gs_set(MAG, "screen-position", "full-screen")
+        gs_set(*MAG_APP, "true")
+        print("software pointer ON: magnifier at 1.0x, nothing is magnified.")
+        print("the pointer is painted on every screen now. undo: fix-cursor --soft off")
+    else:
+        gs_set(*MAG_APP, "false")
+        factor = ""
+        try:
+            with open(STATE) as fh:
+                factor = fh.read().strip()
+        except OSError:
+            pass
+        if factor:
+            gs_set(MAG, "mag-factor", factor)
+            os.remove(STATE)
+        print("software pointer OFF" + (f", zoom factor restored to {factor}" if factor else ""))
+
+
 def logout():
     print("logging out in 5s, Ctrl+C to abort", flush=True)
     time.sleep(5)
@@ -152,8 +201,13 @@ def diagnose():
         print(f"could not probe the GPU: {detail}")
     elif ok:
         print(f"NVIDIA card is healthy again now ({detail}).")
-        print("=> the compositor latched the failure, the GPU did not. "
-              "Log out and back in and the pointer returns: fix-cursor --logout")
+        print("=> the compositor latched the failure, the GPU did not.")
+        if gs_get(*MAG_APP) == "true":
+            print("   the 1.0x-magnifier workaround is already on; if the pointer is "
+                  "still missing this is something else.")
+        else:
+            print("   get the pointer back now without logging out: fix-cursor --soft")
+            print("   (or the heavier cure, which also works: fix-cursor --logout)")
     else:
         print(f"NVIDIA card still cannot take a cursor ({detail}).")
         print("=> a re-login will not be enough, reboot.")
@@ -161,7 +215,9 @@ def diagnose():
 
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
-    if arg == "--nudge":
+    if arg == "--soft":
+        soft(turn_on=(len(sys.argv) < 3 or sys.argv[2] not in ("off", "no", "false")))
+    elif arg == "--nudge":
         nudge()
     elif arg == "--blink":
         blink()
