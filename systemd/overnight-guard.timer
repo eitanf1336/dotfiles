@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch the overnight supervisor's own timer
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=overnight-guard.service
+
+[Install]
+WantedBy=timers.target

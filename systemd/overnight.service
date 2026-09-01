@@ -1,0 +1,11 @@
+[Unit]
+Description=Overnight supervisor (see a group of Claude chats through to the end)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/overnight tick
+# A tick can switch accounts, wake a stale token and start revivals.
+TimeoutStartSec=900
+# Revivals and the courier are detached on purpose and must outlive the tick.
+KillMode=process

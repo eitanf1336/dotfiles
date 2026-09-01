@@ -1,0 +1,13 @@
+[Unit]
+Description=Supervise the overnight Claude group every minute
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=60s
+AccuracySec=5s
+# A suspend or a slow boot must not swallow a tick.
+Persistent=true
+Unit=overnight.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,1348 @@
+#!/usr/bin/env python3
+"""overnight - see a group of Claude chats through to the end while he sleeps.
+
+quota-watcher parks *everything* alive when the 5-hour limit runs low and wakes
+it again afterwards. This is the other half: a supervisor that adopts a named
+group of chats and is responsible for them until every one of them says it is
+finished. Through the night it will, on its own:
+
+  * park the group politely before the quota runs out, and stop it for real if
+    a chat ignores the warning (nothing dies mid-sentence),
+  * move the whole machine to another Claude account that still has headroom -
+    switching in, waking that slot's token and reading its LIVE limit before it
+    trusts it, and backing straight out again if the slot cannot answer,
+  * bring every member back where it left off, in its own session, with its
+    full history, and tell it to carry on,
+  * revive anything that fell over, went idle, or wedged mid-tool-call,
+  * and stop only when each chat has reported itself done - then write the
+    morning report and say so on WhatsApp.
+
+It tracks the MAIN chats only: top-level background sessions. Sub-agents that a
+chat spawns for itself belong to that chat, not to this.
+
+Usage:
+  overnight [PCT] [--rotate A B] [TARGET ...]   adopt and start looking after them
+  overnight --add TARGET ...                    add a chat to the group later
+  overnight --status                            where every member is right now
+  overnight --report                            the report of the last run
+  overnight --stop [--leave-paused]             hand the group back
+  overnight --tick [-n]                         one supervision pass (the timer)
+
+Targets are agent ids, session ids or bits of a chat name. With none given it
+adopts every background chat that is working right now (never this one).
+
+Options:
+  --rotate A B ...   claude-account slots to cycle through when quota runs out
+  --grace SECONDS    how long the polite park message gets (default 300)
+  --stall MINUTES    idle this long and a member gets nudged (default 7)
+  --wedged MINUTES   live but no transcript growth this long = restart it (45)
+  --attempts N       how many revivals one member gets before it is called
+                     stuck and left alone (default 10)
+  --jobs N           how many revivals may run at once (default 2, ~700MB each)
+  --all-live         also adopt live-but-idle chats, not just working ones
+  --yolo             revivals run with --dangerously-skip-permissions, so a
+                     permission prompt cannot stall the night
+"""
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+BIN = os.path.join(HOME, "code/linux-setup/bin")
+DIR = os.path.join(HOME, ".claude/overnight")
+CONF = os.path.join(DIR, "config.json")
+STATE = os.path.join(DIR, "state.json")
+LOG = os.path.join(DIR, "overnight.log")
+COURIER_LOG = os.path.join(DIR, "courier.log")
+LOGS = os.path.join(DIR, "logs")
+REPORT = os.path.join(DIR, "report.md")
+QW_SAVED = os.path.join(DIR, "quota-watcher-was.json")
+GUARD_PAUSE = os.path.join(HOME, ".claude/limits-guard/PAUSE")
+SLEEP_FILE = os.path.join(os.environ.get("XDG_STATE_HOME",
+                          os.path.join(HOME, ".local/state")),
+                          "sleep-mode", "sleeping")
+
+CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
+UNIT = "overnight.timer"
+GROUP_JID = "120363410856554324@g.us"          # the "My Claude" self-group
+BRIDGE = os.environ.get("CWB_BRIDGE_SEND", "http://localhost:8080/api/send")
+COURIER_MODEL = os.environ.get("ON_COURIER_MODEL", "haiku")
+
+# What a member says when it has nothing left to do. It is the only thing that
+# ends its supervision, so it has to be something no chat writes by accident.
+SENTINEL = "OVERNIGHT-DONE"
+SENTINEL_RE = re.compile(r"OVERNIGHT[-_ ]DONE\s*:?(.*)", re.I)
+
+if sys.stdout.isatty() and os.environ.get("NO_COLOR") is None:
+    RED, YEL, GRN, CYA, GRY, BLD, RST = (
+        "\033[31m", "\033[33m", "\033[32m", "\033[36m",
+        "\033[90m", "\033[1m", "\033[0m")
+else:
+    RED = YEL = GRN = CYA = GRY = BLD = RST = ""
+
+
+# ---- borrowed machinery -------------------------------------------------
+# quota-watcher already knows how to read the limit without being rate-limited
+# into blindness, and how to move accounts safely; claude-pause knows how to
+# read a transcript. Importing them beats a second copy that drifts.
+def load(name):
+    path = os.path.realpath(shutil.which(name) or os.path.join(BIN, name))
+    try:
+        loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), path)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+    except Exception as e:
+        sys.stderr.write(f"{RED}error:{RST} cannot load {name} ({path}): {e}\n")
+        sys.exit(1)
+
+
+qw = load("quota-watcher")
+cp = load("claude-pause")
+
+
+# ---- small helpers ------------------------------------------------------
+def log(msg):
+    os.makedirs(DIR, exist_ok=True)
+    with open(LOG, "a") as fh:
+        fh.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
+
+
+def read_json(path, default):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(obj, fh, indent=1)
+    os.replace(tmp, path)
+
+
+def die(msg, code=1):
+    sys.stderr.write(f"{RED}error:{RST} {msg}\n")
+    sys.exit(code)
+
+
+def fmt_eta(seconds):
+    return qw.fmt_eta(seconds)
+
+
+def asleep():
+    return os.path.exists(SLEEP_FILE)
+
+
+def notify(title, body, whatsapp=True):
+    """The desktop only if he is awake to see it - the point of this thing is
+    that he is not. WhatsApp always: it is the thing he reads in the morning."""
+    if not asleep() and shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "overnight", title, body],
+                       capture_output=True)
+    if not whatsapp:
+        return
+    try:
+        payload = json.dumps(
+            {"recipient": GROUP_JID,
+             "message": f"\U0001F916\U0001F916\U0001F916\n\n{title}\n\n{body}"
+                        f"\n\n\U0001F916\U0001F916\U0001F916",
+             "store_local": True}).encode()
+        req = urllib.request.Request(BRIDGE, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            log(f"whatsapp -> {r.status}")
+    except Exception as e:
+        log(f"whatsapp FAILED: {e}")
+
+
+# ---- the things we say --------------------------------------------------
+CONTRACT = f"""
+
+This chat is being looked after by `overnight` while the user sleeps. That means: if you stop, you will be started again; if the quota runs out you will be parked and brought back, possibly on a different Claude account. Nobody is reading your output until morning, so do not wait for the user and do not ask a question you can answer yourself by looking.
+
+There is exactly one way to end: when the task you were given is genuinely finished, make the LAST line of your reply
+
+    {SENTINEL}: <one sentence saying what you finished and where it lives>
+
+and stop. Until that line appears you will keep being woken up. Do not write it unless you mean it, and never write it in the middle of a reply."""
+
+
+def nudge_prompt(reason):
+    return f"""Overnight supervisor: you went quiet ({reason}) and your task is not marked finished.
+
+Pick the work back up:
+1. Read back over the end of this conversation and re-establish what you were doing and what is left.
+2. Check the world rather than trusting your memory of it: files move, builds go stale, anything you had running is gone.
+3. Carry on and finish it. Do not start anything new, do not redo finished work, and do not sit waiting for the user.
+
+If you were stopped because you were waiting for permission or for an answer, take the safest sensible route yourself and write down the call you made.
+
+If it turns out everything was already done, say so in one line.{CONTRACT}"""
+
+
+def resume_prompt(switched_to=None):
+    where = (f"You have also been moved onto a different Claude account "
+             f"({switched_to}), which is where the fresh quota came from. That "
+             f"changes nothing about your work.\n\n" if switched_to else "")
+    return f"""Welcome back. The overnight supervisor parked you and is now resuming you.
+
+You did not fail. You were stopped on purpose so you would not burn the last of the shared quota mid-task. Your files, this conversation and your working directory are as you left them.
+
+{where}Pick up where you stopped:
+1. Read the end of this conversation, including the stopping note you left if you left one.
+2. Do not trust your old picture of the world: time has passed, and anything you had running in the background is gone. If you are told a background command has no completion record, that is this pause, not a bug: read its output file before deciding anything.
+3. Finish the task you were originally given.{CONTRACT}"""
+
+
+def park_message(remaining, threshold, eta, grace_min, rotating):
+    comeback = ("You will be stopped and then resumed automatically: either on "
+                "another Claude account that still has quota, within minutes, or "
+                f"once this one resets ({eta})."
+                if rotating else
+                f"You will be stopped and resumed automatically once the quota "
+                f"resets ({eta}).")
+    return f"""Overnight supervisor: please reach a safe stopping point now and end your turn.
+
+The shared 5-hour Claude quota is down to about {remaining:.0f}% left, and this machine parks every session at {threshold:.0f}% so that none of us dies mid-sentence. Nothing has gone wrong and nothing is being thrown away.
+
+What to do, in this order:
+1. Finish the tool call you are in the middle of, or abandon it, whichever leaves less mess. Do not start another one.
+2. Leave the work pickup-able cold: save files, commit if that is your habit.
+3. Deal with anything running in the background. It does NOT survive this: your process is what dies. Wait for it if it is close, or kill it and say so, and name its output file either way.
+4. Write one short paragraph saying exactly where you stopped, what you had established, and what the very next step is. This is the note you will be handed back, so write it for someone with no memory of the last hour.
+5. End your turn. Do not start new work and do not spawn subagents.
+
+{comeback} It is this same session, with your full history, and you will be told to carry on from that note.
+
+If you are still streaming in {grace_min} minutes you will be stopped anyway, wherever you happen to be.{CONTRACT}"""
+
+
+def adopt_message(n, rotating):
+    """Sent once, when a chat is taken on. Cheap, and it saves a nudge later:
+    a chat that knows how to sign off will do it on its own instead of going
+    quiet and waiting to be prodded."""
+    quota = ("If the quota runs low you will be parked and brought back, "
+             "possibly on a different Claude account. "
+             if rotating else
+             "If the quota runs low you will be parked and brought back once "
+             "it resets. ")
+    return f"""Overnight supervisor: you are one of {n} chat(s) being looked after tonight while the user sleeps.
+
+Nothing has changed about your task. What has changed is that nobody is reading your output until morning: do not stop to ask a question you could answer by looking, do not wait for the user, and do not leave work half-finished expecting to be asked again. {quota}If you stop for any other reason, you will simply be started again.{CONTRACT}"""
+
+
+STAND_DOWN = """Overnight supervisor: stand down, the quota recovered and you are not being parked.
+
+Headroom came back before the grace period ran out, so ignore the parking notice you just got and carry on with what you were doing."""
+
+
+# ---- who is out there ---------------------------------------------------
+def agent_list():
+    return cp.agents()
+
+
+def by_sid(agents=None):
+    """One entry per session, preferring the one with a live process. A chat
+    that has been resumed headlessly shows up twice: the daemon's remembered
+    background job, and the `-p` process actually doing the work."""
+    out = {}
+    for a in (agents if agents is not None else agent_list()):
+        sid = a.get("sessionId")
+        if not sid:
+            continue
+        old = out.get(sid)
+        if old is None or (qw.alive(a.get("pid")) and not qw.alive(old.get("pid"))):
+            out[sid] = a
+    return out
+
+
+def is_main_chat(a):
+    """A top-level background chat. Sub-agents never appear here at all (they
+    live inside their parent's process), and `interactive` is either a terminal
+    he is sitting in front of or one of our own headless runs."""
+    return a.get("kind") != "interactive" and bool(a.get("id"))
+
+
+def is_live(a):
+    return cp.is_working(a) or qw.alive(a.get("pid"))
+
+
+def candidates(all_live=False):
+    mine = cp.self_ids()
+    out = []
+    for a in agent_list():
+        if not is_main_chat(a) or cp.is_self(a, mine) or a.get("state") == "done":
+            continue
+        if not is_live(a):
+            continue
+        if not all_live and not cp.is_working(a):
+            continue
+        out.append(a)
+    return out
+
+
+def match(targets):
+    """Resolve ids / session ids / bits of a name against every chat the daemon
+    still knows, live or not."""
+    found, missed = [], []
+    everything = [a for a in agent_list() if is_main_chat(a)]
+    mine = cp.self_ids()
+    for t in targets:
+        low = t.lower()
+        hits = [a for a in everything
+                if a.get("id") == t or a.get("sessionId") == t
+                or (a.get("sessionId") or "").startswith(t)
+                or low in (a.get("name") or "").lower()]
+        hits = [a for a in hits if not cp.is_self(a, mine)]
+        if not hits:
+            missed.append(t)
+        else:
+            found.extend(hits)
+    return found, missed
+
+
+def make_member(a):
+    path = cp.transcript_path(a.get("sessionId"))
+    cwd, model = cp.session_meta(cp.tail_records(path)) if path else (None, None)
+    return {
+        "sid": a.get("sessionId"),
+        "short": a.get("id") or (a.get("sessionId") or "")[:8],
+        "name": a.get("name") or a.get("id") or "(unnamed)",
+        "cwd": cwd or a.get("cwd") or HOME,
+        "model": model,
+        "status": "running",
+        "attempts": 0,
+        "pid": None,
+        "note": "",
+        "since": time.time(),
+        "last_working": time.time(),
+        "last_size": transcript_size(a.get("sessionId")),
+        "last_growth": time.time(),
+    }
+
+
+# ---- reading a member ---------------------------------------------------
+def transcript_size(sid):
+    path = cp.transcript_path(sid) if sid else None
+    try:
+        return os.path.getsize(path) if path else 0
+    except OSError:
+        return 0
+
+
+def finished_note(sid):
+    """The member's own sign-off, if its last turn carries one. Only the LAST
+    turn counts: a chat that said it was done and then got more work is not."""
+    path = cp.transcript_path(sid)
+    if not path:
+        return None
+    rec = cp.last_turn(cp.tail_records(path))
+    if not rec or rec.get("type") != "assistant":
+        return None
+    text = cp.msg_text(rec)
+    m = SENTINEL_RE.search(text or "")
+    if not m:
+        return None
+    return " ".join((m.group(1) or "").split())[:200] or "(no summary given)"
+
+
+def member_working(m, live):
+    if m.get("pid") and qw.alive(m["pid"]):
+        return True                                # our own revival, mid-turn
+    a = live.get(m["sid"])
+    if not a:
+        return False
+    if a.get("kind") == "interactive":
+        return qw.alive(a.get("pid"))              # a headless run in flight
+    return cp.is_working(a)
+
+
+def member_live(m, live):
+    if m.get("pid") and qw.alive(m["pid"]):
+        return True
+    a = live.get(m["sid"])
+    return bool(a and is_live(a))
+
+
+# ---- acting on a member -------------------------------------------------
+def stop_member(m, live):
+    """Drop the process, keep the conversation."""
+    ok = False
+    if m.get("pid") and qw.alive(m["pid"]):
+        try:
+            os.kill(int(m["pid"]), 15)
+            ok = True
+        except OSError as e:
+            log(f"{m['short']}: could not TERM {m['pid']}: {e}")
+    m["pid"] = None
+    a = live.get(m["sid"])
+    if a and is_main_chat(a) and is_live(a):
+        ok = cp.stop_agent(a.get("id") or m["short"]) or ok
+    return ok
+
+
+def revive(m, prompt, cfg, live):
+    """Continue the session in place: same id, same transcript, one more turn.
+
+    A session the daemon still holds refuses --resume, so it is stopped first.
+    The process is detached on purpose - a tick must never sit for hours
+    holding a whole night's work inside a systemd job that will time out."""
+    if member_live(m, live):
+        stop_member(m, live)
+        time.sleep(1.5)
+    os.makedirs(LOGS, exist_ok=True)
+    logfile = os.path.join(LOGS, f"{m['short']}.log")
+    cmd = [CLAUDE]
+    if m.get("model"):
+        cmd += ["--model", m["model"]]
+    if cfg.get("yolo"):
+        cmd += ["--dangerously-skip-permissions"]
+    cmd += ["--resume", m["sid"], "-p", prompt]
+    if not os.path.isdir(m.get("cwd") or ""):
+        m["cwd"] = HOME
+    try:
+        with open(logfile, "a") as fh:
+            fh.write(f"\n=== {datetime.now().isoformat(timespec='seconds')} "
+                     f"revive #{m['attempts'] + 1}\n")
+            p = subprocess.Popen(cmd, cwd=m["cwd"], stdin=subprocess.DEVNULL,
+                                 stdout=fh, stderr=fh, start_new_session=True)
+    except OSError as e:
+        log(f"{m['short']}: revive FAILED: {e}")
+        return False
+    m["pid"] = p.pid
+    m["attempts"] += 1
+    m["last_working"] = time.time()
+    m["last_growth"] = time.time()
+    log(f"{m['short']} ({m['name']}): revived, attempt {m['attempts']}, pid {p.pid}")
+    return True
+
+
+def courier(members, text, tag, live):
+    """Hand a message to chats that are still registered as background agents.
+    A headless `-p` run cannot be addressed this way, which is fine: those are
+    ours, and we stop them ourselves when the grace runs out."""
+    names = []
+    for m in members:
+        a = live.get(m["sid"])
+        if a and is_main_chat(a) and is_live(a):
+            names.append(a.get("name") or a.get("id") or m["short"])
+    if not names:
+        return
+    listed = "\n".join(f"   - {n}" for n in names)
+    prompt = (
+        "You are a courier. Do exactly this, then stop.\n"
+        "1. Call ListAgents.\n"
+        "2. Each of these sessions, named exactly like this, must receive a "
+        f"message:\n{listed}\n"
+        "   For each name, call SendMessage with `to` set to that name exactly "
+        "as written above. Only if the tool says the name is ambiguous, retry "
+        "that one as `name [ref]` using the ref ListAgents printed. Skip any "
+        "name that is not in the listing. Do not message anything that is not "
+        "on that list, and do not message yourself.\n"
+        "3. The message text is everything between the BEGIN and END lines "
+        "below. Send it verbatim to every one of them.\n"
+        "4. Reply with one line: how many you sent.\n"
+        "Do not do anything else. Do not read or write files. Do not run "
+        "commands.\n"
+        "---BEGIN MESSAGE---\n" + text + "\n---END MESSAGE---\n")
+    os.makedirs(DIR, exist_ok=True)
+    with open(COURIER_LOG, "a") as fh:
+        fh.write(f"\n=== {datetime.now().isoformat(timespec='seconds')} {tag}"
+                 f" -> {', '.join(names)}\n")
+        fh.flush()
+        try:
+            p = subprocess.Popen(
+                [CLAUDE, "-p", "--model", COURIER_MODEL,
+                 "--allowedTools", "ListAgents,SendMessage"],
+                stdin=subprocess.PIPE, stdout=fh, stderr=fh,
+                cwd=HOME, start_new_session=True)
+            p.stdin.write(prompt.encode())
+            p.stdin.close()
+        except OSError as e:
+            fh.write(f"[overnight] courier failed to start: {e}\n")
+            return
+    log(f"courier dispatched ({tag}) to {len(names)} chat(s)")
+
+
+# ---- accounts -----------------------------------------------------------
+def rotate(cfg, st):
+    """Move to the next account that really has headroom.
+
+    The check is deliberately expensive: a saved slot's cached usage is stale
+    and its access token may have gone off while it sat there, so the only
+    honest test is to switch in, make the credentials refresh themselves, and
+    read the LIVE limit. Anything that cannot answer is put back."""
+    names = cfg.get("rotate") or []
+    if not names:
+        return None
+    need = min(90.0, float(cfg.get("threshold", 12)) + float(cfg.get("margin", 10)))
+    now = time.time()
+    exhausted = dict(st.get("exhausted") or {})
+    started_on = qw.active_account()
+    known = {a["name"] for a in qw.accounts_json().get("accounts") or []}
+
+    for name in names:
+        if name == started_on or name not in known:
+            continue
+        if exhausted.get(name, 0) > now:
+            continue
+        if not qw.switch_account(name):
+            exhausted[name] = now + 900
+            continue
+        rem, resets, weekly = qw.account_headroom()      # wakes the token first
+        bad = None
+        if rem is None:
+            bad, until = "would not report its usage", now + 1800
+        elif weekly:
+            bad, until = f"weekly at {weekly['percent']}%", now + 3600
+        elif rem <= need:
+            bad, until = f"only {rem:.0f}% left (need {need:.0f}%)", resets or now + 3600
+        if bad:
+            log(f"rotate: {name} {bad} - backing out")
+            exhausted[name] = until
+            if started_on:
+                qw.switch_account(started_on)
+            continue
+        if started_on:
+            exhausted[started_on] = st.get("resets_at") or (now + 3600)
+        exhausted.pop(name, None)
+        st["exhausted"] = exhausted
+        write_json(STATE, st)
+        log(f"rotate: switched to {name} with {rem:.0f}% left")
+        return name
+
+    st["exhausted"] = exhausted
+    due = [t for t in exhausted.values() if t > now]
+    st["retry_rotate_at"] = min(due) if due else now + 600
+    write_json(STATE, st)
+    return None
+
+
+# ---- state --------------------------------------------------------------
+def conf():
+    return read_json(CONF, {})
+
+
+def state():
+    return read_json(STATE, {"phase": "armed", "members": []})
+
+
+def save(st):
+    write_json(STATE, st)
+    return st
+
+
+def pending(st):
+    return [m for m in st.get("members", [])
+            if m.get("status") not in ("done", "stuck")]
+
+
+def hit_limit(sid):
+    """Did this member's last turn die on a usage limit? If so it did not fail,
+    the quota did - it must not burn a revival attempt for that."""
+    path = cp.transcript_path(sid)
+    if not path:
+        return False
+    rec = cp.last_turn(cp.tail_records(path))
+    if not rec or not rec.get("isApiErrorMessage"):
+        return False
+    return bool(cp.LIMIT_RE.search(cp.msg_text(rec) or ""))
+
+
+# ---- keeping myself alive ----------------------------------------------
+SERVICE_UNIT = """[Unit]
+Description=Overnight supervisor (see a group of Claude chats through to the end)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/overnight tick
+# A tick can switch accounts, wake a stale token and start revivals.
+TimeoutStartSec=900
+# Revivals and the courier are detached on purpose and must outlive the tick.
+KillMode=process
+"""
+
+TIMER_UNIT = """[Unit]
+Description=Supervise the overnight Claude group every minute
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=60s
+AccuracySec=5s
+# A suspend or a slow boot must not swallow a tick.
+Persistent=true
+Unit=overnight.service
+
+[Install]
+WantedBy=timers.target
+"""
+
+GUARD_SERVICE = """[Unit]
+Description=Restart the overnight supervisor if its timer ever stops
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/overnight heal
+TimeoutStartSec=120
+"""
+
+GUARD_TIMER = """[Unit]
+Description=Watch the overnight supervisor's own timer
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=overnight-guard.service
+
+[Install]
+WantedBy=timers.target
+"""
+
+UNITS = {"overnight.service": SERVICE_UNIT, "overnight.timer": TIMER_UNIT,
+         "overnight-guard.service": GUARD_SERVICE,
+         "overnight-guard.timer": GUARD_TIMER}
+
+
+def systemctl(*args):
+    return subprocess.run(["systemctl", "--user", *args],
+                          capture_output=True, text=True)
+
+
+def ensure_units():
+    """Written as real files, never symlinks: `systemctl --user disable`
+    deletes a symlinked unit outright, so a symlink into the repo would survive
+    exactly one --stop."""
+    d = os.path.join(HOME, ".config/systemd/user")
+    os.makedirs(d, exist_ok=True)
+    changed = False
+    for name, body in UNITS.items():
+        path = os.path.join(d, name)
+        try:
+            if not os.path.islink(path) and open(path).read() == body:
+                continue
+        except OSError:
+            pass
+        if os.path.islink(path):
+            os.unlink(path)
+        with open(path, "w") as fh:
+            fh.write(body)
+        changed = True
+    if changed:
+        systemctl("daemon-reload")
+    return changed
+
+
+def heal_units(quiet=True):
+    """The two timers guard each other: as long as either one is still firing,
+    the other gets put back. Nothing here spends a token, so it is safe to run
+    every minute forever."""
+    if not conf().get("enabled"):
+        return False
+    ensure_units()
+    fixed = []
+    for unit in ("overnight.timer", "overnight-guard.timer"):
+        if systemctl("is-active", unit).stdout.strip() != "active":
+            r = systemctl("enable", "--now", unit)
+            fixed.append(f"{unit}{'' if r.returncode == 0 else ' (FAILED)'}")
+    if fixed:
+        log(f"self-heal: restarted {', '.join(fixed)}")
+        if not quiet:
+            print(f"restarted {', '.join(fixed)}")
+    return bool(fixed)
+
+
+def cmd_heal(argv):
+    heal_units(quiet=False)
+    return 0
+
+
+# ---- the group ----------------------------------------------------------
+def adopt_new(cfg, st):
+    """Chats that started after the night began. He may open one at 2am, or a
+    resumed member may spawn a fresh background chat - either way it is part of
+    the night now: it gets parked with everyone else when the quota goes, and
+    it gets brought back with them."""
+    if not cfg.get("adopt_new", True):
+        return []
+    known = {m["sid"] for m in st.get("members", [])}
+    added = []
+    for a in candidates(all_live=bool(cfg.get("all_live"))):
+        sid = a.get("sessionId")
+        if sid in known or sid in (st.get("declined") or []):
+            continue
+        m = make_member(a)
+        # It arrived while everyone else was parked: park it too, or it will
+        # spend the last of the quota alone, and it must not be live when the
+        # machine changes account underneath it.
+        if st.get("phase") in ("warning", "paused"):
+            m["status"] = "parked"
+        st.setdefault("members", []).append(m)
+        added.append(m)
+    if added:
+        log("adopted mid-night: " + ", ".join(f"{m['short']} ({m['name']})"
+                                              for m in added))
+        if st.get("phase") == "armed" and not cfg.get("quiet"):
+            courier(added, adopt_message(len(pending(st)),
+                                         bool(cfg.get("rotate"))),
+                    "adopt", by_sid())
+    return added
+
+
+def refresh(st, live):
+    """Bookkeeping only: who finished, who is still moving. Spends nothing."""
+    now = time.time()
+    for m in st.get("members", []):
+        if m.get("status") in ("done", "stuck"):
+            continue
+        note = finished_note(m["sid"])
+        if note:
+            m["status"] = "done"
+            m["note"] = note
+            m["pid"] = None
+            m["finished_at"] = now
+            log(f"{m['short']} ({m['name']}): DONE - {note}")
+            continue
+        size = transcript_size(m["sid"])
+        if size != m.get("last_size"):
+            m["last_size"] = size
+            m["last_growth"] = now
+        if member_working(m, live):
+            m["last_working"] = now
+            m["status"] = "running"
+        if m.get("pid") and not qw.alive(m["pid"]):
+            m["pid"] = None
+
+
+def supervise(cfg, st, live):
+    """Nobody in this group is allowed to just stop. A member that is not
+    working gets one turn handed back to it; a member that is 'working' but has
+    written nothing for a long time is wedged and gets restarted."""
+    if os.path.exists(GUARD_PAUSE):
+        log("weekly limit guard is holding a PAUSE - not reviving anything")
+        return
+    now = time.time()
+    stall = float(cfg.get("stall", 7)) * 60
+    wedged = float(cfg.get("wedged", 45)) * 60
+    cap = int(cfg.get("attempts", 10))
+    running = sum(1 for m in st.get("members", [])
+                  if m.get("pid") and qw.alive(m["pid"]))
+    for m in pending(st):
+        if running >= int(cfg.get("jobs", 2)):
+            return
+        if now < float(m.get("retry_after") or 0):
+            continue
+        if member_working(m, live):
+            if now - m.get("last_growth", now) < wedged:
+                continue
+            reason = (f"nothing written for "
+                      f"{fmt_eta(now - m.get('last_growth', now))} - wedged")
+        else:
+            if now - m.get("last_working", now) < stall:
+                continue
+            reason = f"idle for {fmt_eta(now - m.get('last_working', now))}"
+        if hit_limit(m["sid"]):
+            # The quota killed it, not the work. Reviving now just burns the
+            # turn on a 429, so it waits for the phase machine to park and
+            # resume it - and if the limit was a weekly one that no park will
+            # fix, it still gets another go in a quarter of an hour.
+            log(f"{m['short']}: last turn died on a usage limit - holding off")
+            m["retry_after"] = now + 900
+            continue
+        if m["attempts"] >= cap:
+            m["status"] = "stuck"
+            m["note"] = f"gave up after {cap} revivals ({reason})"
+            log(f"{m['short']} ({m['name']}): STUCK after {cap} revivals")
+            notify("Overnight: a chat is stuck",
+                   f"{m['name']} would not finish after {cap} revivals. "
+                   f"Left alone; everything else carries on.")
+            continue
+        # Members the quota cycle could not fit into one wake-up are still
+        # parked: they get the welcome-back note, not a "you went quiet" one.
+        prompt = (resume_prompt(None) if m.get("status") == "parked"
+                  else nudge_prompt(reason))
+        if revive(m, prompt, cfg, live):
+            m["status"] = "running"
+            running += 1
+
+
+def park_all(cfg, st, live, reason):
+    stopped = 0
+    for m in pending(st):
+        if member_live(m, live):
+            stopped += stop_member(m, live)
+        m["status"] = "parked"
+        m["pid"] = None
+    log(f"PARKED {len(pending(st))} chat(s) ({reason}), {stopped} needed forcing")
+    return stopped
+
+
+def wake_all(cfg, st, switched_to=None):
+    """Bring the whole group back, a couple at a time so the box does not OOM
+    on a wall of ~700MB processes."""
+    live = by_sid()
+    woken = 0
+    for m in pending(st):
+        if m.get("status") != "parked":
+            continue
+        if woken >= int(cfg.get("jobs", 2)):
+            break                                  # the next tick takes the rest
+        if revive(m, resume_prompt(switched_to), cfg, live):
+            m["status"] = "running"
+            m["attempts"] = max(0, m["attempts"] - 1)   # a park is not a failure
+            woken += 1
+    return woken
+
+
+# ---- the tick -----------------------------------------------------------
+def cmd_tick(argv):
+    dry = any(a in ("-n", "--dry-run") for a in argv)
+    cfg = conf()
+    if not cfg.get("enabled"):
+        return 0
+    if not dry:
+        heal_units()
+
+    st = state()
+    live = by_sid()
+    if not dry:
+        adopt_new(cfg, st)
+        live = by_sid()
+    refresh(st, live)
+
+    if not pending(st):
+        return finish(cfg, st, "every chat reported itself finished")
+
+    threshold = float(cfg.get("threshold", 12))
+    grace = int(cfg.get("grace", 300))
+    rotating = bool(cfg.get("rotate"))
+    phase = st.get("phase", "armed")
+    now = time.time()
+
+    # The usage endpoint refuses bursts, so the read paces itself. Supervision
+    # does not: a chat that fell over is picked up on the very next tick.
+    remaining = resets_at = None
+    if dry or now >= float(st.get("next_poll_at") or 0):
+        try:
+            data = qw.limits()
+            remaining, resets_at = qw.five_hour(data)
+            st["fails"] = 0
+            st["remaining"] = remaining
+            soon = phase != "armed" or (remaining is not None
+                                        and remaining <= threshold + 25)
+            st["next_poll_at"] = now + (60 if soon else 300)
+        except Exception as e:
+            fails = int(st.get("fails", 0)) + 1
+            st["fails"] = fails
+            st["next_poll_at"] = now + min(300, 60 * fails)
+            log(f"limit read FAILED (#{fails}): {e}")
+    if dry:
+        print(f"phase={phase}  members={len(st.get('members', []))} "
+              f"({len(pending(st))} unfinished)  "
+              f"{'%.0f%% left' % remaining if remaining is not None else 'quota unread'}"
+              f"  account={qw.active_account() or '?'}")
+
+    if phase == "armed":
+        # A blind read never parks anything: not knowing is not the same as
+        # being out of quota, and parking on a 429 would stop the night dead.
+        if remaining is not None and remaining <= threshold:
+            eta = fmt_eta(resets_at - now) if resets_at else "the next reset"
+            if dry:
+                print(f"would ask {len(pending(st))} chat(s) to park")
+                return 0
+            courier(pending(st),
+                    park_message(remaining, threshold, eta,
+                                 max(1, grace // 60), rotating), "park", live)
+            st["phase"] = "warning"
+            st["warned_at"] = now
+            st["resets_at"] = resets_at
+            log(f"WARNING at {remaining:.0f}% left: {len(pending(st))} chat(s) "
+                f"asked to park, forcing in {grace // 60}m")
+            notify(f"Overnight: quota at {remaining:.0f}% left",
+                   f"{len(pending(st))} chat(s) asked to park. "
+                   + ("Rotating to another account next."
+                      if rotating else f"Resume is automatic in {eta}."))
+        elif not dry:
+            supervise(cfg, st, live)
+        save(st)
+        return 0
+
+    if phase == "warning":
+        if remaining is not None and remaining > threshold:
+            if not dry:
+                courier(pending(st), STAND_DOWN, "stand-down", live)
+                st["phase"] = "armed"
+                save(st)
+            log("stand-down, the quota recovered")
+            return 0
+        still = [m for m in pending(st) if member_live(m, live)]
+        if still and now - float(st.get("warned_at") or now) < grace:
+            if dry:
+                print(f"{len(still)} still live, "
+                      f"{fmt_eta(grace - (now - st['warned_at']))} of grace left")
+            return 0
+        if dry:
+            print(f"would park {len(pending(st))} now")
+            return 0
+        park_all(cfg, st, live, "quota")
+        st["phase"] = "paused"
+        st["paused_at"] = now
+        save(st)
+        if rotating:
+            return try_rotate(cfg, st, now)
+        return 0
+
+    if phase == "paused":
+        # Anything that woke up or was started while we were parked has to go
+        # back to sleep: it would spend the last of the quota alone, and it must
+        # not be mid-turn when the machine changes account underneath it.
+        strays = [m for m in pending(st) if member_live(m, live)]
+        if strays and not dry:
+            park_all(cfg, st, live, "stray while parked")
+        want = st.get("resets_at")
+        if remaining is not None and remaining > threshold \
+                and not (want and now < float(want)):
+            if dry:
+                print("would resume everyone now")
+                return 0
+            return finish_resume(cfg, st, None, remaining, now)
+        if rotating and now >= float(st.get("retry_rotate_at") or 0):
+            if dry:
+                print("would try rotating to another account")
+                return 0
+            return try_rotate(cfg, st, now)
+        save(st)
+        return 0
+
+    return 0
+
+
+def try_rotate(cfg, st, now):
+    live = by_sid()
+    strays = [m for m in pending(st) if member_live(m, live)]
+    if strays:
+        park_all(cfg, st, live, "before switching account")
+    name = rotate(cfg, st)
+    if not name:
+        st = state()
+        log(f"no account has headroom - waiting "
+            f"{fmt_eta(float(st.get('retry_rotate_at') or now) - now)}")
+        return 0
+    rem, _, _ = qw.account_headroom()
+    return finish_resume(cfg, st, name, rem, now)
+
+
+def finish_resume(cfg, st, switched_to, remaining, now):
+    n = wake_all(cfg, st, switched_to)
+    st["phase"] = "armed"
+    st["last_resume_at"] = now
+    st["cycles"] = int(st.get("cycles", 0)) + 1
+    st["retry_rotate_at"] = 0
+    save(st)
+    where = f" on account {switched_to}" if switched_to else ""
+    log(f"RESUMED {n} chat(s){where} at "
+        f"{remaining if remaining is not None else -1:.0f}% left "
+        f"(cycle {st['cycles']})")
+    notify("Overnight: chats resumed",
+           f"{n} chat(s) picked back up{where}"
+           f"{f' ({remaining:.0f}% quota free)' if remaining is not None else ''}. "
+           f"{len(pending(st))} still unfinished.")
+    return 0
+
+
+# ---- the end ------------------------------------------------------------
+def write_report(cfg, st, why):
+    started = float(st.get("started_at") or time.time())
+    lines = [f"# Overnight run - {datetime.now().strftime('%a %d %b, %H:%M')}",
+             "",
+             f"Ran for {fmt_eta(time.time() - started)}, "
+             f"{st.get('cycles', 0)} quota cycle(s). Ended because {why}.",
+             f"Account now: {qw.active_account() or '?'}"
+             + (f" (armed on {cfg.get('armed_account')})"
+                if cfg.get("armed_account") != qw.active_account() else ""),
+             ""]
+    done = [m for m in st.get("members", []) if m.get("status") == "done"]
+    stuck = [m for m in st.get("members", []) if m.get("status") == "stuck"]
+    rest = [m for m in st.get("members", [])
+            if m.get("status") not in ("done", "stuck")]
+    if done:
+        lines += [f"## Finished ({len(done)})", ""]
+        for m in done:
+            lines.append(f"- **{m['name']}** (`{m['short']}`) - {m['note']}")
+        lines.append("")
+    if stuck:
+        lines += [f"## Gave up on ({len(stuck)})", ""]
+        for m in stuck:
+            lines.append(f"- **{m['name']}** (`{m['short']}`) - {m.get('note')}"
+                         f"  \n  log: `{os.path.join(LOGS, m['short'] + '.log')}`")
+        lines.append("")
+    if rest:
+        lines += [f"## Still going when it ended ({len(rest)})", ""]
+        for m in rest:
+            lines.append(f"- **{m['name']}** (`{m['short']}`) - "
+                         f"{m.get('status')}, {m.get('attempts', 0)} revival(s)")
+        lines.append("")
+    lines += ["---", f"log: `{LOG}`  |  per-chat logs: `{LOGS}/`"]
+    os.makedirs(DIR, exist_ok=True)
+    with open(REPORT, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return done, stuck, rest
+
+
+def restore_quota_watcher():
+    """Give the machine back to quota-watcher if it was watching before."""
+    was = read_json(QW_SAVED, {})
+    if not was.get("enabled"):
+        return None
+    argv = [str(was.get("threshold", 10))]
+    if was.get("rotate"):
+        argv += ["--rotate"] + list(was["rotate"])
+    if was.get("grace"):
+        argv += ["--grace", str(was["grace"])]
+    try:
+        subprocess.run([shutil.which("quota-watcher") or
+                        os.path.join(HOME, ".local/bin/quota-watcher")] + argv,
+                       capture_output=True, timeout=120)
+        log(f"re-armed quota-watcher ({' '.join(argv)})")
+        return " ".join(argv)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"could not re-arm quota-watcher: {e}")
+        return None
+
+
+def finish(cfg, st, why):
+    done, stuck, rest = write_report(cfg, st, why)
+    cfg["enabled"] = False
+    write_json(CONF, cfg)
+    systemctl("disable", "--now", "overnight.timer")
+    systemctl("disable", "--now", "overnight-guard.timer")
+    st["phase"] = "finished"
+    st["finished_at"] = time.time()
+    save(st)
+    back = restore_quota_watcher()
+    log(f"FINISHED: {len(done)} done, {len(stuck)} stuck, {len(rest)} unfinished")
+    body = (f"{len(done)} chat(s) finished"
+            + (f", {len(stuck)} gave up" if stuck else "")
+            + (f", {len(rest)} still unfinished" if rest else "")
+            + ".\n\n"
+            + "\n".join(f"✅ {m['name']}: {m['note']}" for m in done[:8])
+            + ("".join(f"\n❌ {m['name']}: {m.get('note')}" for m in stuck[:5]))
+            + f"\n\nFull report: {REPORT}"
+            + (f"\nquota-watcher re-armed ({back})." if back else ""))
+    notify("Overnight run finished", body)
+    return 0
+
+
+# ---- commands -----------------------------------------------------------
+def parse_start(argv):
+    cfg = {"threshold": 12.0, "grace": 300, "margin": 10.0, "stall": 7.0,
+           "wedged": 45.0, "attempts": 10, "jobs": 2, "rotate": [],
+           "all_live": False, "yolo": False, "adopt_new": True,
+           "quiet": False}
+    targets = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--rotate", "-r"):
+            i += 1
+            while i < len(argv) and not argv[i].startswith("-"):
+                cfg["rotate"].append(argv[i])
+                i += 1
+            i -= 1
+        elif a in ("--grace", "--stall", "--wedged", "--attempts", "--jobs",
+                   "--margin", "--park-at"):
+            key = {"--park-at": "threshold"}.get(a, a.lstrip("-"))
+            i += 1
+            cfg[key] = float(argv[i]) if key in ("threshold", "margin", "stall",
+                                                 "wedged") else int(argv[i])
+        elif a == "--all-live":
+            cfg["all_live"] = True
+        elif a == "--quiet":
+            cfg["quiet"] = True
+        elif a == "--yolo":
+            cfg["yolo"] = True
+        elif a == "--no-adopt":
+            cfg["adopt_new"] = False
+        elif a.startswith("--"):
+            die(f"unknown option: {a} (try --help)")
+        else:
+            try:
+                cfg["threshold"] = float(a.rstrip("%"))
+            except ValueError:
+                targets.append(a)
+        i += 1
+    if not 0 < cfg["threshold"] < 100:
+        die("the park threshold is a percentage of quota LEFT, 0 to 100")
+    return cfg, targets
+
+
+def describe(members):
+    return ", ".join(f"{BLD}{m['name']}{RST}" for m in members)
+
+
+def cmd_start(argv):
+    cfg, targets = parse_start(argv)
+    if conf().get("enabled"):
+        die("overnight is already running - `overnight --status`, or "
+            "`overnight --add <chat>` to give it another one")
+
+    if targets:
+        hits, missed = match(targets)
+        if missed:
+            die(f"no chat matching {', '.join(missed)} - `claude agents` "
+                f"lists them")
+        chosen = hits
+    else:
+        chosen = candidates(all_live=cfg["all_live"])
+    seen, members = set(), []
+    for a in chosen:
+        if a.get("sessionId") in seen:
+            continue
+        seen.add(a.get("sessionId"))
+        members.append(make_member(a))
+    if not members:
+        die("no main chat is running right now, so there is nothing to look "
+            "after (--all-live also takes the idle ones)")
+
+    if cfg["rotate"]:
+        saved = {a["name"] for a in qw.accounts_json().get("accounts") or []}
+        missing = [n for n in cfg["rotate"] if n not in saved]
+        if missing:
+            die(f"no saved account called {', '.join(missing)} - "
+                f"claude-account list has: {', '.join(sorted(saved)) or '(none)'}")
+        here = qw.active_account()
+        if here and here not in cfg["rotate"]:
+            cfg["rotate"].append(here)             # so the cycle comes home
+
+    # One watcher at a time. quota-watcher parks and resumes by hand what this
+    # is now responsible for, and two of them fighting would resume a chat we
+    # deliberately parked - so it stands down for the night and is put back
+    # exactly as it was at the end.
+    qw_was = qw.conf()
+    stood_down = False
+    if qw_was.get("enabled"):
+        write_json(QW_SAVED, qw_was)
+        subprocess.run([shutil.which("quota-watcher") or
+                        os.path.join(HOME, ".local/bin/quota-watcher"),
+                        "--stop", "--leave-paused"], capture_output=True)
+        stood_down = True
+    else:
+        write_json(QW_SAVED, {})
+
+    if systemctl("is-active", "claude-keep-awake.service").stdout.strip() \
+            != "active":
+        systemctl("enable", "--now", "claude-keep-awake.service")
+
+    cfg.update({"enabled": True,
+                "armed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "armed_account": qw.active_account()})
+    write_json(CONF, cfg)
+    # The tick runs from systemd with no session of its own, so cp.self_ids()
+    # will not save this chat from being adopted later: write it down now.
+    declined = sorted(i for i in cp.self_ids() if len(i) > 8)
+    save({"phase": "armed", "cycles": 0, "members": members,
+          "started_at": time.time(), "next_poll_at": 0,
+          "declined": declined})
+    ensure_units()
+    for unit in ("overnight.timer", "overnight-guard.timer"):
+        r = systemctl("enable", "--now", unit)
+        if r.returncode != 0:
+            die(f"could not enable {unit}: {r.stderr.strip()}")
+    log(f"ARMED over {len(members)} chat(s): "
+        + ", ".join(f"{m['short']} ({m['name']})" for m in members)
+        + f"; park at {cfg['threshold']:.0f}% left"
+        + (f", rotate {','.join(cfg['rotate'])}" if cfg["rotate"] else ""))
+
+    if not cfg.get("quiet"):
+        courier(members, adopt_message(len(members), bool(cfg["rotate"])),
+                "adopt", by_sid())
+
+    print(f"{GRN}tracking {len(members)} chat{'s' if len(members) != 1 else ''}"
+          f"{RST}: {describe(members)}")
+    print(f"  {GRY}main chats only - sub-agents belong to the chat that "
+          f"started them.{RST}")
+    print(f"  parks everyone at {BLD}{cfg['threshold']:.0f}% quota left{RST}"
+          f"{GRY}, {cfg['grace'] // 60} min of grace, then stops them for "
+          f"real.{RST}")
+    if cfg["rotate"]:
+        print(f"  rotates {BLD}{' → '.join(cfg['rotate'])}{RST}"
+              f"{GRY} - switches in, wakes the token and reads that account's "
+              f"live limit before trusting it.{RST}")
+    print(f"  {GRY}revives anything that stops, goes idle for "
+          f"{cfg['stall']:.0f} min, or writes nothing for "
+          f"{cfg['wedged']:.0f} min ({cfg['attempts']} tries each).{RST}")
+    print(f"  {GRY}new chats that start tonight are adopted automatically.{RST}")
+    print(f"  {GRY}two timers guard each other, so if the supervisor is ever "
+          f"stopped it puts itself back.{RST}")
+    if stood_down:
+        print(f"  {GRY}quota-watcher stood down for the night (it is re-armed "
+              f"when this finishes).{RST}")
+    print(f"  {GRY}it ends when every chat has said {SENTINEL}, then writes "
+          f"{REPORT} and messages WhatsApp.{RST}")
+    return 0
+
+
+def cmd_add(argv):
+    if not conf().get("enabled"):
+        die("overnight is not running")
+    hits, missed = match([a for a in argv if not a.startswith("-")])
+    if missed:
+        die(f"no chat matching {', '.join(missed)}")
+    st = state()
+    known = {m["sid"] for m in st.get("members", [])}
+    added = [make_member(a) for a in hits if a.get("sessionId") not in known]
+    if not added:
+        print("already looking after those.")
+        return 0
+    st.setdefault("members", []).extend(added)
+    save(st)
+    log("added by hand: " + ", ".join(m["short"] for m in added))
+    print(f"now tracking {len(pending(st))} unfinished chat(s); added "
+          f"{describe(added)}")
+    return 0
+
+
+def cmd_stop(argv):
+    leave = "--leave-paused" in argv
+    cfg, st = conf(), state()
+    systemctl("disable", "--now", "overnight.timer")
+    systemctl("disable", "--now", "overnight-guard.timer")
+    cfg["enabled"] = False
+    write_json(CONF, cfg)
+    log("DISARMED by hand")
+    print(f"{YEL}overnight stood down{RST} - nothing is looking after the group "
+          f"now.")
+    parked = [m for m in pending(st) if m.get("status") == "parked"]
+    if parked and not leave:
+        print(f"  waking {len(parked)} parked chat(s)…")
+        wake_all(cfg, st, None)
+        save(st)
+    elif parked:
+        print(f"  {GRY}{len(parked)} chat(s) left parked.{RST}")
+    write_report(cfg, st, "you stopped it")
+    back = restore_quota_watcher()
+    if back:
+        print(f"  {GRY}quota-watcher re-armed ({back}).{RST}")
+    was, now_on = cfg.get("armed_account"), qw.active_account()
+    if was and now_on and was != now_on:
+        print(f"  {GRY}rotation left you on account {BLD}{now_on}{RST}{GRY} "
+              f"(you armed it on {was}) - {BLD}claude-account use {was}{RST}"
+              f"{GRY} to go back.{RST}")
+    print(f"  {GRY}report: {REPORT}{RST}")
+    return 0
+
+
+def cmd_status(argv):
+    cfg, st = conf(), state()
+    if not cfg.get("enabled"):
+        print(f"{GRY}overnight is off.{RST}  start it with "
+              f"{BLD}overnight [PCT] [--rotate A B] [chats…]{RST}")
+        if os.path.exists(REPORT):
+            print(f"  {GRY}last run: {REPORT}{RST}")
+        return 0
+    phase = st.get("phase", "armed")
+    colour = {"armed": GRN, "warning": YEL, "paused": RED}.get(phase, "")
+    timer = systemctl("is-active", "overnight.timer").stdout.strip()
+    guard = systemctl("is-active", "overnight-guard.timer").stdout.strip()
+    try:
+        rem, resets = qw.five_hour(qw.limits())
+        quota = (f"{rem:.0f}% left, resets in "
+                 f"{fmt_eta(resets - time.time()) if resets else '?'}")
+    except Exception:
+        seen = st.get("remaining")
+        quota = (f"{seen:.0f}% left {GRY}(last reading - the usage endpoint is "
+                 f"rate-limiting; nothing is parked on a blind read){RST}"
+                 if seen is not None else f"{RED}not read yet{RST}")
+    live = by_sid()
+    print(f"{BLD}overnight{RST}  {colour}{phase}{RST}  "
+          f"{GRY}(timer {timer}, guard {guard}, "
+          f"{st.get('cycles', 0)} quota cycle(s), running "
+          f"{fmt_eta(time.time() - float(st.get('started_at') or time.time()))})"
+          f"{RST}")
+    print(f"  account        {qw.active_account() or '?'}")
+    print(f"  5-hour quota   {quota}")
+    print(f"  parks at       {float(cfg.get('threshold', 12)):.0f}% left, "
+          f"after {int(cfg.get('grace', 300)) // 60} min of grace")
+    if cfg.get("rotate"):
+        print(f"  rotates        {' → '.join(cfg['rotate'])}")
+        for k, v in (st.get("exhausted") or {}).items():
+            if v > time.time():
+                print(f"    {GRY}{k}: dry for another "
+                      f"{fmt_eta(v - time.time())}{RST}")
+    print(f"  {BLD}chats{RST}")
+    for m in st.get("members", []):
+        mark = {"done": f"{GRN}done{RST}", "stuck": f"{RED}stuck{RST}",
+                "parked": f"{CYA}parked{RST}"}.get(
+                    m.get("status"),
+                    f"{YEL}working{RST}" if member_working(m, live)
+                    else f"{GRY}idle{RST}")
+        extra = f"  {GRY}{m['note']}{RST}" if m.get("note") else ""
+        print(f"    {m['short']:9} {mark:20} {m['name'][:44]}"
+              f"{GRY} ({m.get('attempts', 0)} revival(s)){RST}{extra}")
+    print(f"  {GRY}log: {LOG}{RST}")
+    return 0
+
+
+def cmd_report(argv):
+    if not os.path.exists(REPORT):
+        print("no report yet.")
+        return 0
+    with open(REPORT) as fh:
+        sys.stdout.write(fh.read())
+    return 0
+
+
+def usage():
+    print(__doc__.strip())
+    return 0
+
+
+TABLE = {"start": cmd_start, "on": cmd_start, "arm": cmd_start,
+         "stop": cmd_stop, "off": cmd_stop, "add": cmd_add,
+         "status": cmd_status, "tick": cmd_tick, "heal": cmd_heal,
+         "report": cmd_report}
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        return cmd_status([]) if conf().get("enabled") else cmd_start([])
+    if argv[0] in ("-h", "--help", "help"):
+        return usage()
+    first = argv[0].lstrip("-").lower()
+    if first in TABLE:
+        return TABLE[first](argv[1:])
+    return cmd_start(argv)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main() or 0)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception as e:
+        # A tick that throws must not take the night with it: the timer fires
+        # again in a minute, and the log says what happened.
+        log(f"TICK CRASHED: {type(e).__name__}: {e}")
+        if "tick" not in sys.argv[1:2] and "heal" not in sys.argv[1:2]:
+            raise
+        sys.exit(0)
