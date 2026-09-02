@@ -1,4 +1,0 @@
-# NVIDIA dGPU: no DRM format modifiers, so mutter's cross-GPU frame copy to the
-# HDMI monitor uses a buffer layout the Intel primary can actually lock.
-# See display-jitter/README.md in the dotfiles repo. Remove this file to undo.
-ENV{ID_PATH}=="pci-0000:01:00.0", SUBSYSTEM=="drm", KERNEL=="card[0-9]", TAG+="mutter-device-disable-kms-modifiers"

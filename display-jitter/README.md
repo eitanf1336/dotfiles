@@ -49,18 +49,36 @@ proprietary driver's readback for a secondary device is far slower than the
 Intel one. Two working screens are worth more than one perfect one, so this is
 reverted. `gpu-primary nvidia` still exists if it is ever worth revisiting.
 
-## The fix actually in place
+## What ALSO did not work: disabling DRM format modifiers
 
-Keep Intel primary, and tell mutter not to use DRM format modifiers on the
-NVIDIA device (`etc/udev/rules.d/62-mutter-nvidia-no-modifiers.rules`). mutter
-ships this same tag in `/lib/udev/rules.d/61-mutter.rules` for GPUs whose
-modifiers it cannot rely on. The theory: the shared-framebuffer setup already
-says "Not hardware accelerated", and without modifiers both drivers fall back to
-a plain linear layout that the primary can actually lock.
+Second attempt, same day: keep Intel primary and tag the NVIDIA card
+`mutter-device-disable-kms-modifiers` (the tag mutter itself ships for GPUs
+whose modifiers it cannot rely on), reasoning that the dock screens never touch
+that device so the worst case would be no change.
 
-The dock screens are untouched by this, because their path (Intel -> evdi) does
-not involve the NVIDIA device at all. So the worst case is no change, not a
-regression.
+The worst case was not no change. **The HDMI monitor came up black at boot** and
+had to be physically unplugged. Reverted, along with everything else here.
+
+## Where this stands
+
+Nothing is installed. The machine is on stock behaviour: Intel primary, the
+occasional `gbm_surface_lock_front_buffer failed` on the main screen, cleared
+with **Super+F5** (`bin/fix-screen`) when it shows up.
+
+Two ideas were tried and both cost a working setup, so the bar for a third is
+high. The remaining untried options, in the order that risks least:
+
+1. **Move the main monitor onto the dock** instead of the laptop HDMI port. Then
+   every display is Intel -> evdi and there is no cross-GPU copy at all. Costs a
+   cable swap, not a boot.
+2. An **Xorg session**, where hybrid + DisplayLink + multi-monitor is far better
+   behaved than Wayland.
+3. Leave it. Super+F5 is a keystroke, and the failure rate is roughly 5/hour.
+
+The guard machinery that used to live here (`gpu-primary-guard`, the boot
+counter, the auto-revert) is gone too, since there is no rule left to guard.
+`bin/gpu-primary` still exists as a toggle, but read the two sections above
+before using it.
 
 Switch it at any time:
 
