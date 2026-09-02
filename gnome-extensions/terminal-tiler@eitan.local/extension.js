@@ -1,9 +1,28 @@
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import GLib from 'gi://GLib';
+import Gio from 'gi://Gio';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+
+// Session restore. `claude-session` (see ~/bin/claude-session) needs two
+// things from us that nothing else can provide: which columns were on which
+// monitor when the session ended, and a way to put a terminal back INTO a
+// column rather than as a stray window. The layout is dumped on disable(),
+// which is what a logout triggers; SpawnTiled is the way back in.
+const IFACE = `
+<node>
+  <interface name="eitan.TerminalTiler">
+    <method name="SpawnTiled">
+      <arg type="u" direction="in" name="monitor"/>
+      <arg type="s" direction="in" name="command"/>
+    </method>
+    <method name="GetLayout">
+      <arg type="s" direction="out" name="json"/>
+    </method>
+  </interface>
+</node>`;
 
 const KEY = 'tile-new-terminal';
 const MIN_KEY = 'minimize-terminal-group';
@@ -30,6 +49,18 @@ const EJECT_MIN = 40;
 export default class TerminalTilerExtension extends Extension {
     enable() {
         this._settings = this.getSettings();
+
+        // Session restore hook (see the IFACE comment above). Exported on the
+        // shell's own bus name, so `gdbus call --dest org.gnome.Shell
+        // --object-path /eitan/TerminalTiler` reaches it. Wrapped in a try so a
+        // bus that refuses the export can never stop the tiler itself loading.
+        try {
+            this._dbus = Gio.DBusExportedObject.wrapJSObject(IFACE, this);
+            this._dbus.export(Gio.DBus.session, '/eitan/TerminalTiler');
+        } catch (e) {
+            logError(e, 'Terminal Tiler: could not export the restore interface');
+            this._dbus = null;
+        }
 
         // monitorIndex -> ordered array of Meta.Window (one batch per monitor).
         this._batches = new Map();
@@ -202,6 +233,19 @@ export default class TerminalTilerExtension extends Extension {
             for (const id of this._retileIds)
                 GLib.Source.remove(id);
             this._retileIds = null;
+        }
+
+        // A logout runs disable(), which is the last moment the column layout
+        // still exists. Write it out so `claude-session restore` can put the
+        // same chats back on the same monitors at the next login.
+        this._saveLayout();
+        if (this._dbus) {
+            try {
+                this._dbus.unexport();
+            } catch (e) {
+                // Shutting down anyway; nothing useful to do about it.
+            }
+            this._dbus = null;
         }
 
         this._batches = null;
@@ -1034,6 +1078,67 @@ export default class TerminalTilerExtension extends Extension {
                     return GLib.SOURCE_REMOVE;
                 });
             this._retileIds.add(id);
+        }
+    }
+
+    // ----- session restore ---------------------------------------------------
+
+    // D-Bus: open `command` as a new column on `monitor`. Same path Super+Return
+    // takes — push the monitor onto _pending, spawn, and let _onWindowCreated
+    // claim the window when it maps. Used by `claude-session restore` at login.
+    SpawnTiled(monitor, command) {
+        if (!this._pending)
+            return;
+        const n = global.display.get_n_monitors();
+        const idx = Math.max(0, Math.min(monitor, n - 1));
+        this._maxed.delete(idx);
+        this._pending.push(idx);
+        try {
+            const [ok, argv] = GLib.shell_parse_argv(command);
+            if (ok) {
+                GLib.spawn_async(null, argv, null,
+                    GLib.SpawnFlags.SEARCH_PATH, null);
+                return;
+            }
+        } catch (e) {
+            logError(e, `Terminal Tiler: SpawnTiled could not launch "${command}"`);
+        }
+        this._pending.pop();   // nothing was spawned; don't strand the slot
+    }
+
+    // D-Bus: the current column layout, same shape as the file below.
+    GetLayout() {
+        return JSON.stringify(this._layout());
+    }
+
+    _layout() {
+        const monitors = {};
+        if (this._batches) {
+            for (const [idx, arr] of this._batches) {
+                const titles = [];
+                for (const win of arr) {
+                    if (this._isAlive(win))
+                        titles.push(win.get_title() || '');
+                }
+                if (titles.length)
+                    monitors[String(idx)] = titles;
+            }
+        }
+        return {saved: Date.now() / 1000, monitors};
+    }
+
+    // Persist the layout to ~/.claude/chats-session/tiler-layout.json. Called
+    // from disable(), i.e. on logout, which is exactly when it is needed and
+    // also the last moment the window list is still real.
+    _saveLayout() {
+        try {
+            const dir = GLib.build_filenamev(
+                [GLib.get_home_dir(), '.claude', 'chats-session']);
+            GLib.mkdir_with_parents(dir, 0o755);
+            const path = GLib.build_filenamev([dir, 'tiler-layout.json']);
+            GLib.file_set_contents(path, JSON.stringify(this._layout(), null, 2));
+        } catch (e) {
+            logError(e, 'Terminal Tiler: could not save the column layout');
         }
     }
 

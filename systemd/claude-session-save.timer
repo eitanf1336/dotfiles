@@ -1,0 +1,13 @@
+[Unit]
+Description=Keep the open-chats snapshot fresh
+# Belt and braces: ExecStop above covers a clean logout, this covers a crash,
+# a power cut, or anything else that never runs a shutdown path.
+
+[Timer]
+Unit=claude-session-save-tick.service
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

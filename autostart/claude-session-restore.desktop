@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Restore Claude chats
+Comment=Reopen the claude-c chats that were open at logout, tiled as they were
+Exec=/home/eitan/bin/claude-session restore
+Icon=utilities-terminal
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=8

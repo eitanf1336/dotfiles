@@ -988,6 +988,21 @@ def set_terminal_accent(hexcolor):
         pass
 
 
+def set_window_title(chat_id=None):
+    """Stamp the chat id into the terminal's window title (OSC 2).
+
+    This is how `claude-session` matches a restored terminal back to the column
+    it used to occupy: the Terminal Tiler records window titles when the
+    session ends, and the id is the only thing in a title that identifies a
+    conversation. Harmless anywhere else — every terminal accepts OSC 2, and
+    terminals that don't just ignore it."""
+    try:
+        text = f"claude-c {chat_id}" if chat_id else "claude-c"
+        os.write(sys.stdout.fileno(), f"\033]2;{text}\007".encode())
+    except Exception:
+        pass
+
+
 def clear_terminal_accent():
     """Put the cursor (and background) back the way the terminal had them. Run
     on every return from a chat, so a killed or crashed chat can't leave the
@@ -1014,7 +1029,8 @@ _KEEP_PROJECT = object()
 
 
 class App:
-    def __init__(self, stdscr, select_id=None, select_project=_KEEP_PROJECT):
+    def __init__(self, stdscr, select_id=None, select_project=_KEEP_PROJECT,
+                 auto_open=False):
         self.stdscr = stdscr
         self.store = load_store()
         self.names = load_names()  # sessionId -> user's custom name
@@ -1080,6 +1096,12 @@ class App:
         self.reload = False  # set on 'r' -> re-exec the script to pick up edits
         self._want_select = select_id  # reposition cursor here on first draw
         self._positioned = False
+        # Session restore (`claude-c --open <id>`): open that chat immediately,
+        # as if the user had pressed Enter on it, so a restored terminal comes
+        # back showing the conversation rather than the board. Going through the
+        # normal Enter path means live agents attach and dead ones resume,
+        # exactly as they would by hand.
+        self._auto_open = bool(auto_open and select_id)
 
     def _blocking_getch(self):
         self.stdscr.timeout(-1)
@@ -1836,11 +1858,26 @@ class App:
         while True:
             rows, nav = self.build_rows()
             if not self._positioned and self._want_select:
+                # Prefix match, so a SHORT agent id (what `claude attach` and the
+                # session-restore snapshot use) finds the full session uuid too.
+                found = False
                 for i, ri in enumerate(nav):
-                    if rows[ri][0] == "chat" and rows[ri][1]["id"] == self._want_select:
+                    cid = rows[ri][1]["id"] if rows[ri][0] == "chat" else None
+                    if cid and (cid == self._want_select
+                                or cid.startswith(self._want_select)):
                         self.sel = i
+                        found = True
                         break
                 self._positioned = True
+                # Only auto-open when the chat was actually located. Without
+                # this, a stale id would leave the cursor on row 0 and Enter
+                # would open somebody else's conversation.
+                if self._auto_open and found:
+                    self._auto_open = False
+                    # Same code path as a real Enter keypress on the selection.
+                    if not self.handle_key(curses.KEY_ENTER, nav):
+                        return
+                self._auto_open = False
             if self._reselect_id is not None:
                 for i, ri in enumerate(nav):
                     if rows[ri][0] == "chat" and rows[ri][1]["id"] == self._reselect_id:
@@ -2785,6 +2822,19 @@ def main():
     boot_project = str(HOME)
     proj_arg = None
 
+    # `--open <id>` — used by session restore (`claude-session`). Boot straight
+    # into that chat instead of the board, so the terminals you had open before
+    # a logout come back showing the same conversations.
+    boot_open = None
+    if "--open" in argv:
+        i = argv.index("--open")
+        if i + 1 < len(argv):
+            boot_open = argv[i + 1]
+            del argv[i:i + 2]
+        else:
+            print("--open needs a chat id")
+            sys.exit(2)
+
     NEW_FLAGS = ("--new", "-n", "--new-chat")
     HELP_FLAGS = ("-h", "--help", "help")
     LIST_FLAGS = ("-l", "--list", "--projects")
@@ -2829,7 +2879,10 @@ def main():
         else:
             boot_view = key
 
-    last_id = None
+    last_id = boot_open
+    # One-shot: only the FIRST board pass auto-opens. Coming back from that chat
+    # (Ctrl+Z) must land on the board, not bounce straight back into the chat.
+    boot_open_once = [True] if boot_open else []
     # Project to restore when the board reopens after a chat. _KEEP_PROJECT on
     # the first launch (use whatever's persisted); after a chat it becomes the
     # project the board was showing, so Ctrl+Z always returns you to the SAME
@@ -2850,7 +2903,8 @@ def main():
         holder = {}
 
         def _run(stdscr):
-            app = App(stdscr, select_id=last_id, select_project=last_project)
+            app = App(stdscr, select_id=last_id, select_project=last_project,
+                      auto_open=boot_open_once.pop() if boot_open_once else False)
             app.run()
             holder["app"] = app
 
@@ -2891,6 +2945,7 @@ def main():
                     _json_set(PROJECT_TAGS_STORE, full, app.active_project)
             print("  Attaching — press Ctrl+Z to leave it running and come back.\n")
             set_terminal_accent(app.project_color(app.active_project))
+            set_window_title(short)
             try:
                 run_child(["claude", "attach", short], run_cwd)
             except FileNotFoundError:
@@ -3044,6 +3099,7 @@ def main():
         # the board. Always cleared on the way back out (finally), even if the
         # chat crashes — the terminal never keeps a stale project color.
         set_terminal_accent(app.project_color(project_key_for(c, app.tags)))
+        set_window_title(run_id)   # so `claude-session` can find this window
         try:
             runner(cmd, run_cwd)
         except FileNotFoundError:

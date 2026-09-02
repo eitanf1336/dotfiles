@@ -1,0 +1,6 @@
+[Unit]
+Description=Snapshot the open Claude chats
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/claude-session save

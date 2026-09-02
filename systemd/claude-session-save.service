@@ -1,0 +1,16 @@
+[Unit]
+Description=Remember which Claude chats are open (and save them at logout)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Nothing to do while the session runs; the point is ExecStop, which fires as
+# the graphical session goes away. That is the last moment the open chats can
+# still be seen, so it is the snapshot that a logout actually restores from.
+ExecStart=/bin/true
+ExecStop=%h/bin/claude-session save
+
+[Install]
+WantedBy=graphical-session.target
