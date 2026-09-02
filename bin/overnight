@@ -778,6 +778,50 @@ def ensure_units():
     return changed
 
 
+INHIBIT_PID = os.path.join(DIR, "inhibitor.pid")
+
+
+def hold_awake():
+    """Keep the machine out of its idle timer for the WHOLE run.
+
+    claude-keep-awake holds an inhibitor only while something is actively
+    computing, which is right for it and wrong for this: a group of chats is
+    idle between turns all night, and on 2026-09-02 logind suspended the laptop
+    at 02:44 in one of those gaps and took ten hours of the night with it. This
+    holds `idle` unconditionally while armed. Deliberate suspend, the lid and
+    the power menu are all left alone - only the idle timer is blocked."""
+    old = read_json(INHIBIT_PID, {}).get("pid")
+    if old and qw.alive(old):
+        try:
+            with open(f"/proc/{int(old)}/cmdline", "rb") as fh:
+                if b"systemd-inhibit" in fh.read():
+                    return False
+        except OSError:
+            pass
+    if not shutil.which("systemd-inhibit"):
+        log("systemd-inhibit is missing - cannot stop the machine idling out")
+        return False
+    p = subprocess.Popen(
+        ["systemd-inhibit", "--what=idle", "--who=overnight",
+         "--why=seeing a group of Claude chats through to the end",
+         "--mode=block", "sleep", "infinity"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True)
+    write_json(INHIBIT_PID, {"pid": p.pid})
+    log(f"holding the machine awake (idle inhibitor, pid {p.pid})")
+    return True
+
+
+def drop_awake():
+    pid = read_json(INHIBIT_PID, {}).get("pid")
+    if pid and qw.alive(pid):
+        try:
+            os.kill(int(pid), 15)
+        except OSError:
+            pass
+    write_json(INHIBIT_PID, {})
+
+
 def heal_units(quiet=True):
     """The two timers guard each other: as long as either one is still firing,
     the other gets put back. Nothing here spends a token, so it is safe to run
@@ -785,6 +829,7 @@ def heal_units(quiet=True):
     if not conf().get("enabled"):
         return False
     ensure_units()
+    hold_awake()                                   # re-taken if it ever dies
     fixed = []
     for unit in ("overnight.timer", "overnight-guard.timer"):
         if systemctl("is-active", unit).stdout.strip() != "active":
@@ -1253,6 +1298,7 @@ def finish(cfg, st, why):
     write_json(CONF, cfg)
     systemctl("disable", "--now", "overnight.timer")
     systemctl("disable", "--now", "overnight-guard.timer")
+    drop_awake()
     st["phase"] = "finished"
     st["finished_at"] = time.time()
     save(st)
@@ -1381,6 +1427,7 @@ def cmd_start(argv):
           "started_at": time.time(), "next_poll_at": 0,
           "declined": declined})
     ensure_units()
+    hold_awake()
     for unit in ("overnight.timer", "overnight-guard.timer"):
         r = systemctl("enable", "--now", unit)
         if r.returncode != 0:
@@ -1459,6 +1506,7 @@ def cmd_stop(argv):
     cfg, st = conf(), state()
     systemctl("disable", "--now", "overnight.timer")
     systemctl("disable", "--now", "overnight-guard.timer")
+    drop_awake()
     cfg["enabled"] = False
     write_json(CONF, cfg)
     log("DISARMED by hand")
