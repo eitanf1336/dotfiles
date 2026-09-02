@@ -80,13 +80,11 @@ counter, the auto-revert) is gone too, since there is no rule left to guard.
 `bin/gpu-primary` still exists as a toggle, but read the two sections above
 before using it.
 
-Switch it at any time:
-
 ```
-gpu-primary status     # what is configured, what the running session picked,
-                       # and the front-buffer failure count this boot
-gpu-primary nvidia     # render on the dGPU (the fix)
-gpu-primary intel      # stock behaviour
+gpu-primary status     # what the running session picked, and the front-buffer
+                       # failure count this boot. Safe, read-only.
+gpu-primary nvidia     # DON'T: kills the DisplayLink screens (see above)
+gpu-primary intel      # stock behaviour, i.e. what is in place now
 ```
 
 Mutter chooses its primary GPU once at startup, so a change **takes effect at
