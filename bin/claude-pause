@@ -182,6 +182,36 @@ def is_live(a):
     return is_working(a) or alive(a.get("pid"))
 
 
+def attached_to(short):
+    """Is he watching this chat right now? `claude attach <id>` is a real
+    process, so this is a straight answer rather than a guess."""
+    if not short:
+        return False
+    try:
+        out = subprocess.run(["pgrep", "-af", f"claude attach {short}"],
+                             capture_output=True, text=True, timeout=10)
+        return bool(out.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def he_is_away():
+    """The sleep switch, or a desktop idle for a while. Unsure means present."""
+    if os.path.exists(os.path.join(
+            os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")),
+            "sleep-mode", "sleeping")):
+        return True
+    try:
+        out = subprocess.run(
+            ["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.IdleMonitor",
+             "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
+             "--method", "org.gnome.Mutter.IdleMonitor.GetIdletime"],
+            capture_output=True, text=True, timeout=10)
+        return int(re.search(r"(\d+)", out.stdout).group(1)) > 15 * 60 * 1000
+    except Exception:
+        return False
+
+
 def stop_agent(short):
     """`claude stop` keeps the conversation and drops the process."""
     try:
@@ -453,6 +483,7 @@ def build_plan(opts):
                 "cwd": cwd or p.get("cwd") or HOME,
                 "model": model,
                 "reason": "paused",
+                "name": p.get("name") or "",
                 "detail": p.get("name") or "",
                 "empty": path is None,
             })
@@ -480,6 +511,7 @@ def build_plan(opts):
     for j in jobs:
         j["live"] = j["sessionId"] in live_now
         j["short"] = (live_now.get(j["sessionId"], {}).get("id")) or j["short"]
+        j["name"] = j.get("name") or live_now.get(j["sessionId"], {}).get("name") or ""
     return [j for j in jobs
             if not j["empty"] and os.path.isdir(j["cwd"])
             and j["sessionId"] not in mine]
@@ -491,15 +523,29 @@ def run_one(job):
     os.makedirs(LOG_DIR, exist_ok=True)
     log = os.path.join(LOG_DIR, job["sessionId"][:8] + ".log")
     if job.get("live"):
+        # Stopping a chat he has open in a terminal drops him back to the
+        # claude-c menu. A resume is never worth doing that to him: the session
+        # is already alive and he is in it, so leave it be.
+        if attached_to(job["short"]) and not he_is_away():
+            with open(log, "a") as fh:
+                fh.write(f"[claude-resume] {job['short']} is open in a "
+                         f"terminal - left alone\n")
+            return 0
         stop_agent(job["short"])
         time.sleep(1.5)
-    base = [CLAUDE, "--resume", job["sessionId"], "-p", CONTINUE_PROMPT]
+    # -n keeps the chat's own name on the resumed run. Without it the headless
+    # process registers under a generated one ("focusrace-0f"), and from the
+    # agent list it reads as a different chat that renamed itself.
+    name = job.get("name") or job.get("detail") or ""
+    base = [CLAUDE] + (["-n", name] if name and len(name) < 60 else []) \
+        + ["--resume", job["sessionId"], "-p", CONTINUE_PROMPT]
     # Keep the model the session was actually using — but transcripts outlive
     # model names, so a retired id gets one retry on the default model rather
     # than becoming a silent no-resume. Only a *model* complaint retries; a
     # failure for any other reason must not run the turn (and the bill) twice.
     cmd = base[:1] + (["--model", job["model"]] if job.get("model") else []) \
         + base[1:]
+
     with open(log, "a") as fh:
         for attempt in (1, 2):
             fh.write(f"$ {' '.join(cmd[:5])} …\n")
