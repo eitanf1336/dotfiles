@@ -760,6 +760,28 @@ def job_tempo_map():
     return m
 
 
+def _headless_turn(a):
+    """Is this record a `claude --resume <id> -p` turn actually in flight?
+
+    A chat woken by claude-resume / quota-watcher runs headless: it registers
+    as `kind: interactive` with a pid but NO state and NO status, so the board
+    read it as an idle, finished chat while it was in fact working - the chat
+    only looked alive once it was opened. A terminal session he is sitting in
+    looks identical in the JSON, so the process itself is asked: a print run
+    carries -p / --print on its command line, an open terminal does not."""
+    if a.get("kind") != "interactive" or a.get("id"):
+        return False
+    pid = a.get("pid")
+    if not pid:
+        return False
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as fh:
+            args = fh.read().split(b"\0")
+    except (OSError, ValueError):
+        return False
+    return b"-p" in args or b"--print" in args
+
+
 def resolve_status(sid, active, jobs):
     """Status icon for a chat. running/needs_input only count if the session is
     genuinely a live agent (in `active`); otherwise it's closed -> done/failed."""
@@ -771,6 +793,8 @@ def resolve_status(sid, active, jobs):
             return "running"
         a = active[sid]
         if a.get("status") == "busy":
+            return "running"
+        if _headless_turn(a):
             return "running"
         if a.get("state") == "failed" or state == "failed":
             return "failed"
