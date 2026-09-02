@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""jitter-watch — press Super+F5 for you when the main screen starts jittering.
+
+This is a workaround, not a fix, and it is worth being blunt about which.
+
+The real cause is structural: GNOME renders the desktop on the Intel GPU and
+the main monitor hangs off the NVIDIA one, so every frame has to be copied
+between chips, and that copy periodically fails:
+
+    gnome-shell: Failed to lock front buffer on /dev/dri/cardN:
+                 gbm_surface_lock_front_buffer failed
+
+Each failure is a dropped frame. A burst of them is the visible jitter, and
+bouncing the VT (what ~/bin/fix-screen does, what Super+F5 is bound to) forces
+a full modeset that clears it. The only actual fix is to stop the copy from
+existing, by putting the main monitor on an Intel output. See
+display-jitter/README.md in the dotfiles repo.
+
+Until then: watch the journal for a BURST of those failures and bounce the VT
+automatically. Deliberately conservative, because a VT bounce is a visible
+flash across every screen and one that fires on a single stray failure would be
+worse than the jitter it is fixing:
+
+  * needs BURST failures inside WINDOW seconds (a slow trickle is ignored)
+  * never fires more than once per COOLDOWN seconds
+
+Turn it off with:  systemctl --user disable --now jitter-watch
+"""
+
+import re
+import subprocess
+import sys
+import time
+from collections import deque
+from pathlib import Path
+
+BURST = 4        # failures required...
+WINDOW = 20.0    # ...within this many seconds
+COOLDOWN = 120.0  # and at most one bounce per this many seconds
+
+PATTERN = re.compile(r"lock front buffer|gbm_surface_lock_front_buffer")
+FIX = str(Path.home() / "bin" / "fix-screen")
+
+
+def main():
+    # --stdin reads lines from standard input instead of the journal, so the
+    # burst thresholds can be exercised without waiting for a real jitter
+    # episode (and without bouncing the user's screens to find out).
+    test_mode = "--stdin" in sys.argv
+    if test_mode:
+        proc = None
+        stream = sys.stdin
+    else:
+        # -f follows, --since now skips the backlog so a restart does not
+        # immediately "see" a burst that already happened and is long over.
+        proc = subprocess.Popen(
+            ["journalctl", "-f", "--since", "now", "-o", "cat",
+             "--no-pager", "_COMM=gnome-shell"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        stream = proc.stdout
+
+    hits = deque()
+    last_bounce = 0.0
+    print("jitter-watch: watching for front-buffer bursts", flush=True)
+
+    for line in stream:
+        if not PATTERN.search(line):
+            continue
+        now = time.time()
+        hits.append(now)
+        while hits and now - hits[0] > WINDOW:
+            hits.popleft()
+
+        if len(hits) < BURST:
+            continue
+        if now - last_bounce < COOLDOWN:
+            # Still settling from the last bounce; do not thrash the screens.
+            continue
+
+        print(f"jitter-watch: {len(hits)} failures in {WINDOW:.0f}s "
+              f"-> bouncing the VT", flush=True)
+        if test_mode:
+            print("jitter-watch: [test] would run fix-screen", flush=True)
+        else:
+            try:
+                subprocess.run([FIX], timeout=30)
+            except (OSError, subprocess.SubprocessError) as e:
+                print(f"jitter-watch: fix-screen failed: {e}", flush=True)
+        last_bounce = time.time()
+        hits.clear()
+
+    return proc.wait() if proc else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

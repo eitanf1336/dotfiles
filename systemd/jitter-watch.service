@@ -1,0 +1,13 @@
+[Unit]
+Description=Bounce the VT automatically when the main screen starts jittering
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/bin/jitter-watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

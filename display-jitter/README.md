@@ -73,7 +73,27 @@ high. The remaining untried options, in the order that risks least:
    cable swap, not a boot.
 2. An **Xorg session**, where hybrid + DisplayLink + multi-monitor is far better
    behaved than Wayland.
-3. Leave it. Super+F5 is a keystroke, and the failure rate is roughly 5/hour.
+3. Leave it. Super+F5 is a keystroke, and the failure rate is roughly 5/hour
+   when idle, though it climbs to several a minute under load.
+
+**An Xorg session is not the easy escape it looks like.** Checked 2026-09-03:
+`/usr/share/xsessions/` is EMPTY on this box, only the Wayland session is
+installed, the NVIDIA X driver is absent (`modesetting_drv.so` is the only one
+present) and there is no DisplayLink xorg.conf.d snippet. So "just pick Xorg at
+the login screen" is not available; it would mean installing an X session plus
+configuring DisplayLink for X, which is a bigger change than the two that
+already broke a screen.
+
+## The workaround that is running: `jitter-watch`
+
+`bin/jitter-watch` + `systemd/jitter-watch.service` follow the journal and run
+`fix-screen` automatically when a BURST of front-buffer failures appears (4
+inside 20s, at most one bounce per 2 minutes). Deliberately conservative: a VT
+bounce flashes every screen, so firing on a single stray failure would be worse
+than the jitter.
+
+It presses Super+F5 for you. It does not fix anything. Turn it off with
+`systemctl --user disable --now jitter-watch`.
 
 The guard machinery that used to live here (`gpu-primary-guard`, the boot
 counter, the auto-revert) is gone too, since there is no rule left to guard.
