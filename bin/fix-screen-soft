@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
-"""fix-screen-soft — clear display corruption WITHOUT switching virtual terminals.
+"""fix-screen-soft — DOES NOT WORK for this jitter. Kept only as a record.
+
+MEASURED 2026-09-03: it runs cleanly, mutter accepts it, the layout survives
+intact, and the corruption is completely unaffected. Soft reset at 02:33,
+front-buffer failure at 02:34:16. Again at 02:38, failure at 02:37:41.
+
+The reason is the thing that made it safe. Flipping to another refresh rate at
+the SAME resolution deliberately changes no buffer sizes, so mutter reuses its
+existing gbm surfaces, and those surfaces are exactly where the corruption
+lives. It re-programs the CRTC and nothing else. A VT bounce works because it
+makes mutter drop and re-acquire every GPU and rebuild every surface, and that
+wholesale teardown is the point, not a side effect.
+
+So Super+F5 is back on `fix-screen`. Do not wire this to a key. Anything that
+clears this has to rebuild the renderer's buffers, which means either a VT
+bounce (stops audio) or switching the output off and on (relocates that
+screen's windows and does not bring them back). Both costs are real; neither
+was avoidable by being clever about modes.
+
+--- original description follows ---
+
+fix-screen-soft — clear display corruption WITHOUT switching virtual terminals.
 
 `fix-screen` (Super+F5) works by bouncing the graphical VT, which makes mutter
 drop and re-acquire the GPU. It clears the jitter, but a VT switch tears down
