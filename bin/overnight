@@ -400,6 +400,28 @@ def member_live(m, live):
 
 
 # ---- acting on a member -------------------------------------------------
+def he_is_away():
+    """Is he actually away from the machine?
+
+    An attached chat is a window he may be sitting in front of, and stopping it
+    drops his terminal back to the claude-c menu. Doing that to an unattended
+    session at 3am saves the work; doing it while he is typing is the single
+    thing he has asked most often never to happen. So: only when the sleep
+    switch is on, or the desktop itself has been idle for a while."""
+    if os.path.exists(SLEEP_FILE):
+        return True
+    try:
+        out = subprocess.run(
+            ["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.IdleMonitor",
+             "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
+             "--method", "org.gnome.Mutter.IdleMonitor.GetIdletime"],
+            capture_output=True, text=True, timeout=10)
+        ms = int(re.search(r"(\d+)", out.stdout).group(1))
+        return ms > 15 * 60 * 1000
+    except Exception:
+        return False                               # unsure means hands off
+
+
 def stop_member(m, live):
     """Drop the process, keep the conversation."""
     ok = False
@@ -413,8 +435,9 @@ def stop_member(m, live):
     a = live.get(m["sid"])
     if a and is_main_chat(a) and is_live(a):
         ok = cp.stop_agent(a.get("id") or m["short"]) or ok
-    elif a and a.get("kind") == "interactive" and qw.alive(a.get("pid")):
-        # A chat he attached to and then left. `claude stop` does not speak for
+    elif a and a.get("kind") == "interactive" and qw.alive(a.get("pid")) \
+            and he_is_away():
+        # A chat he attached to and then LEFT. `claude stop` does not speak for
         # it, so it would sit outside the quota cycle and die on the limit with
         # nothing to resume. It is a member: it gets stopped like one, and the
         # next revive brings it back as a proper background agent under its own
@@ -588,8 +611,10 @@ def fresh_headroom():
     exe = shutil.which("claude-limits") or os.path.join(HOME, ".local/bin/claude-limits")
     for attempt in (1, 2):
         try:
-            out = subprocess.run([exe, "--json", "--fresh"], capture_output=True,
-                                 text=True, timeout=60, check=True)
+            out = subprocess.run(
+                [exe, "--json", "--fresh"], capture_output=True, text=True,
+                timeout=60, check=True,
+                env=dict(os.environ, CLAUDE_LIMITS_TTL="0"))
             data = json.loads(out.stdout)
             meta = data.get("_claude_limits") or {}
             if meta.get("cached"):
@@ -631,6 +656,7 @@ def rotate(cfg, st):
         if not qw.switch_account(name):
             exhausted[name] = now + 900
             continue
+        qw.wake_credentials()                    # a parked slot's token is stale
         rem, resets, weekly = fresh_headroom()   # past the cache, or it lies
         bad = None
         if rem is None:
@@ -1010,12 +1036,20 @@ def supervise(cfg, st, live):
 
 def park_all(cfg, st, live, reason):
     stopped = 0
+    spared = []
     for m in pending(st):
+        a = live.get(m["sid"])
+        if a and a.get("kind") == "interactive" and qw.alive(a.get("pid")) \
+                and not he_is_away():
+            spared.append(m["name"])
+            continue
         if member_live(m, live):
             stopped += stop_member(m, live)
         m["status"] = "parked"
         m["pid"] = None
-    log(f"PARKED {len(pending(st))} chat(s) ({reason}), {stopped} needed forcing")
+    log(f"PARKED {len(pending(st))} chat(s) ({reason}), {stopped} needed forcing"
+        + (f"; left alone because he is at the machine: {', '.join(spared)}"
+           if spared else ""))
     return stopped
 
 
@@ -1207,6 +1241,15 @@ def try_rotate(cfg, st, now):
     name = rotate(cfg, st)
     if not name:
         st = state()
+        # Nowhere better to go. That is NOT a reason to sit stopped: if the
+        # account we are on can still run them, they go back to work here and
+        # the rotation is retried later. Leaving a group parked on a rotation
+        # that merely failed has cost this machine a whole night once already.
+        rem, _, weekly = fresh_headroom()
+        if rem is not None and not weekly and rem > float(cfg.get("floor", 5)):
+            log(f"rotation found nothing better - carrying on here with "
+                f"{rem:.0f}% left")
+            return finish_resume(cfg, st, None, rem, now)
         log(f"no account has headroom - waiting "
             f"{fmt_eta(float(st.get('retry_rotate_at') or now) - now)}")
         return 0
