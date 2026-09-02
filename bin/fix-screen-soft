@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""fix-screen-soft — clear display corruption WITHOUT switching virtual terminals.
+
+`fix-screen` (Super+F5) works by bouncing the graphical VT, which makes mutter
+drop and re-acquire the GPU. It clears the jitter, but a VT switch tears down
+and rebuilds the whole session's device access, which is why it stops Spotify
+and interrupts anything else holding a device.
+
+This does the same job with a much smaller hammer: it flips the screen to
+another refresh rate at the SAME resolution and straight back. That is a full
+modeset with fresh framebuffers, which is the part that actually clears the
+corruption, but nothing else moves:
+
+  * no VT switch, so audio and every other device holder is untouched
+  * the resolution never changes, so the desktop geometry never changes, so
+    your windows are not relocated (removing a monitor DOES relocate them, and
+    they do not come back, which is why that approach was abandoned)
+
+If a screen has no second mode at its current resolution, it falls back to
+briefly switching that output off and on, which does move windows. It says so
+when it does that.
+
+  fix-screen-soft                 reset the screen showing corruption (default:
+                                  the one on a GPU that is not mutter's primary,
+                                  which is where these failures always land)
+  fix-screen-soft CONNECTOR       reset a specific output, e.g. HDMI-1
+  fix-screen-soft --list          show the outputs and which one it would pick
+  fix-screen-soft --verify        validate the configs with mutter, change nothing
+
+Configs are applied with method=TEMPORARY, so ~/.config/monitors.xml is never
+written: whatever happens, your saved layout is untouched and a logout restores
+it. The restore is in a finally block, so an error mid-way still puts the
+screen back.
+"""
+
+import sys
+import time
+
+import gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib          # noqa: E402
+
+BUS_NAME = "org.gnome.Mutter.DisplayConfig"
+OBJ_PATH = "/org/gnome/Mutter/DisplayConfig"
+IFACE = "org.gnome.Mutter.DisplayConfig"
+
+VERIFY, TEMPORARY, PERSISTENT = 0, 1, 2
+
+
+def proxy():
+    return Gio.DBusProxy.new_for_bus_sync(
+        Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, None,
+        BUS_NAME, OBJ_PATH, IFACE, None)
+
+
+def current_state(p):
+    serial, monitors, logicals, props = p.call_sync(
+        "GetCurrentState", None, Gio.DBusCallFlags.NONE, -1, None).unpack()
+    return serial, monitors, logicals, props
+
+
+def current_mode(monitor):
+    """The mode id this monitor is running right now, with its pixel size."""
+    _spec, modes, _props = monitor
+    for mode in modes:
+        mode_id, w, h, _refresh, _scale, _scales, mprops = mode
+        if mprops.get("is-current"):
+            return mode_id, w, h
+    if modes:
+        return modes[0][0], modes[0][1], modes[0][2]
+    return None, 0, 0
+
+
+def alt_mode(monitor):
+    """Another mode at exactly the current resolution, or None.
+
+    Same width and height means the logical layout is byte-for-byte unchanged,
+    so mutter has no reason to move a single window: only the scanout timing
+    differs, and that is enough to force the modeset."""
+    _spec, modes, _props = monitor
+    cur = None
+    for mode in modes:
+        if mode[6].get("is-current"):
+            cur = mode
+            break
+    if cur is None:
+        return None
+    for mode in modes:
+        if mode[6].get("is-current"):
+            continue
+        if mode[1] == cur[1] and mode[2] == cur[2]:
+            return mode[0]
+    return None
+
+
+def config_with_mode(monitors, logicals, connector, mode_id):
+    """The current config, with one output forced onto a specific mode."""
+    by_connector = {m[0][0]: m for m in monitors}
+    out = []
+    for x, y, scale, transform, primary, specs, _props in logicals:
+        entries = []
+        for conn, _v, _p, _s in specs:
+            mon = by_connector.get(conn)
+            if not mon:
+                continue
+            mid, _w, _h = current_mode(mon)
+            if conn == connector and mode_id:
+                mid = mode_id
+            if mid is None:
+                continue
+            entries.append((conn, mid, {}))
+        if entries:
+            out.append((x, y, scale, transform, primary, entries))
+    return out
+
+
+def build_config(monitors, logicals, skip_connector=None):
+    """Turn GetCurrentState's logical monitors into ApplyMonitorsConfig's shape,
+    optionally leaving one output out (which is how we switch it off).
+
+    Dropping a monitor from the middle of a row leaves a hole, and mutter
+    refuses that with "Logical monitors not adjacent". So when something is
+    skipped, the survivors are re-packed side by side in their original
+    left-to-right order. This is temporary and only for the half-second the
+    screen is off; the untouched config goes back straight after."""
+    by_connector = {m[0][0]: m for m in monitors}
+    built = []
+    for x, y, scale, transform, primary, specs, _props in logicals:
+        entries, width, height = [], 0, 0
+        for connector, _vendor, _product, _serial in specs:
+            if connector == skip_connector:
+                continue
+            mon = by_connector.get(connector)
+            if not mon:
+                continue
+            mode_id, mw, mh = current_mode(mon)
+            if mode_id is None:
+                continue
+            entries.append((connector, mode_id, {}))
+            # transform 1/3 are the 90/270 rotations, which swap the axes.
+            if transform in (1, 3, 5, 7):
+                mw, mh = mh, mw
+            width = max(width, int(mw / scale))
+            height = max(height, int(mh / scale))
+        if entries:
+            built.append({"x": x, "y": y, "scale": scale,
+                          "transform": transform, "primary": primary,
+                          "entries": entries, "w": width, "h": height})
+
+    if skip_connector is not None and built:
+        # Re-pack along x, preserving order, so there is no gap where the
+        # skipped monitor used to be.
+        built.sort(key=lambda b: b["x"])
+        cursor = 0
+        for b in built:
+            b["x"] = cursor
+            b["y"] = 0
+            cursor += b["w"]
+        if not any(b["primary"] for b in built):
+            built[0]["primary"] = True   # mutter wants exactly one primary
+
+    return [(b["x"], b["y"], b["scale"], b["transform"], b["primary"],
+             b["entries"]) for b in built]
+
+
+def apply(p, serial, method, config):
+    p.call_sync(
+        "ApplyMonitorsConfig",
+        GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})",
+                     (serial, method, config, {})),
+        Gio.DBusCallFlags.NONE, -1, None)
+
+
+def pick_target(monitors, logicals):
+    """Default to the output most likely to be the corrupted one.
+
+    These failures are always on a screen mutter has to copy frames to, i.e. one
+    that is not on its primary GPU. We cannot see GPU assignment over this
+    interface, so use the practical proxy on this machine: the logical monitor
+    marked primary. It is the main screen, and the main screen is the one on the
+    other GPU."""
+    for _x, _y, _scale, _transform, primary, specs, _props in logicals:
+        if primary and specs:
+            return specs[0][0]
+    for _x, _y, _scale, _transform, _primary, specs, _props in logicals:
+        if specs:
+            return specs[0][0]
+    return None
+
+
+def main():
+    args = [a for a in sys.argv[1:]]
+    p = proxy()
+    serial, monitors, logicals, _props = current_state(p)
+
+    if "--list" in args:
+        target = pick_target(monitors, logicals)
+        for _x, _y, _scale, _transform, primary, specs, _props2 in logicals:
+            for connector, vendor, product, _s in specs:
+                mark = []
+                if primary:
+                    mark.append("primary")
+                if connector == target:
+                    mark.append("<- would reset")
+                print(f"  {connector:<12} {vendor} {product} "
+                      f"{' '.join(mark)}")
+        return 0
+
+    verify_only = "--verify" in args
+    named = [a for a in args if not a.startswith("-")]
+    target = named[0] if named else pick_target(monitors, logicals)
+    if not target:
+        print("no outputs found", file=sys.stderr)
+        return 1
+
+    by_connector = {m[0][0]: m for m in monitors}
+    mon = by_connector.get(target)
+    if mon is None:
+        print(f"no such output: {target}", file=sys.stderr)
+        return 1
+
+    whole = build_config(monitors, logicals)
+    other = alt_mode(mon)
+
+    if other:
+        nudged = config_with_mode(monitors, logicals, target, other)
+        how = f"refresh-rate flip via {other}, windows stay put"
+    else:
+        # No second mode at this resolution: fall back to off/on, which does
+        # shuffle windows. Say so rather than surprising anyone.
+        nudged = build_config(monitors, logicals, skip_connector=target)
+        how = "off/on (no alternate mode at this resolution; WINDOWS WILL MOVE)"
+        if not nudged:
+            print(f"{target} is the only screen and has no alternate mode; "
+                  f"use fix-screen instead.", file=sys.stderr)
+            return 1
+
+    if verify_only:
+        # method=VERIFY asks mutter to validate without applying anything.
+        apply(p, serial, VERIFY, nudged)
+        apply(p, serial, VERIFY, whole)
+        print(f"both configs valid; would reset {target} by {how}")
+        return 0
+
+    print(f"resetting {target}: {how}")
+    try:
+        apply(p, serial, TEMPORARY, nudged)
+        time.sleep(0.5)
+    finally:
+        # Always put it back, even if the step above raised. The serial changes
+        # once a config is applied, so re-read it before restoring.
+        serial, monitors, _logicals2, _ = current_state(p)
+        apply(p, serial, TEMPORARY, whole)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except GLib.Error as e:
+        print(f"fix-screen-soft: {e.message}", file=sys.stderr)
+        sys.exit(1)

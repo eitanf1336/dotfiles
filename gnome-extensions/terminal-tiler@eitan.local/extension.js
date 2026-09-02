@@ -64,6 +64,7 @@ export default class TerminalTilerExtension extends Extension {
 
         // monitorIndex -> ordered array of Meta.Window (one batch per monitor).
         this._batches = new Map();
+        this._layoutSaveId = 0;
         // monitorIndex -> the one Meta.Window currently maximised over its
         // batch (fills the work area, peers hidden behind it). Absent unless
         // that monitor's group is in the temporary maximised state.
@@ -238,6 +239,10 @@ export default class TerminalTilerExtension extends Extension {
         // A logout runs disable(), which is the last moment the column layout
         // still exists. Write it out so `claude-session restore` can put the
         // same chats back on the same monitors at the next login.
+        if (this._layoutSaveId) {
+            GLib.Source.remove(this._layoutSaveId);
+            this._layoutSaveId = 0;
+        }
         this._saveLayout();
         if (this._dbus) {
             try {
@@ -798,6 +803,14 @@ export default class TerminalTilerExtension extends Extension {
         if (!arr)
             return;
 
+        // Keep the on-disk layout current. It used to be written only from
+        // disable(), on the assumption that a logout runs it. It does not:
+        // GNOME Shell is killed at session end and disable() never fires, so
+        // the file was never there when `claude-session restore` looked for it.
+        // Writing it (debounced) whenever the columns change means it is always
+        // right, whatever ends the session.
+        this._scheduleLayoutSave();
+
         // Prune windows that died or got dragged onto another monitor.
         const live = arr.filter(w => this._isAlive(w));
         if (live.length !== arr.length) {
@@ -1130,6 +1143,18 @@ export default class TerminalTilerExtension extends Extension {
     // Persist the layout to ~/.claude/chats-session/tiler-layout.json. Called
     // from disable(), i.e. on logout, which is exactly when it is needed and
     // also the last moment the window list is still real.
+    // Debounced: a re-tile fires several times in a row while windows settle,
+    // and this only needs to write once after they have.
+    _scheduleLayoutSave() {
+        if (this._layoutSaveId)
+            return;
+        this._layoutSaveId = GLib.timeout_add(GLib.PRIORITY_LOW, 2000, () => {
+            this._layoutSaveId = 0;
+            this._saveLayout();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
     _saveLayout() {
         try {
             const dir = GLib.build_filenamev(

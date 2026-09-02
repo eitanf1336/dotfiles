@@ -84,7 +84,35 @@ the login screen" is not available; it would mean installing an X session plus
 configuring DisplayLink for X, which is a bigger change than the two that
 already broke a screen.
 
-## The workaround that is running: `jitter-watch`
+## The workaround to actually use: `fix-screen-soft`
+
+`fix-screen` (Super+F5) bounces the graphical VT. That clears the corruption,
+but a VT switch tears down and rebuilds the whole session's device access,
+which stops Spotify and interrupts anything else holding a device. That cost is
+what made the automatic version unusable.
+
+`bin/fix-screen-soft` does the same job without touching the VT: it flips the
+affected screen to another refresh rate at the SAME resolution and straight
+back. That is a full modeset with fresh framebuffers, which is the part that
+clears the corruption, while nothing else moves:
+
+* no VT switch, so audio and every other device holder is untouched
+* the resolution never changes, so the desktop geometry never changes, so no
+  windows are relocated
+
+The first design switched the output off and on instead. Two problems, both
+found before shipping it: mutter rejects the gap in the layout with "Logical
+monitors not adjacent", and more importantly, removing a monitor makes GNOME
+relocate its windows and they do not come back. The refresh-rate flip has
+neither problem. It needs a second mode at the current resolution, which this
+monitor has (2560x1440 at 60, 120 and 144); if a screen has none, the tool
+falls back to off/on and says so first.
+
+Configs are applied with method=TEMPORARY, so `monitors.xml` is never written,
+and the restore is in a `finally` block. Verified live: layout came back
+byte-identical, and no VT switch appears in the journal.
+
+## `jitter-watch`, installed but OFF
 
 `bin/jitter-watch` + `systemd/jitter-watch.service` follow the journal and run
 `fix-screen` automatically when a BURST of front-buffer failures appears (4
@@ -92,8 +120,12 @@ inside 20s, at most one bounce per 2 minutes). Deliberately conservative: a VT
 bounce flashes every screen, so firing on a single stray failure would be worse
 than the jitter.
 
-It presses Super+F5 for you. It does not fix anything. Turn it off with
-`systemctl --user disable --now jitter-watch`.
+It presses the fix for you. It does not fix anything itself.
+
+**It is disabled**, because it was written when the only available remedy was
+the VT bounce, and having that fire automatically is worse than the jitter. If
+it is ever re-enabled it should call `fix-screen-soft`, not `fix-screen`. Turn
+it on with `systemctl --user enable --now jitter-watch`.
 
 The guard machinery that used to live here (`gpu-primary-guard`, the boot
 counter, the auto-revert) is gone too, since there is no rule left to guard.

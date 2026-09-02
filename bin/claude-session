@@ -129,10 +129,17 @@ def tiler_layout():
 def save():
     STATE.mkdir(parents=True, exist_ok=True)
     entries = []
+    seen = set()
     for b in open_boards():
         chat = b["chat"]
         if not chat:
             continue          # a board sitting on the list, nothing open in it
+        if chat["id"] in seen:
+            # The same conversation can be open in two boards at once (easy to
+            # do by accident). Restoring it twice would just make two terminals
+            # fight over one chat, so keep the first.
+            continue
+        seen.add(chat["id"])
         entries.append({
             "chat": chat["id"],
             "cwd": chat["cwd"] or b["cwd"],
