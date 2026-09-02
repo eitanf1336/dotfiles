@@ -423,7 +423,11 @@ def he_is_away():
 
 
 def stop_member(m, live):
-    """Drop the process, keep the conversation."""
+    """Drop the process, keep the conversation - unless he is looking at it."""
+    if attached_to(m["short"]) and not he_is_away():
+        log(f"{m['short']} ({m['name']}): he is attached to it, leaving it "
+            f"alone")
+        return False
     ok = False
     if ours_alive(m):
         try:
@@ -480,74 +484,57 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 BACKGROUNDED = re.compile(r"backgrounded\s*[^0-9a-f]*([0-9a-f]{8})")
 
 
+def attached_to(short):
+    """Is he sitting in one of these chats right now?
+
+    `claude attach <id>` is a real process, so this is a straight answer rather
+    than a guess. Stopping a chat he has open drops his terminal back to the
+    claude-c menu, which is the thing he has asked most often never to happen.
+    """
+    try:
+        out = subprocess.run(["pgrep", "-af", f"claude attach {short}"],
+                             capture_output=True, text=True, timeout=10)
+        return bool(out.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def revive(m, prompt, cfg, live):
-    """Put a member back to work as a REAL background agent.
+    """Hand the session one more turn, in place.
 
-    This must never be `--resume -p`. A --print run has no interactive session
-    for `claude agents` to attach to, so a chat woken that way vanishes out of
-    the agent list and comes back under a generated name: from the outside it
-    reads as "the supervisor ate my chat". `--bg --resume` continues the same
-    conversation as an attachable job, and -n keeps its name. Claude Code says
-    so itself if you get it wrong, which is how this was found.
-
-    A --bg resume mints a new session id for the continued conversation, so the
-    member is re-pointed at it here - otherwise the next tick would supervise a
-    session nobody is running any more."""
+    Deliberately `--resume -p` and nothing cleverer. It keeps the SAME session
+    id, so the conversation stays one conversation: no fork, no second entry in
+    claude-c under the same name, nothing for him to tell apart in the morning.
+    `--bg --resume` was tried and mints a new session id every single wake,
+    which filled his board with duplicates of the same chat.
+    """
     if member_live(m, live):
         stop_member(m, live)
         time.sleep(1.5)
     os.makedirs(LOGS, exist_ok=True)
     logfile = os.path.join(LOGS, f"{m['short']}.log")
-    cmd = [CLAUDE, "--bg", "--resume", m["sid"], "-n", m["name"]]
+    cmd = [CLAUDE]
     if m.get("model"):
         cmd += ["--model", m["model"]]
     if cfg.get("yolo"):
         cmd += ["--dangerously-skip-permissions"]
-    cmd += [prompt]
+    cmd += ["--resume", m["sid"], "-p", prompt]
     if not os.path.isdir(m.get("cwd") or ""):
         m["cwd"] = HOME
     try:
         with open(logfile, "a") as fh:
             fh.write(f"\n=== {datetime.now().isoformat(timespec='seconds')} "
                      f"revive #{m['attempts'] + 1}\n")
-            r = subprocess.run(cmd, cwd=m["cwd"], stdin=subprocess.DEVNULL,
-                               capture_output=True, text=True, timeout=240)
-            out = (r.stdout or "") + (r.stderr or "")
-            fh.write(out + f"\n[overnight] exit {r.returncode}\n")
-    except (OSError, subprocess.TimeoutExpired) as e:
+            p = subprocess.Popen(cmd, cwd=m["cwd"], stdin=subprocess.DEVNULL,
+                                 stdout=fh, stderr=fh, start_new_session=True)
+    except OSError as e:
         log(f"{m['short']}: revive FAILED: {e}")
         return False
+    m["pid"] = p.pid
     m["attempts"] += 1
     m["last_working"] = time.time()
     m["last_growth"] = time.time()
-    m["pid"] = None
-
-    hit = BACKGROUNDED.search(ANSI.sub("", out))
-    if not hit:
-        log(f"{m['short']} ({m['name']}): revive did not report a background "
-            f"job - see {logfile}")
-        return r.returncode == 0
-    short = hit.group(1)
-    # Follow the conversation to wherever it now lives, and prove it really is
-    # a background job under its own name before calling this a success.
-    for _ in range(6):
-        for a in agent_list():
-            if a.get("id") == short and is_main_chat(a):
-                old_sid = m["sid"]
-                m["short"], m["sid"] = short, a.get("sessionId") or m["sid"]
-                if m["sid"] != old_sid:
-                    inherit_chat_metadata(old_sid, m["sid"])
-                m["last_size"] = transcript_size(m["sid"])
-                log(f"{m['short']} ({m['name']}): revived as a background "
-                    f"agent, attempt {m['attempts']}")
-                return True
-        time.sleep(2)
-    log(f"{short} ({m['name']}): WOKEN BUT NOT ATTACHABLE - it is not in the "
-        f"agent list. He cannot open it; this must never happen.")
-    notify("Overnight: a chat came back unattachable",
-           f"{m['name']} was resumed but is not showing as a background agent. "
-           f"Its work is safe in session {m['sid'][:8]}.")
-    m["short"] = short
+    log(f"{m['short']} ({m['name']}): resumed, attempt {m['attempts']}")
     return True
 
 
@@ -1039,8 +1026,9 @@ def park_all(cfg, st, live, reason):
     spared = []
     for m in pending(st):
         a = live.get(m["sid"])
-        if a and a.get("kind") == "interactive" and qw.alive(a.get("pid")) \
-                and not he_is_away():
+        interactive = a and a.get("kind") == "interactive" \
+            and qw.alive(a.get("pid"))
+        if (interactive or attached_to(m["short"])) and not he_is_away():
             spared.append(m["name"])
             continue
         if member_live(m, live):
