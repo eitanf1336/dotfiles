@@ -25,9 +25,9 @@ gsettings set "$k" command '/home/eitan/.local/bin/prompts gui'
 
 paths+=("/fix-screen/")
 k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/fix-screen/"
-gsettings set "$k" name 'Fix screen (reset displays)'
+gsettings set "$k" name 'Fix screen (soft reset, keeps audio)'
 gsettings set "$k" binding '<Super>F5'
-gsettings set "$k" command '/home/eitan/bin/fix-screen'
+gsettings set "$k" command '/home/eitan/bin/fix-screen-soft'
 
 paths+=("/keys-cheatsheet/")
 k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/keys-cheatsheet/"
