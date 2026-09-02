@@ -30,6 +30,25 @@ if ! swapon --show=NAME --noheadings | grep -qx /swap2.img; then
 fi
 grep -qE '^[[:space:]]*/swap2.img[[:space:]]' /etc/fstab || echo '/swap2.img none swap sw,pri=10 0 0' >> /etc/fstab
 
+echo "==> Memory protection for the desktop cgroup chain"
+# GNOME Shell already asks for MemoryMin=768M / MemoryLow=1.5G, but cgroup v2
+# hands protection DOWN: a cgroup's effective protection is capped by its
+# ancestors', and every ancestor here had memory.min = memory.low = 0. So the
+# shell's protection was silently zero and the kernel swapped the compositor
+# out mid-frame, which looks exactly like screen jitter. Give the ancestors a
+# reservation so the shell's own values can bite. Children that ask for no
+# protection (Chrome, etc.) claim none of it.
+for u in user.slice user-.slice user@.service; do
+  install -D -m 0644 "$HERE/etc/systemd/system/$u.d/50-memory-protection.conf" \
+          "/etc/systemd/system/$u.d/50-memory-protection.conf"
+done
+systemctl daemon-reload
+# Apply to the already-running units too, so no reboot is needed.
+systemctl set-property --runtime user.slice        MemoryMin=1G MemoryLow=2G || true
+systemctl set-property --runtime "user-$(id -u "${SUDO_USER:-eitan}").slice"    MemoryMin=1G MemoryLow=2G || true
+systemctl set-property --runtime "user@$(id -u "${SUDO_USER:-eitan}").service"  MemoryMin=1G MemoryLow=2G || true
+# The last link in the chain, session.slice, is a USER unit: see install-user.sh
+
 echo "==> Enabling services"
 systemctl daemon-reload
 systemctl enable --now earlyoom

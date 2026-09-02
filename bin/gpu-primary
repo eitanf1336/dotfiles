@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# gpu-primary: choose which GPU GNOME Shell/mutter renders the desktop on.
+#
+# Background. This laptop has an Intel iGPU (card1) and an NVIDIA dGPU (card0),
+# plus DisplayLink screens on evdi. With the built-in panel turned off, mutter
+# still defaults to the Intel GPU ("selected primary from builtin panel
+# presence"), renders everything there, and CPU-copies each frame to the NVIDIA
+# HDMI monitor. That fallback path is not hardware accelerated and periodically
+# fails with "gbm_surface_lock_front_buffer failed" = the screen jitter that
+# Super+F5 (fix-screen) used to clear.
+#
+#   gpu-primary nvidia   render on the dGPU; HDMI monitor becomes direct scanout
+#   gpu-primary intel    back to stock behaviour (removes the rule)
+#   gpu-primary status   what is configured, and what the running session picked
+#
+# Takes effect at the next login: mutter chooses its primary GPU at startup.
+
+set -euo pipefail
+
+RULE=/etc/udev/rules.d/61-mutter-primary-gpu.rules
+NV_PATH=pci-0000:01:00.0   # ID_PATH of /dev/dri/card0 (NVIDIA)
+
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+pk() {  # run one privileged command, via sudo if free, else a polkit dialog
+  if sudo -n true 2>/dev/null; then sudo "$@"; else
+    local u; u=$(id -u)
+    DISPLAY="${DISPLAY:-:0}" \
+    WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$u}" \
+    DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$u/bus}" \
+    pkexec "$@"
+  fi
+}
+
+# Everything privileged happens in ONE root invocation, so at most one
+# password dialog appears per command.
+run_root() { local sc; sc=$(mktemp); printf '%s\n' "$1" > "$sc"; chmod 0755 "$sc"; pk bash "$sc"; rm -f "$sc"; }
+
+case "${1:-status}" in
+  nvidia)
+    run_root "set -e
+cat > '$RULE' <<'RULEEOF'
+# Managed by \`gpu-primary\`. Makes mutter render on the NVIDIA dGPU instead of
+# the Intel iGPU, so the HDMI monitor is scanned out directly rather than
+# CPU-copied across GPUs (the cause of the periodic screen jitter).
+# Remove with: gpu-primary intel
+ENV{ID_PATH}==\"$NV_PATH\", SUBSYSTEM==\"drm\", KERNEL==\"card[0-9]\", TAG+=\"mutter-device-preferred-primary\"
+RULEEOF
+chmod 0644 '$RULE'
+udevadm control --reload-rules
+udevadm trigger -s drm"
+    echo "primary GPU -> NVIDIA (card0). Takes effect at next login."
+    ;;
+  intel|default|reset)
+    if [ -e "$RULE" ]; then
+      run_root "set -e
+rm -f '$RULE'
+udevadm control --reload-rules
+udevadm trigger -s drm"
+    fi
+    echo "primary GPU -> stock mutter choice (Intel). Takes effect at next login."
+    ;;
+  status)
+    if [ -e "$RULE" ]; then echo "configured: NVIDIA (card0)  [$RULE]"
+    else echo "configured: stock mutter choice (no rule installed)"; fi
+    tag=$(udevadm info -q all -n /dev/dri/card0 2>/dev/null | grep -c 'mutter-device-preferred-primary' || true)
+    echo "udev tag live on card0: $([ "${tag:-0}" -gt 0 ] && echo yes || echo no)"
+    running=$(journalctl -b --no-pager 2>/dev/null | grep 'selected primary' | tail -1 || true)
+    echo "running session:  ${running#*gnome-shell*: }"
+    n=$(journalctl -b --no-pager 2>/dev/null | grep -c 'lock front buffer' || true)
+    echo "front-buffer failures this boot: ${n:-0}"
+    ;;
+  *) usage ;;
+esac

@@ -31,6 +31,18 @@ for d in org.gnome.Shell@ubuntu.service.d vte-spawn-.scope.d \
   install -m 0644 "$HERE/user-dropins/$d"/*.conf "$SYSD/$d/"
 done
 
+# session.slice is the last link in the cgroup chain between user@1000.service
+# and GNOME Shell. cgroup v2 caps a cgroup's memory protection by its parent's,
+# so this link needs a reservation too or the shell's MemoryMin/MemoryLow are
+# effectively zero and the compositor gets swapped out mid-frame (= jitter).
+# The system-level half of this chain is installed by setup.sh.
+echo "==> memory protection on session.slice"
+install -d -m 0755 "$SYSD/session.slice.d"
+install -m 0644 "$HERE/user-dropins/session.slice.d/50-memory-protection.conf" \
+        "$SYSD/session.slice.d/50-memory-protection.conf"
+systemctl --user daemon-reload
+systemctl --user set-property --runtime session.slice MemoryMin=1G MemoryLow=2G || true
+
 # Long-running background user services: cap them so a parked dev server can
 # never take the whole machine. Only units that actually exist are touched.
 echo "==> resource caps on background services"

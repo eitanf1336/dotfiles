@@ -1,0 +1,5 @@
+# Managed by `gpu-primary`. Makes mutter render on the NVIDIA dGPU instead of
+# the Intel iGPU, so the HDMI monitor is scanned out directly rather than
+# CPU-copied across GPUs (the cause of the periodic screen jitter).
+# Remove with: gpu-primary intel
+ENV{ID_PATH}=="pci-0000:01:00.0", SUBSYSTEM=="drm", KERNEL=="card[0-9]", TAG+="mutter-device-preferred-primary"

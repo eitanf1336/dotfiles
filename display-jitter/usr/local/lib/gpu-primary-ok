@@ -1,0 +1,16 @@
+#!/bin/bash
+# Clear gpu-primary-guard's boot-failure counter, but only once the desktop has
+# genuinely come up: graphical-session.target can be reached even when mutter is
+# dying, so wait and then ask GNOME Shell itself whether it is answering.
+set -u
+for _ in $(seq 1 24); do            # up to ~2 minutes
+  sleep 5
+  if gdbus call --session --dest org.gnome.Shell \
+       --object-path /org/gnome/Shell \
+       --method org.freedesktop.DBus.Properties.Get \
+       org.gnome.Shell ShellVersion >/dev/null 2>&1; then
+    echo 0 > /var/lib/gpu-primary/failcount 2>/dev/null || true
+    exit 0
+  fi
+done
+exit 0

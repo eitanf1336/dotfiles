@@ -195,6 +195,49 @@ level-triggered**, and only touches `power-saver`, so choosing a profile yoursel
 (including power-saver while plugged in) sticks until you physically replug.
 Unplugging is left entirely alone, since GNOME's low-battery rule owns that.
 
+## Cause 5: the shell's memory protection was silently zero (2026-09-02)
+
+`org.gnome.Shell@ubuntu.service` ships `MemoryMin=768M` and `MemoryLow=1.5G`,
+and Cause 3's work added more on top. All of it was doing nothing.
+
+In cgroup v2, memory protection is handed **down** the tree: a cgroup's
+effective `memory.min` / `memory.low` is capped by what its ancestors reserve.
+The chain here is
+
+```
+user.slice -> user-1000.slice -> user@1000.service -> session.slice -> org.gnome.Shell@ubuntu.service
+```
+
+and every link except the last had `memory.min = memory.low = 0`. So the shell's
+own numbers were clamped to **zero** and the kernel was free to page the
+compositor out — measured on 2026-09-02: 101 MB of `gnome-shell` swapped with
+325k major faults, on a box whose zram was 100% full. Every one of those
+swap-ins stalls a frame, which is indistinguishable from screen jitter.
+
+The fix is to reserve at each ancestor (`MemoryMin=1G`, `MemoryLow=2G`).
+Protection is only claimed by children that ask for it, so this shields GNOME
+Shell and nothing else — Chrome, Spotify and the Claude spares still get
+reclaimed first, which is the intent.
+
+Verify the whole chain, not just the leaf:
+
+```bash
+B=/sys/fs/cgroup
+for p in /user.slice /user.slice/user-1000.slice \
+         /user.slice/user-1000.slice/user@1000.service \
+         /user.slice/user-1000.slice/user@1000.service/session.slice \
+         /user.slice/user-1000.slice/user@1000.service/session.slice/org.gnome.Shell@ubuntu.service; do
+  echo "$p min=$(cat $B$p/memory.min) low=$(cat $B$p/memory.low)"
+done
+grep VmSwap /proc/$(pgrep -x gnome-shell)/status   # want 0
+```
+
+A non-zero leaf with zero ancestors is the failure mode, and it looks completely
+correct if you only ever check the leaf. Related: `../display-jitter/README.md`,
+which covers the *other* cause of the same visual symptom.
+
+---
+
 ## Reproduce (fresh machine)
 
 ```bash
