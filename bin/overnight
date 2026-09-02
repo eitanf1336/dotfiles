@@ -815,7 +815,8 @@ def hold_awake():
         log("systemd-inhibit is missing - cannot stop the machine idling out")
         return False
     p = subprocess.Popen(
-        ["systemd-inhibit", "--what=idle", "--who=overnight",
+        ["systemd-inhibit", "--what=idle:handle-lid-switch",
+         "--who=overnight",
          "--why=seeing a group of Claude chats through to the end",
          "--mode=block", "sleep", "infinity"],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
