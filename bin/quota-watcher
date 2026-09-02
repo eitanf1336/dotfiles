@@ -40,6 +40,7 @@ Options:
 import errno
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -54,6 +55,9 @@ STATE = os.path.join(DIR, "state.json")
 LOG = os.path.join(DIR, "watcher.log")
 COURIER_LOG = os.path.join(DIR, "courier.log")
 RESUME_LOG = os.path.join(DIR, "resume.log")
+SLEEP_FILE = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")),
+    "sleep-mode", "sleeping")
 PAUSED_FILE = os.path.join(
     os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")),
     "claude-pause", "paused.json")
@@ -84,11 +88,12 @@ def park_message(remaining, threshold, comeback, grace_min):
 The shared 5-hour Claude quota is down to about {remaining:.0f}% left, and this machine parks every session at {threshold:.0f}% so that none of us dies mid-sentence. Nothing has gone wrong and nothing is being thrown away.
 
 What to do, in this order:
-1. Finish the tool call you are in the middle of, or abandon it, whichever leaves less mess. Do not start another one.
-2. Leave the work pickup-able cold: save files, commit if that is your habit.
-3. Deal with anything you have running in the background. A background shell command does NOT survive this: your process is what dies, so the command is either killed with it or left orphaned with nobody reading its output, and the session that resumes you will be told only that it cannot prove the command finished. So either wait for it if it is close, or kill it and say so, and name its output file in your note either way.
-4. In your reply, write one short paragraph saying exactly where you stopped, what you had established, and what the very next step is. This is the note you will be handed back later, so write it for someone with no memory of the last hour.
-5. End your turn. Do not start new work and do not spawn subagents.
+1. STOP YOUR SUB-AGENTS FIRST, before anything else. Any Agent/Task call you have running spends the same quota you are being parked to protect, and it dies with you in a few minutes anyway, so its work is lost either way. End them now, do not dispatch another, and do not wait for one to come back.
+2. Finish the tool call you are in the middle of, or abandon it, whichever leaves less mess. Do not start another one.
+3. Leave the work pickup-able cold: save files, commit if that is your habit.
+4. Deal with anything you have running in the background. A background shell command does NOT survive this: your process is what dies, so the command is either killed with it or left orphaned with nobody reading its output, and the session that resumes you will be told only that it cannot prove the command finished. So either wait for it if it is close, or kill it and say so, and name its output file in your note either way.
+5. In your reply, write one short paragraph saying exactly where you stopped, what you had established, and what the very next step is. This is the note you will be handed back later, so write it for someone with no memory of the last hour.
+6. End your turn. Do not start new work and do not spawn subagents.
 
 {comeback}
 
@@ -249,10 +254,44 @@ def live_sessions(working_only=False):
     return out
 
 
+def attached_to(short):
+    """Is he watching this chat right now? `claude attach <id>` is a real
+    process, so this is a straight answer. Stopping a chat he has open drops
+    his terminal back to the claude-c menu, which is the complaint he has
+    repeated most."""
+    if not short:
+        return False
+    try:
+        out = subprocess.run(["pgrep", "-af", f"claude attach {short}"],
+                             capture_output=True, text=True, timeout=10)
+        return bool(out.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def he_is_away():
+    """The sleep switch, or a desktop that has been idle a while. Unsure counts
+    as present: hands off."""
+    if os.path.exists(SLEEP_FILE):
+        return True
+    try:
+        out = subprocess.run(
+            ["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.IdleMonitor",
+             "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
+             "--method", "org.gnome.Mutter.IdleMonitor.GetIdletime"],
+            capture_output=True, text=True, timeout=10)
+        return int(re.search(r"(\d+)", out.stdout).group(1)) > 15 * 60 * 1000
+    except Exception:
+        return False
+
+
 def stop_agent(a):
     """`claude stop` keeps the conversation and drops the process. It only
     speaks for background sessions, so an interactive one (which we only get
     here when the user asked for --kill-interactive) falls back to a TERM."""
+    if attached_to(short_of(a)) and not he_is_away():
+        log(f"{short_of(a)} ({label(a)}): he is attached to it, leaving it alone")
+        return False
     if is_bg(a):
         try:
             out = subprocess.run([CLAUDE, "stop", short_of(a)],
@@ -479,12 +518,30 @@ def wake_credentials():
         pass
 
 
-def account_headroom():
+def fresh_limits():
+    """The live usage picture, read past the cache.
+
+    claude-limits caches a good reading for 90 seconds and an account switch
+    takes about four, so the ordinary read hands back the OLD account's
+    headroom under the new account's name. On 2026-09-01 that wrote off an
+    account with 97% free as dry and left a whole group parked for two hours.
+    Anything taken right after a switch has to come through here."""
+    exe = shutil.which("claude-limits") or os.path.join(HOME, ".local/bin/claude-limits")
+    out = subprocess.run([exe, "--json", "--fresh"], capture_output=True,
+                         text=True, timeout=60, check=True,
+                         env=dict(os.environ, CLAUDE_LIMITS_TTL="0"))
+    data = json.loads(out.stdout)
+    if (data.get("_claude_limits") or {}).get("cached"):
+        raise RuntimeError("only a cached reading came back")
+    return data
+
+
+def account_headroom(fresh=False):
     """(remaining%, resets_at, weekly_blocker) for the account that is live
     right now, refreshing a stale token once before giving up."""
     for attempt in (1, 2):
         try:
-            data = limits()
+            data = fresh_limits() if fresh else limits()
         except Exception as e:
             if attempt == 1:
                 log(f"limits unreadable ({e}) - waking the credentials")
@@ -536,7 +593,8 @@ def rotate(cfg, st):
         if not switch_account(name):
             exhausted[name] = now + 900             # try again in 15 min
             continue
-        rem, resets, weekly = account_headroom()
+        wake_credentials()          # a parked slot's token has gone stale
+        rem, resets, weekly = account_headroom(fresh=True)
         if rem is None:
             log(f"rotate: {name} would not report its usage - backing out")
             exhausted[name] = now + 1800
@@ -616,6 +674,7 @@ def cmd_tick(argv):
 
     threshold = float(cfg.get("threshold", 10))
     grace = int(cfg.get("grace", 300))
+    floor = float(cfg.get("floor", 6))
     working_only = bool(cfg.get("working_only"))
     rotating = bool(cfg.get("rotate"))
     st = state()
@@ -658,6 +717,22 @@ def cmd_tick(argv):
         soon = phase != "armed" or remaining <= threshold + 25
         st = set_state(fails=0, remaining=remaining,
                        next_poll_at=now + (60 if soon else 300))
+    # Four Opus chats went from 10% to 3% during one five minute grace window,
+    # so a flat percentage is not enough: whatever the group is spending per
+    # minute, the grace has to fit inside what is left, with the floor under it.
+    if not dry and remaining is not None:
+        prev_t, prev_r = st.get("burn_at"), st.get("burn_from")
+        if prev_t and prev_r is not None:
+            dt = (now - float(prev_t)) / 60.0
+            if 0.5 <= dt <= 20:
+                rate = max(0.0, (float(prev_r) - remaining) / dt)
+                st["burn"] = round(float(st.get("burn") or rate) * 0.5
+                                   + rate * 0.5, 3)
+        st["burn_at"], st["burn_from"] = now, remaining
+        write_json(STATE, st)
+    threshold = max(threshold,
+                    min(60.0, floor + float(st.get("burn") or 0)
+                        * (grace / 60.0 + 1)))
     eta = fmt_eta(resets_at - now) if resets_at else "the next reset"
     if dry:
         print(f"phase={phase}  {remaining:.0f}% left  threshold={threshold:.0f}%"
@@ -728,7 +803,11 @@ def cmd_tick(argv):
         still = [a for a in live_sessions(working_only)
                  if stoppable(a, kill_int)]
         elapsed = now - float(st.get("warned_at") or now)
-        if still and elapsed < grace:
+        out_of_time = remaining <= floor
+        if out_of_time and not dry:
+            log(f"only {remaining:.0f}% left - forcing the park now rather "
+                f"than waiting out the grace")
+        if still and not out_of_time and elapsed < grace:
             if dry:
                 print(f"{len(still)} still live, "
                       f"{fmt_eta(grace - elapsed)} of grace left")
@@ -795,7 +874,7 @@ def try_rotate_and_resume(cfg, st, now):
         due = float(st.get("retry_rotate_at") or 0)
         log(f"no account has headroom - waiting {fmt_eta(due - now)}")
         return 0
-    rem, _, _ = account_headroom()
+    rem, _, _ = account_headroom(fresh=True)
     return finish_resume(cfg, state(), name, rem, now)
 
 
