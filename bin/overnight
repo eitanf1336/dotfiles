@@ -1661,11 +1661,10 @@ def cmd_check(argv):
     for m in st.get("members", []):
         if m.get("status") in ("done", "stuck"):
             continue
-        if m["short"] not in by_id and m["sid"] not in attached \
-                and st.get("phase") == "armed":
-            alerts.append(f"ALERT {m['name']} ({m['short']}) is not in the "
-                          f"agent list - he cannot open it")
-        elif member_working(m, live):
+        # Not being in the agent list is NORMAL now: a chat resumed in place
+        # runs headless and only re-registers when it is attached again. What
+        # matters is whether it is still moving, which is checked below.
+        if member_working(m, live):
             working += 1
         elif now - float(m.get("last_working") or now) > 20 * 60 \
                 and st.get("phase") == "armed":
