@@ -9,9 +9,11 @@ if [ "$(id -u)" -ne 0 ]; then echo "Run as root: sudo bash $0"; exit 1; fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_USER="${SUDO_USER:-eitan}"
 
-echo "==> udev rule: NVIDIA as mutter's preferred primary GPU"
-install -D -m 0644 "$HERE/etc/udev/rules.d/61-mutter-primary-gpu.rules" \
-        /etc/udev/rules.d/61-mutter-primary-gpu.rules
+echo "==> udev rule: no DRM format modifiers on the NVIDIA dGPU"
+# NOT the preferred-primary rule: making NVIDIA primary fixed the HDMI monitor
+# and made the two DisplayLink dock screens unusable. See README.md.
+install -D -m 0644 "$HERE/etc/udev/rules.d/62-mutter-nvidia-no-modifiers.rules" \
+        /etc/udev/rules.d/62-mutter-nvidia-no-modifiers.rules
 udevadm control --reload-rules
 udevadm trigger -s drm
 

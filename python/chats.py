@@ -1102,6 +1102,7 @@ class App:
         # normal Enter path means live agents attach and dead ones resume,
         # exactly as they would by hand.
         self._auto_open = bool(auto_open and select_id)
+        self._select_tries = 0   # the chat list can still be loading pass 1
 
     def _blocking_getch(self):
         self.stdscr.timeout(-1)
@@ -1868,7 +1869,14 @@ class App:
                         self.sel = i
                         found = True
                         break
-                self._positioned = True
+                self._select_tries += 1
+                # Keep looking for a few passes: the live-agent scan is still
+                # settling on the first draw, so a chat can be missing from the
+                # rows for a moment and then appear. Giving up on pass 1 is what
+                # made session restore land on the board instead of the chat.
+                give_up = self._select_tries >= 20
+                if found or give_up:
+                    self._positioned = True
                 # Only auto-open when the chat was actually located. Without
                 # this, a stale id would leave the cursor on row 0 and Enter
                 # would open somebody else's conversation.
@@ -1877,7 +1885,8 @@ class App:
                     # Same code path as a real Enter keypress on the selection.
                     if not self.handle_key(curses.KEY_ENTER, nav):
                         return
-                self._auto_open = False
+                elif self._auto_open and give_up:
+                    self._auto_open = False
             if self._reselect_id is not None:
                 for i, ri in enumerate(nav):
                     if rows[ri][0] == "chat" and rows[ri][1]["id"] == self._reselect_id:
@@ -2859,6 +2868,13 @@ def main():
     proj_arg = " ".join(rest).strip() or None
 
     boot_view = _KEEP_PROJECT
+    if boot_open:
+        # Restore opens by id, and the board's persisted project filter would
+        # happily hide that chat. Show all projects so it is always findable.
+        # None is the "All projects" value here — the "__all__" string is only
+        # how it is spelled in the persisted json, and passing that through as a
+        # project key selects a project by that literal name, i.e. nothing.
+        boot_view = None
     if proj_arg:
         ok, key, matches = resolve_project(proj_arg)
         if not ok:

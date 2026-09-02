@@ -35,17 +35,32 @@ Failed to lock front buffer on /dev/dri/card1: gbm_surface_lock_front_buffer fai
 Every one of those is a dropped/garbled frame. **100% of them were on `card1`**,
 the GPU with no displays attached. That is the jitter.
 
-## The fix
+## What did NOT work: making NVIDIA the primary GPU
 
-Tag the NVIDIA card so mutter uses it as the primary render device
-(`etc/udev/rules.d/61-mutter-primary-gpu.rules`). The main monitor then becomes
-a direct scanout with no cross-GPU copy at all. The DisplayLink screens still
-get CPU copies, but that is inherent to USB display adapters and was never the
-part that failed.
+The obvious fix is to tag the NVIDIA card `mutter-device-preferred-primary`, so
+the main monitor is a direct scanout with no cross-GPU copy. Tried it on
+2026-09-03. It **worked** on the target: front-buffer failures went from ~5/hour
+to zero and the HDMI monitor was clean.
 
-Costs nothing in power: `NVreg_DynamicPowerManagement=0x00` already keeps the
-dGPU awake (see `../nvidia/README.md` — it is there to avoid a D3cold GSP
-crash), so the card was running regardless.
+It also made the two DisplayLink dock screens unusable — the pointer barely
+moved on them. Flipping the primary GPU does not remove the copy, it moves it:
+the dock screens go from Intel -> evdi (fine) to NVIDIA -> evdi, and the
+proprietary driver's readback for a secondary device is far slower than the
+Intel one. Two working screens are worth more than one perfect one, so this is
+reverted. `gpu-primary nvidia` still exists if it is ever worth revisiting.
+
+## The fix actually in place
+
+Keep Intel primary, and tell mutter not to use DRM format modifiers on the
+NVIDIA device (`etc/udev/rules.d/62-mutter-nvidia-no-modifiers.rules`). mutter
+ships this same tag in `/lib/udev/rules.d/61-mutter.rules` for GPUs whose
+modifiers it cannot rely on. The theory: the shared-framebuffer setup already
+says "Not hardware accelerated", and without modifiers both drivers fall back to
+a plain linear layout that the primary can actually lock.
+
+The dock screens are untouched by this, because their path (Intel -> evdi) does
+not involve the NVIDIA device at all. So the worst case is no change, not a
+regression.
 
 Switch it at any time:
 

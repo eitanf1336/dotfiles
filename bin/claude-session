@@ -39,6 +39,7 @@ from pathlib import Path
 HOME = Path.home()
 STATE = HOME / ".claude" / "chats-session"
 SESSION = STATE / "session.json"
+HISTORY = STATE / "history"
 LAYOUT = STATE / "tiler-layout.json"   # written by the Terminal Tiler extension
 TERMINAL = "terminator"
 BUS = ("--session", "--dest", "org.gnome.Shell",
@@ -145,7 +146,58 @@ def save():
     tmp = SESSION.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, indent=2))
     tmp.replace(SESSION)                       # atomic: never a half-written file
+
+    # Keep a history as well. Without it the save timer wipes the useful
+    # snapshot within a minute of logging back in: by then the chats are gone,
+    # so it faithfully records "nothing was open" over the thing you wanted
+    # restored. restore() picks the last snapshot from BEFORE this boot.
+    try:
+        HISTORY.mkdir(parents=True, exist_ok=True)
+        (HISTORY / f"{int(payload['saved'])}.json").write_text(
+            json.dumps(payload, indent=2))
+        old = sorted(HISTORY.glob("*.json"))
+        for stale in old[:-40]:
+            stale.unlink()
+    except OSError:
+        pass
     return entries
+
+
+def boot_time():
+    try:
+        up = float(Path("/proc/uptime").read_text().split()[0])
+        return time.time() - up
+    except (OSError, ValueError):
+        return 0.0
+
+
+def last_pre_boot_session():
+    """The newest saved snapshot that still had chats in it AND was written
+    before this boot. That is the one describing the desktop you left behind;
+    anything written after the boot describes the empty desktop you came back
+    to."""
+    cutoff = boot_time()
+    best = None
+    try:
+        files = sorted(HISTORY.glob("*.json"))
+    except OSError:
+        files = []
+    for f in files:
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if not d.get("chats"):
+            continue
+        if d.get("saved", 0) <= cutoff:
+            best = d
+    if best:
+        return best
+    try:
+        d = json.loads(SESSION.read_text())
+        return d if d.get("chats") else None
+    except (OSError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------- restore
@@ -197,9 +249,8 @@ def _place(chat_id, where):
 
 def plan():
     """The chats to reopen, in the order their columns should be spawned."""
-    try:
-        data = json.loads(SESSION.read_text())
-    except (OSError, ValueError):
+    data = last_pre_boot_session()
+    if not data:
         return []
     where = placements()
     out = []
@@ -245,13 +296,12 @@ def restore():
 # ------------------------------------------------------------------- list
 
 def show():
-    try:
-        data = json.loads(SESSION.read_text())
-    except (OSError, ValueError):
+    data = last_pre_boot_session()
+    if not data:
         print("no saved session")
         return 1
     age = int(time.time() - data.get("saved", 0))
-    print(f"saved {age}s ago -> {SESSION}")
+    print(f"restoring the snapshot from {age}s ago ({len(data.get('chats') or [])} chats)")
     if not LAYOUT.exists():
         print("(no tiler layout yet — it is written at logout, so the first "
               "restore comes back untiled)")
