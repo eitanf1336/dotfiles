@@ -461,10 +461,21 @@ CHAT_STORE = os.path.join(HOME, ".claude/chats")
 # this the chat drops out of its category and its project and he cannot find it
 # in the board any more - which is exactly how it looks when a chat "vanishes".
 CHAT_FILES = ("categories.json", "chat_projects.json", "names.json")
+# claude-c hides a chat whose id appears here, so a continuation does not show
+# up beside the conversation it continues. It already maintains this file for
+# its own re-opens; anything else that mints a new session id has to as well,
+# or the board fills with copies of one chat under one name.
+SUPERSEDED = os.path.join(CHAT_STORE, "superseded.json")
 
 
 def inherit_chat_metadata(old_sid, new_sid):
     carried = []
+    if old_sid != new_sid:
+        sup = read_json(SUPERSEDED, {})
+        if sup.get(old_sid) != new_sid:
+            sup[old_sid] = new_sid
+            write_json(SUPERSEDED, sup)
+            carried.append("superseded")
     for fn in CHAT_FILES:
         path = os.path.join(CHAT_STORE, fn)
         data = read_json(path, None)

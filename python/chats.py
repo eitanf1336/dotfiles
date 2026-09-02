@@ -326,7 +326,10 @@ SUPERSEDED_STORE = HOME / ".claude" / "chats" / "superseded.json"
 
 
 def load_superseded():
-    return _load_json(SUPERSEDED_STORE)
+    # A chat can never supersede itself, and an entry saying it does hides a
+    # live chat from the board for good. Seven of those were found on
+    # 2026-09-02, three of them over chats that were running at the time.
+    return {k: v for k, v in _load_json(SUPERSEDED_STORE).items() if k != v}
 
 
 # Diagnostic tracing for the "Ctrl+Z sometimes stops a live agent" report.
