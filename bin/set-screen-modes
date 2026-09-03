@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""set-screen-modes — pin each monitor to a chosen refresh rate at login.
+
+Why this exists rather than just saving it in GNOME's display settings: the
+refresh rates here are not a preference, they are the fix for the main screen's
+jitter, and asking mutter to persist them did nothing (`monitors.xml` was not
+even touched). So they are re-applied explicitly every login.
+
+The finding, measured 2026-09-03:
+
+    dock screens at 60Hz   1.40 front-buffer failures/min on the MAIN screen
+    dock screens at 50Hz   0.00 over ten minutes (60Hz rate predicted ~14)
+
+The desktop is rendered on the Intel GPU and copied to every screen that is not
+on it: two DisplayLink screens and the NVIDIA-driven main monitor. With all of
+them at 60Hz those copies are demanded in lockstep on every frame and the
+renderer periodically has no free buffer, which is the corruption. Detuning the
+dock screens to 50Hz breaks the lockstep. Note the CPU cost did NOT change
+(DisplayLinkManager stayed at ~72% of a core), so this is about frame-timing
+collisions, not load.
+
+MODES below is the exact combination that measured zero. The main screen's
+120Hz is part of that tested state, so it is pinned too rather than left to
+drift back.
+
+  set-screen-modes            apply the pinned modes
+  set-screen-modes --show     print what each screen is running now
+"""
+
+import sys
+
+import gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib          # noqa: E402
+
+# connector -> mode id. Anything not listed is left alone.
+MODES = {
+    "DVI-I-1": "1920x1080@50.000",     # DisplayLink, detuned off 60 on purpose
+    "DVI-I-2": "1920x1080@50.000",     # DisplayLink, detuned off 60 on purpose
+    "HDMI-1": "2560x1440@119.998",     # main screen, part of the tested state
+}
+
+
+def proxy():
+    return Gio.DBusProxy.new_for_bus_sync(
+        Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, None,
+        "org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+        "org.gnome.Mutter.DisplayConfig", None)
+
+
+def state(p):
+    return p.call_sync("GetCurrentState", None,
+                       Gio.DBusCallFlags.NONE, -1, None).unpack()
+
+
+def main():
+    p = proxy()
+    serial, monitors, logicals, _ = state(p)
+    by_connector = {m[0][0]: m for m in monitors}
+
+    if "--show" in sys.argv[1:]:
+        for spec, modes, _props in monitors:
+            cur = [m for m in modes if m[6].get("is-current")]
+            if cur:
+                want = MODES.get(spec[0])
+                mark = ""
+                if want:
+                    mark = "  (pinned)" if cur[0][0] == want else f"  (want {want})"
+                print(f"  {spec[0]:<10} {cur[0][1]}x{cur[0][2]} @ "
+                      f"{cur[0][3]:.1f}Hz{mark}")
+        return 0
+
+    config, changed = [], []
+    for x, y, scale, transform, primary, specs, _props in logicals:
+        entries = []
+        for connector, _v, _p, _s in specs:
+            mon = by_connector.get(connector)
+            if not mon:
+                continue
+            current = next((m[0] for m in mon[1] if m[6].get("is-current")), None)
+            wanted = MODES.get(connector)
+            # Only ask for a mode the monitor actually offers; EDIDs differ
+            # between docks, and a bad id would fail the whole apply.
+            if wanted and any(m[0] == wanted for m in mon[1]):
+                if wanted != current:
+                    changed.append(f"{connector} {current} -> {wanted}")
+                current = wanted
+            if current:
+                entries.append((connector, current, {}))
+        if entries:
+            config.append((x, y, scale, transform, primary, entries))
+
+    if not changed:
+        print("already on the pinned modes")
+        return 0
+
+    p.call_sync("ApplyMonitorsConfig",
+                GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})",
+                             (serial, 1, config, {})),
+                Gio.DBusCallFlags.NONE, -1, None)
+    for line in changed:
+        print(f"  {line}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except GLib.Error as e:
+        print(f"set-screen-modes: {e.message}", file=sys.stderr)
+        sys.exit(1)

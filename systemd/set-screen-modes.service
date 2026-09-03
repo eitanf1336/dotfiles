@@ -1,0 +1,15 @@
+[Unit]
+Description=Pin monitor refresh rates (the fix for the main screen's jitter)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+# The outputs are not all up the instant the session target is reached, and a
+# mode id for a monitor mutter has not enumerated yet would fail the apply.
+ExecStartPre=/bin/sleep 12
+ExecStart=%h/bin/set-screen-modes
+RemainAfterExit=yes
+
+[Install]
+WantedBy=graphical-session.target

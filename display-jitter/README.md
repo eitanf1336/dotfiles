@@ -35,6 +35,52 @@ Failed to lock front buffer on /dev/dri/card1: gbm_surface_lock_front_buffer fai
 Every one of those is a dropped/garbled frame. **100% of them were on `card1`**,
 the GPU with no displays attached. That is the jitter.
 
+## SOLVED (2026-09-03): detune the DisplayLink screens to 50Hz
+
+Everything below this section is the record of chasing the wrong GPU. The
+actual cause was found by testing rather than reasoning: stop the DisplayLink
+daemon and count.
+
+```
+DisplayLink running   7 front-buffer failures / 5 min
+DisplayLink stopped   0 failures / 2 min
+```
+
+It was never the NVIDIA hand-off. With the dock screens out of the picture the
+main screen was clean. Then, with them back but detuned:
+
+```
+dock screens @ 60Hz   1.40 failures/min
+dock screens @ 50Hz   0.00 over ten minutes   (60Hz rate predicted ~14)
+```
+
+**And DisplayLinkManager's CPU did not change** (~72% of a core either way). So
+this is not a load problem, it is a frame-timing one: with every screen at
+60Hz, all three copies off the Intel primary are demanded in lockstep on every
+frame and the renderer periodically has no free buffer. Running the dock
+screens at 50Hz breaks the lockstep, and a 17% refresh change removes 100% of
+the failures at identical CPU cost.
+
+Applied by `bin/set-screen-modes` + `systemd/set-screen-modes.service` at every
+login, because asking mutter to persist it did nothing (`monitors.xml` was not
+even written). `set-screen-modes --show` prints what is running and whether it
+matches. The pinned set is the exact combination that measured zero, main
+screen at 120Hz included.
+
+The cost is that two 1080p side monitors run at 50Hz instead of 60, which is
+invisible on a desktop. `jitter-watch` stays enabled as a safety net and now
+has nothing to do.
+
+## The lesson
+
+Three GPU-level fixes were attempted before anyone measured which component was
+actually responsible, and two of them broke a working setup: NVIDIA-primary
+killed the dock screens, and disabling DRM format modifiers left the main
+monitor black at boot. A single two-minute experiment (stop the daemon, count
+the failures) identified the real cause and pointed straight at a fix that
+costs nothing and risks nothing. Measure which part is guilty before changing
+any part.
+
 ## What did NOT work: making NVIDIA the primary GPU
 
 The obvious fix is to tag the NVIDIA card `mutter-device-preferred-primary`, so
