@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Paint
+Comment=MS Paint
+Exec=/home/eitan/bin/paint
+Icon=/home/eitan/.local/share/icons/webapps/paint.png
+Terminal=false
+StartupWMClass=chrome-jspaint.app__-Default
+Categories=Graphics;2DGraphics;RasterGraphics;
+StartupNotify=true

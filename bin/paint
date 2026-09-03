@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Paint. Actual MS Paint, not a "paint-inspired" GNOME app: JS Paint is a
+# pixel-faithful remake of the Windows tool (same toolbox, same palette strip,
+# same File menu), running in Chrome --app mode so it looks like a normal
+# desktop window with its own dock icon.
+#
+# Dedicated Chrome profile (--user-data-dir) for the same reason Gmail/Gemini
+# have one: with the default profile a running Chrome absorbs the --app window
+# and it gets grouped under the Chrome icon. A separate profile forces its own
+# instance and app_id. It also lets the service worker cache the whole app, so
+# it works with no network after the first launch.
+URL="https://jspaint.app/"
+PROFILE="$HOME/.local/share/paint-app"
+setsid -f /usr/bin/google-chrome \
+  --app="$URL" \
+  --user-data-dir="$PROFILE" \
+  --class=Paint \
+  --name=Paint \
+  "$@" \
+  >/dev/null 2>&1
