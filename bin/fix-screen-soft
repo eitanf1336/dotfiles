@@ -245,7 +245,7 @@ def main():
     print(f"resetting {target}: {how}")
     try:
         apply(p, serial, TEMPORARY, nudged)
-        time.sleep(0.5)
+        time.sleep(0.25)
     finally:
         # Always put it back, even if the step above raised. The serial changes
         # once a config is applied, so re-read it before restoring.

@@ -44,18 +44,24 @@ import time
 from collections import deque
 from pathlib import Path
 
-# Tuned against every episode actually observed on this machine:
-#   visible:   02:18:30 + 02:18:53 (23s apart)
-#              11:41:11, 11:42:09, 11:42:31 (3 spread over 80s)
-#   harmless:  02:30:21 -> 02:32:40 (139s), 02:34:16 -> 02:37:41 (205s)
-# A pair inside 90s covers both visible episodes and none of the quiet ones.
-# Earlier settings (4/20s, then 3/60s) were both too tight and let real bursts
-# through, which is the failure mode that matters: a spurious reset costs a
-# brief blank, a missed burst costs the thing this exists to prevent.
-# Override without editing: JITTER_BURST / JITTER_WINDOW / JITTER_COOLDOWN.
-BURST = int(os.environ.get("JITTER_BURST", 2))
+# Fire on EVERY failure. Three tunings went the other way (4-in-20s, 3-in-60s,
+# 2-in-90s), all built on the idea that a lone dropped frame is invisible and
+# only clusters matter. That idea is wrong, and the data that killed it is:
+#
+#   failures at 11:47:32, 11:49:21, 11:51:02  -- ~100s apart, no cluster
+#   user, at that moment: "again it jitters"
+#
+# So the corruption is not a transient flicker that a cluster makes visible. It
+# is persistent: one failure dirties the screen and it STAYS dirty until a
+# modeset clears it, which is why this needed a keypress in the first place. A
+# single failure is therefore already a visible defect, and waiting for a
+# second one just means staring at the first.
+#
+# The cooldown alone prevents thrashing. Override with JITTER_BURST /
+# JITTER_WINDOW / JITTER_COOLDOWN.
+BURST = int(os.environ.get("JITTER_BURST", 1))
 WINDOW = float(os.environ.get("JITTER_WINDOW", 90))
-COOLDOWN = float(os.environ.get("JITTER_COOLDOWN", 60))
+COOLDOWN = float(os.environ.get("JITTER_COOLDOWN", 20))
 
 PATTERN = re.compile(r"lock front buffer|gbm_surface_lock_front_buffer")
 FIX = str(Path.home() / "bin" / "fix-screen-soft")

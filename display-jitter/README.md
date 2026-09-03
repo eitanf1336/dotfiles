@@ -124,27 +124,28 @@ It calls **`fix-screen-soft`**, never `fix-screen`. That distinction is the
 whole reason it is safe to run automatically: the VT bounce would stop Spotify
 every time it fired.
 
-Thresholds come from the episodes actually observed on this machine, not from
-taste. A lone dropped frame is invisible; a cluster is what the eye catches.
+It fires on **every** failure, with only a cooldown to stop it thrashing.
+
+Three earlier tunings (4-in-20s, 3-in-60s, 2-in-90s) all assumed a lone dropped
+frame is invisible and only clusters matter. That assumption was wrong, and
+this is the observation that killed it:
 
 ```
-visible    02:18:30 + 02:18:53                 23s apart
-visible    11:41:11, 11:42:09, 11:42:31        3 spread over 80s
-harmless   02:30:21 -> 02:32:40                139s apart
-harmless   02:34:16 -> 02:37:41                205s apart
+failures at 11:47:32, 11:49:21, 11:51:02   ~100s apart, no cluster at all
+user at that moment:                        "again it jitters"
 ```
 
-A **pair inside 90 seconds** separates those cleanly, so that is the trigger,
-with a 60s cooldown. Two earlier settings (4-in-20s, then 3-in-60s) were both
-too tight and let real bursts straight through. That is the failure mode that
-matters: a spurious reset costs a brief blank, a missed burst costs the thing
-this exists to prevent. `JITTER_BURST` / `JITTER_WINDOW` / `JITTER_COOLDOWN`
-override without a code edit.
+The corruption is not a transient flicker that needs repeating to be seen. It
+is **persistent**: one failure dirties the screen and it stays dirty until a
+modeset clears it. That is precisely why this ever needed a keypress. So a
+single failure is already a visible defect, and every "wait for a second one"
+threshold just meant staring at the first.
 
 A correction worth recording: the soft reset was briefly written off as useless
-because failures still appeared in the log after it ran. They did, but they
-were isolated singles, not bursts. Counting raw failures instead of clusters
-made a working fix look broken. Judge this by burst pattern, not by count.
+because failures still appeared in the log after it ran. They did, and that is
+expected. The reset clears the corruption already on screen; it does not stop
+new failures happening. Judging the remedy by whether failures stopped was the
+wrong test entirely.
 
 Turn it off with `systemctl --user disable --now jitter-watch`.
 
