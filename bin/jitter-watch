@@ -36,6 +36,7 @@ rate is isolated singles minutes apart. So:
 Turn it off with:  systemctl --user disable --now jitter-watch
 """
 
+import os
 import re
 import subprocess
 import sys
@@ -43,9 +44,18 @@ import time
 from collections import deque
 from pathlib import Path
 
-BURST = 3        # failures required...
-WINDOW = 60.0    # ...within this many seconds (a measured visible burst was 3/47s)
-COOLDOWN = 45.0  # and at most one reset per this many seconds
+# Tuned against every episode actually observed on this machine:
+#   visible:   02:18:30 + 02:18:53 (23s apart)
+#              11:41:11, 11:42:09, 11:42:31 (3 spread over 80s)
+#   harmless:  02:30:21 -> 02:32:40 (139s), 02:34:16 -> 02:37:41 (205s)
+# A pair inside 90s covers both visible episodes and none of the quiet ones.
+# Earlier settings (4/20s, then 3/60s) were both too tight and let real bursts
+# through, which is the failure mode that matters: a spurious reset costs a
+# brief blank, a missed burst costs the thing this exists to prevent.
+# Override without editing: JITTER_BURST / JITTER_WINDOW / JITTER_COOLDOWN.
+BURST = int(os.environ.get("JITTER_BURST", 2))
+WINDOW = float(os.environ.get("JITTER_WINDOW", 90))
+COOLDOWN = float(os.environ.get("JITTER_COOLDOWN", 60))
 
 PATTERN = re.compile(r"lock front buffer|gbm_surface_lock_front_buffer")
 FIX = str(Path.home() / "bin" / "fix-screen-soft")
@@ -86,7 +96,7 @@ def main():
             # Still settling from the last bounce; do not thrash the screens.
             continue
 
-        print(f"jitter-watch: {len(hits)} failures in {WINDOW:.0f}s "
+        print(f"jitter-watch: {len(hits)} failures within {WINDOW:.0f}s "
               f"-> soft-resetting the screen", flush=True)
         if test_mode:
             print("jitter-watch: [test] would run fix-screen-soft", flush=True)
