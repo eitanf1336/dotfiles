@@ -112,7 +112,7 @@ Configs are applied with method=TEMPORARY, so `monitors.xml` is never written,
 and the restore is in a `finally` block. Verified live: layout came back
 byte-identical, and no VT switch appears in the journal.
 
-## `jitter-watch`, installed but OFF
+## `jitter-watch`, running
 
 `bin/jitter-watch` + `systemd/jitter-watch.service` follow the journal and run
 `fix-screen` automatically when a BURST of front-buffer failures appears (4
@@ -120,12 +120,22 @@ inside 20s, at most one bounce per 2 minutes). Deliberately conservative: a VT
 bounce flashes every screen, so firing on a single stray failure would be worse
 than the jitter.
 
-It presses the fix for you. It does not fix anything itself.
+It calls **`fix-screen-soft`**, never `fix-screen`. That distinction is the
+whole reason it is safe to run automatically: the VT bounce would stop Spotify
+every time it fired.
 
-**It is disabled**, because it was written when the only available remedy was
-the VT bounce, and having that fire automatically is worse than the jitter. If
-it is ever re-enabled it should call `fix-screen-soft`, not `fix-screen`. Turn
-it on with `systemctl --user enable --now jitter-watch`.
+Thresholds come from what a visible episode actually looks like in the log, not
+from taste. A lone dropped frame is invisible; a cluster is what the eye
+catches. A measured visible burst was **3 failures inside 47 seconds**, and the
+harmless background rate is isolated singles minutes apart. So it fires on 3
+inside 60s, at most once per 45s.
+
+A correction worth recording: the soft reset was briefly written off as useless
+because failures still appeared in the log after it ran. They did, but they
+were isolated singles, not bursts. Counting raw failures instead of clusters
+made a working fix look broken. Judge this by burst pattern, not by count.
+
+Turn it off with `systemctl --user disable --now jitter-watch`.
 
 The guard machinery that used to live here (`gpu-primary-guard`, the boot
 counter, the auto-revert) is gone too, since there is no rule left to guard.

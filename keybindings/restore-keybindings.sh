@@ -25,8 +25,16 @@ gsettings set "$k" command '/home/eitan/.local/bin/prompts gui'
 
 paths+=("/fix-screen/")
 k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/fix-screen/"
-gsettings set "$k" name 'Fix screen (reset displays)'
+gsettings set "$k" name 'Fix screen (soft, keeps audio)'
 gsettings set "$k" binding '<Super>F5'
+gsettings set "$k" command '/home/eitan/bin/fix-screen-soft'
+
+# The wholesale version: bounces the VT, which rebuilds every GPU surface. It
+# always clears the corruption but stops Spotify, so it is the fallback key.
+paths+=("/fix-screen-hard/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/fix-screen-hard/"
+gsettings set "$k" name 'Fix screen (hard VT bounce)'
+gsettings set "$k" binding '<Super><Shift>F5'
 gsettings set "$k" command '/home/eitan/bin/fix-screen'
 
 paths+=("/keys-cheatsheet/")

@@ -10,7 +10,8 @@ These are GNOME `media-keys` custom shortcuts. Restore them with `keybindings/re
 | Screenshot → copy path for Claude | `<Control><Alt>s` | `/home/eitan/bin/screenshot-claude` |
 | Screenshot → copy path for Claude | `Print` (PrtScr; built-in `show-screenshot-ui` freed) | `/home/eitan/bin/screenshot-claude` |
 | Prompts library (popup) | `<Control><Shift>p` | `/home/eitan/.local/bin/prompts gui` |
-| Fix screen (reset displays) | `<Super>F5` | `/home/eitan/bin/fix-screen` |
+| Fix screen (soft, keeps audio) | `<Super>F5` | `/home/eitan/bin/fix-screen-soft` |
+| Fix screen (hard VT bounce) | `<Super><Shift>F5` | `/home/eitan/bin/fix-screen` |
 | Keyboard shortcuts overlay | `<Super>k` | `/home/eitan/bin/keys-cheatsheet` |
 | DLNL Brightness Up | `<Super>equal` | `/home/eitan/.local/bin/brightness up` |
 | DLNL Brightness Up | `<Super>KP_Add` | `/home/eitan/.local/bin/brightness up` |
