@@ -8,7 +8,7 @@ These are GNOME `media-keys` custom shortcuts. Restore them with `keybindings/re
 | Ask Claude (popup) | `<Control><Alt>a` | `/home/eitan/.local/bin/claude-ask` |
 | Run one command (red border) | `<Control><Alt>r` | `/home/eitan/bin/run-once-term` |
 | Screenshot → copy path for Claude | `<Control><Alt>s` | `/home/eitan/bin/screenshot-claude` |
-| Screenshot → copy path for Claude | `Print` (PrtScr; built-in `show-screenshot-ui` freed) | `/home/eitan/bin/screenshot-claude` |
+| Screenshot → copy path for Claude | `<Shift>Print` (plain `Print` stays GNOME's screenshot UI — the only one with the record-video toggle) | `/home/eitan/bin/screenshot-claude` |
 | Prompts library (popup) | `<Control><Shift>p` | `/home/eitan/.local/bin/prompts gui` |
 | Fix screen (soft, keeps audio) | `<Super>F5` | `/home/eitan/bin/fix-screen-soft` |
 | Fix screen (hard VT bounce) | `<Super><Shift>F5` | `/home/eitan/bin/fix-screen` |

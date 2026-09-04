@@ -109,13 +109,16 @@ gsettings set "$k" name 'Screenshot → copy path for Claude'
 gsettings set "$k" binding '<Control><Alt>s'
 gsettings set "$k" command '/home/eitan/bin/screenshot-claude'
 
-# Repurpose plain PrtScr: free it from GNOME's built-in screenshot UI and
-# point it at screenshot-claude so Print copies the saved path to the clipboard.
-gsettings set org.gnome.shell.keybindings show-screenshot-ui "[]"
+# Plain PrtScr stays GNOME's own screenshot UI, because that overlay is the only
+# one with the record-video toggle; the portal screenshot screenshot-claude uses
+# hides it. Shift+PrtScr gets screenshot-claude instead, taking over the built-in
+# instant-fullscreen shot (which the UI already covers).
+gsettings set org.gnome.shell.keybindings show-screenshot-ui "['Print']"
+gsettings set org.gnome.shell.keybindings screenshot "[]"
 paths+=("/screenshot-claude-print/")
 k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/screenshot-claude-print/"
-gsettings set "$k" name 'Screenshot → copy path for Claude (PrtScr)'
-gsettings set "$k" binding 'Print'
+gsettings set "$k" name 'Screenshot → copy path for Claude (Shift+PrtScr)'
+gsettings set "$k" binding '<Shift>Print'
 gsettings set "$k" command '/home/eitan/bin/screenshot-claude'
 
 paths+=("/sunrise-alarm/")
