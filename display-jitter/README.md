@@ -1,3 +1,18 @@
+> **NOTHING HERE RUNS AUTOMATICALLY (2026-09-07).** Both background services
+> were removed at the user's request: `jitter-watch` fires on every logged
+> failure and that overshoots, resetting the screen far more often than the
+> jitter actually warrants. `set-screen-modes` is gone from startup too.
+>
+> What is left is manual only:
+>
+> * **Super+F5** runs `bin/fix-screen-soft` (refresh-rate flip, keeps audio)
+> * **Super+Shift+F5** runs `bin/fix-screen` (VT bounce, always works, stops
+>   Spotify)
+> * `bin/set-screen-modes` applies the 50Hz dock detune by hand if wanted
+>
+> The scripts are kept because they work when invoked. Do not re-enable either
+> service without the user asking for it.
+
 # Screen jitter: the actual cause, and the permanent fix
 
 For a year the laptop's screens would randomly start showing jittery graphical
