@@ -10,6 +10,22 @@
 >   Spotify)
 > * `bin/set-screen-modes` applies the 50Hz dock detune by hand if wanted
 >
+> **The 50Hz setting now lives in `~/.config/monitors.xml`, hand-written
+> (2026-09-07).** mutter would not persist it over D-Bus: `ApplyMonitorsConfig`
+> with method=PERSISTENT was accepted and the file was never touched. So the
+> two DVI-I (DisplayLink) monitor entries were edited to `<rate>50.000</rate>`
+> directly, in BOTH configuration blocks that can match this monitor set.
+>
+> There are two because evdi hands out DVI-I-1 and DVI-I-2 in a different order
+> between boots, so the same three screens match two stored blocks with the
+> serials swapped. Only one is live on any given boot. HDMI-1 is pinned to
+> 59.951 in both as well, because one of them had it at 119.998 and that is why
+> the main screen kept silently jumping to 120Hz.
+>
+> Caveat: changing anything in Settings -> Displays makes GNOME rewrite that
+> file and it may drop the 50Hz. If the jitter comes back after touching
+> display settings, that is why. `set-screen-modes --show` reports it.
+>
 > The scripts are kept because they work when invoked. Do not re-enable either
 > service without the user asking for it.
 
