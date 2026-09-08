@@ -39,6 +39,7 @@ Options:
 """
 import errno
 import json
+import math
 import os
 import re
 import shutil
@@ -730,9 +731,13 @@ def cmd_tick(argv):
                                    + rate * 0.5, 3)
         st["burn_at"], st["burn_from"] = now, remaining
         write_json(STATE, st)
-    threshold = max(threshold,
-                    min(60.0, floor + float(st.get("burn") or 0)
-                        * (grace / 60.0 + 1)))
+    # The threshold is exactly what he asked for, nothing clever. A predicted
+    # burn rate used to inflate it so the grace would always fit inside what
+    # was left, but a single heavy minute doubled the estimate and warned
+    # everyone 9 points early. He would rather it fire late and be TOLD than
+    # fire early: if the quota runs dry during the wind-down that is an
+    # acceptable outcome, and the report below tells him what to set instead.
+    # `burn` is still measured, purely to size that recommendation.
     eta = fmt_eta(resets_at - now) if resets_at else "the next reset"
     if dry:
         print(f"phase={phase}  {remaining:.0f}% left  threshold={threshold:.0f}%"
@@ -774,6 +779,7 @@ def cmd_tick(argv):
                                       max(1, grace // 60)), "park")
         send_to_sessions(untouched, wrapup_message(remaining, eta), "wrap-up")
         set_state(phase="warning", warned_at=now,
+                  warned_remaining=remaining,
                   targets=[{"sessionId": a.get("sessionId"), "id": a.get("id"),
                             "kind": a.get("kind"), "name": a.get("name")}
                            for a in parkable],
@@ -803,6 +809,8 @@ def cmd_tick(argv):
         still = [a for a in live_sessions(working_only)
                  if stoppable(a, kill_int)]
         elapsed = now - float(st.get("warned_at") or now)
+        st_warn_pct = st.get("warned_remaining")
+        st_warn_pct = float(st_warn_pct) if st_warn_pct is not None else None
         out_of_time = remaining <= floor
         if out_of_time and not dry:
             log(f"only {remaining:.0f}% left - forcing the park now rather "
@@ -832,10 +840,30 @@ def cmd_tick(argv):
         log(f"PAUSED: {len(record)} parked ({obeyed} had already stopped "
             f"themselves, {stopped} needed forcing), {remaining:.0f}% left, "
             f"reset in {eta}")
+        # He asked to be told when the wind-down cost more than the margin he
+        # set, so that next time he can just set a bigger number. This is the
+        # whole reason the threshold is allowed to be naive.
+        warned_at_pct = st_warn_pct
+        spent = (warned_at_pct - remaining) if warned_at_pct is not None else None
+        overran = spent is not None and remaining <= floor
+        advice = ""
+        if spent is not None and spent > 0:
+            need = math.ceil(threshold + spent - remaining + 1)
+            if overran:
+                advice = (f" The wind-down itself burned {spent:.0f}% and ran "
+                          f"the quota down to {remaining:.0f}%, under the {floor:.0f}% "
+                          f"floor. Nothing was lost, but the margin was too thin: "
+                          f"arm it at about {need}% next time.")
+                log(f"OVERRAN: warned at {warned_at_pct:.0f}%, parked at "
+                    f"{remaining:.0f}%, grace cost {spent:.0f}% - suggest "
+                    f"--threshold {need}")
+            else:
+                advice = (f" The wind-down cost {spent:.0f}%, leaving "
+                          f"{remaining:.0f}%.")
         notify("Claude sessions parked",
                f"{len(record)} session(s) parked at {remaining:.0f}% quota "
                f"left. {obeyed} stopped themselves when asked, {stopped} had "
-               f"to be forced.")
+               f"to be forced." + advice)
         # Nothing to wait for if another account can take them right now.
         if rotating:
             return try_rotate_and_resume(cfg, st, now)
