@@ -848,7 +848,9 @@ def cmd_tick(argv):
         overran = spent is not None and remaining <= floor
         advice = ""
         if spent is not None and spent > 0:
-            need = math.ceil(threshold + spent - remaining + 1)
+            # What he should have armed at: cover the whole wind-down,
+            # land clear of the floor, plus a point of slack.
+            need = int(math.ceil(spent + floor + 1))
             if overran:
                 advice = (f" The wind-down itself burned {spent:.0f}% and ran "
                           f"the quota down to {remaining:.0f}%, under the {floor:.0f}% "
