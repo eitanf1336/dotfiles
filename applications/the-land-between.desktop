@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=The Land Between
+Comment=The cutting room for the channel
+Exec=/home/eitan/TheLandBetween/cotube
+Icon=the-land-between
+Terminal=false
+Categories=AudioVideo;Video;
+StartupWMClass=chrome-127.0.0.1__7800-Default
