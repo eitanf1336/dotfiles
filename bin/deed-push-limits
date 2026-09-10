@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""deed-push-limits - send this account's Claude usage limits to the deed portal.
+
+The portal is a Cloudflare Worker and has no business holding an OAuth token,
+so the numbers are read here and pushed in. Three of them: the 5-hour session,
+the weekly total, and the model-scoped weekly (Fable).
+
+It MUST read the deed account, not whichever login happens to be active on this
+machine. claude-limits used to read ~/.claude unconditionally and reported the
+wrong account's usage as if it were this one, which is exactly the mistake this
+display would otherwise put on the client's screen.
+"""
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+
+DEED_CONFIG = os.path.expanduser("~/.claude-deed")
+CREDS = os.path.expanduser("~/.config/deed-portal/credentials")
+
+
+def portal_env():
+    """PORTAL_URL and AGENT_TOKEN, from the same file every other tool uses."""
+    env = {}
+    with open(CREDS, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[7:]
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+
+def main():
+    env = dict(os.environ, CLAUDE_CONFIG_DIR=DEED_CONFIG)
+    out = subprocess.run(["claude-limits", "--json"], capture_output=True,
+                         text=True, timeout=120, env=env)
+    if out.returncode != 0:
+        print("claude-limits failed:", out.stderr.strip()[:200], file=sys.stderr)
+        return 1
+    data = json.loads(out.stdout)
+    rows = [l for l in data.get("limits", [])
+            if l.get("kind") in ("session", "weekly_all", "weekly_scoped")]
+    if not rows:
+        print("no limits in the reading, not pushing", file=sys.stderr)
+        return 1
+
+    cfg = portal_env()
+    payload = json.dumps({"limits": rows}).encode()
+    req = urllib.request.Request(
+        cfg["PORTAL_URL"] + "/api/limits", data=payload,
+        headers={"Authorization": "Bearer " + cfg["AGENT_TOKEN"],
+                 "content-type": "application/json",
+                 "User-Agent": "Mozilla/5.0 deedwork/1.0"})
+    urllib.request.urlopen(req, timeout=60).read()
+    print(", ".join(f"{r['kind']} {r['percent']}%" for r in rows))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
