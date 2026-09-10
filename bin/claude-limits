@@ -32,11 +32,15 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 
-CRED = os.path.expanduser("~/.claude/.credentials.json")
+# Respect an alternate config dir. A session started with CLAUDE_CONFIG_DIR is
+# signed in to a DIFFERENT account, and reading ~/.claude here reported the wrong
+# account's usage as if it were this one (2026-09-10, cost a wrong answer).
+CONFIG_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+CRED = os.path.join(CONFIG_DIR, ".credentials.json")
 URL = "https://api.anthropic.com/api/oauth/usage"
 UA = "claude-cli/2.1.197 (claude-limits)"
 
-CACHE_DIR = os.path.expanduser("~/.claude/usage-cache")
+CACHE_DIR = os.path.join(CONFIG_DIR, "usage-cache")  # per account, never mix readings
 try:
     CACHE_TTL = float(os.environ.get("CLAUDE_LIMITS_TTL") or 90)
 except ValueError:

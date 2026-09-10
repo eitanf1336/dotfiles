@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# claude-deed - open the deed-portal chat on its OWN Claude account.
+#
+# The deed job burns quota fast enough to want its own billing account, but
+# Claude Code has one login per config directory, so isolation means a separate
+# config dir. ~/.claude-deed shares CLAUDE.md, skills, commands, prompts,
+# memory and transcripts with the main one by symlink; only .credentials.json
+# is its own. Launching without CLAUDE_CONFIG_DIR silently uses the main
+# account instead, which is the whole failure this script exists to prevent.
+set -euo pipefail
+SESSION=1c976435-dfde-4deb-90a9-6e02954c14e6
+export CLAUDE_CONFIG_DIR=~/.claude-deed
+if [ ! -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]; then
+  echo "No login in $CLAUDE_CONFIG_DIR yet: run /login once the chat opens." >&2
+fi
+exec claude --resume "$SESSION" "$@"

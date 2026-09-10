@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""claude-account-deed - swap which Claude account the DEED config dir uses.
+
+The deed portal work runs in its own config dir (~/.claude-deed) so it bills a
+separate account from the rest of the machine. `claude-account` swaps the MAIN
+login at ~/.claude and must never be pointed here: running it would move every
+other chat instead. This is its counterpart, and it touches nothing outside
+~/.claude-deed.
+
+The saved-account store is shared (~/.claude/accounts), so a login parked by
+either tool can be used by either. Only the live credentials differ.
+
+Usage:
+  claude-account-deed                list saved accounts, mark the deed one
+  claude-account-deed whoami         who the deed config is signed in as
+  claude-account-deed use <name>     point the deed config at a saved account
+  claude-account-deed save <name>    park the deed config's current login
+  claude-account-deed limits         usage for the deed account
+
+Switching is live: Claude re-reads credentials each turn, so an open deed chat
+moves accounts on its next message. It refuses while a deed session is mid-task
+unless you pass --force, because switching under a running task would bill the
+rest of it to the other account.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+DEED = os.path.join(HOME, ".claude-deed")
+CRED = os.path.join(DEED, ".credentials.json")
+CFG = os.path.join(DEED, ".claude.json")
+SLOTS = os.path.join(HOME, ".claude", "accounts")
+ACTIVE = os.path.join(DEED, ".active-account")
+IDENTITY_KEYS = ("oauthAccount", "userID")
+
+R, G, Y, B, X = "\033[31m", "\033[32m", "\033[33m", "\033[34m", "\033[0m"
+if not sys.stdout.isatty():
+    R = G = Y = B = X = ""
+
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def slots():
+    try:
+        return sorted(n for n in os.listdir(SLOTS)
+                      if os.path.isfile(os.path.join(SLOTS, n, "credentials.json")))
+    except OSError:
+        return []
+
+
+def email_of(path):
+    """The account's email, read from a slot's identity or a live config."""
+    try:
+        d = json.load(open(path, encoding="utf-8"))
+    except Exception:
+        return ""
+    acct = d.get("oauthAccount") or {}
+    return acct.get("emailAddress", "")
+
+
+def deed_email():
+    return email_of(CFG)
+
+
+def active_name():
+    try:
+        return open(ACTIVE, encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+
+
+def busy():
+    """Is a deed session mid-task right now?"""
+    try:
+        out = subprocess.run(["pgrep", "-af", "claude"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except Exception:
+        return False
+    return any("claude-deed" in ln or DEED in ln for ln in out.splitlines())
+
+
+def cmd_list():
+    cur = deed_email()
+    print(f"deed config: {B}{DEED}{X}")
+    print(f"signed in as: {G}{cur or '(nobody)'}{X}")
+    names = slots()
+    if not names:
+        die(f"{Y}No saved accounts in {SLOTS}.{X}")
+    print("\nsaved accounts:")
+    for n in names:
+        e = email_of(os.path.join(SLOTS, n, "identity.json"))
+        mark = f" {G}<- deed is using this{X}" if e and e == cur else ""
+        print(f"  {n:<10} {e or '(unknown)'}{mark}")
+
+
+def cmd_whoami():
+    print(deed_email() or "(nobody)")
+
+
+def cmd_use(name, force):
+    if name not in slots():
+        die(f"{R}No saved account called {name!r}.{X}\nSaved: {', '.join(slots()) or '(none)'}")
+    if busy() and not force:
+        die(f"{Y}A deed session is running. Switching now would bill the rest of its\n"
+            f"task to the other account. Finish it, or pass --force.{X}")
+    d = os.path.join(SLOTS, name)
+    # 1. credentials
+    os.makedirs(DEED, exist_ok=True)
+    if os.path.isfile(CRED):
+        shutil.copyfile(CRED, CRED + ".bak")
+        os.chmod(CRED + ".bak", 0o600)
+    shutil.copyfile(os.path.join(d, "credentials.json"), CRED)
+    os.chmod(CRED, 0o600)
+    # 2. identity, merged so everything else in the config survives
+    ident_path = os.path.join(d, "identity.json")
+    if os.path.isfile(ident_path):
+        ident = json.load(open(ident_path, encoding="utf-8"))
+        cfg = {}
+        if os.path.isfile(CFG):
+            try:
+                cfg = json.load(open(CFG, encoding="utf-8"))
+            except Exception:
+                cfg = {}
+        for k in IDENTITY_KEYS:
+            if k in ident:
+                cfg[k] = ident[k]
+        tmp = CFG + ".tmp"
+        json.dump(cfg, open(tmp, "w", encoding="utf-8"), indent=2)
+        os.replace(tmp, CFG)
+    with open(ACTIVE, "w", encoding="utf-8") as fh:
+        fh.write(name + "\n")
+    print(f"{G}deed config now uses {name} ({email_of(ident_path) or 'unknown'}){X}")
+    print("Open deed chats move on their next message. The main login is untouched.")
+
+
+def cmd_save(name):
+    if not os.path.isfile(CRED):
+        die(f"{R}The deed config has no login to save.{X}")
+    d = os.path.join(SLOTS, name)
+    os.makedirs(d, exist_ok=True)
+    shutil.copyfile(CRED, os.path.join(d, "credentials.json"))
+    os.chmod(os.path.join(d, "credentials.json"), 0o600)
+    ident = {}
+    if os.path.isfile(CFG):
+        try:
+            cfg = json.load(open(CFG, encoding="utf-8"))
+            ident = {k: cfg[k] for k in IDENTITY_KEYS if k in cfg}
+        except Exception:
+            pass
+    json.dump(ident, open(os.path.join(d, "identity.json"), "w", encoding="utf-8"), indent=2)
+    os.chmod(os.path.join(d, "identity.json"), 0o600)
+    json.dump({"saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+               "email": deed_email(),
+               "note": "saved from the deed config dir"},
+              open(os.path.join(d, "meta.json"), "w", encoding="utf-8"), indent=2)
+    print(f"{G}saved the deed login as {name} ({deed_email()}){X}")
+
+
+def cmd_limits():
+    env = dict(os.environ, CLAUDE_CONFIG_DIR=DEED)
+    os.execvpe("claude-limits", ["claude-limits"] + sys.argv[2:], env)
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a not in ("-f", "--force")]
+    force = len(args) != len(sys.argv[1:])
+    cmd = args[0] if args else "list"
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+    elif cmd == "list":
+        cmd_list()
+    elif cmd == "whoami":
+        cmd_whoami()
+    elif cmd == "limits":
+        cmd_limits()
+    elif cmd == "use":
+        if len(args) < 2:
+            die("usage: claude-account-deed use <name>")
+        cmd_use(args[1], force)
+    elif cmd == "save":
+        if len(args) < 2:
+            die("usage: claude-account-deed save <name>")
+        cmd_save(args[1])
+    else:
+        die(f"unknown command {cmd!r}. Try --help.")
+
+
+if __name__ == "__main__":
+    main()
