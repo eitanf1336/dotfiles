@@ -15,8 +15,15 @@ set -euo pipefail
 CFG="$HOME/.claude-deed"
 export CLAUDE_CONFIG_DIR="$CFG"
 
-[ -f "$CFG/.credentials.json" ] || \
-  echo "No login in $CFG yet: run /login once a chat opens." >&2
+# Preflight the login. A file existing proves nothing; asking Claude proves the
+# token still works. Doing it HERE, before the board spawns anything, is also
+# the moment a stale token gets refreshed: leave it to the board and the deed
+# daemon and the first chat both try to refresh the same expired token at once,
+# one of them loses the race, and you get a "run /login" banner for the ~60s it
+# takes the daemon to notice the other one succeeded.
+if ! timeout 15 claude auth status 2>/dev/null | grep -q '"loggedIn": true'; then
+  echo "Not signed in to the deed account ($CFG): run /login once a chat opens." >&2
+fi
 
 # The board rewrites projects.json from memory every time the P panel is used,
 # so a board that was already open when the Deed project was added can drop it.
