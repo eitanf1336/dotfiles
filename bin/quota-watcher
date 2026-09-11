@@ -223,6 +223,20 @@ def is_bg(a):
     return a.get("kind") != "interactive" and bool(a.get("id"))
 
 
+def is_subagent(a):
+    """A subagent belongs to a parent session: it has no life of its own, it
+    dies with the parent, and telling it to park is telling nobody. Only the
+    parent can wrap its fleet up. Top-level sessions carry an 8-hex short id;
+    a subagent carries an `agent-` id or names a parent, so either marker is
+    enough to keep it off the list."""
+    if a.get("parentSessionId") or a.get("parentId") or a.get("parentUuid"):
+        return True
+    if a.get("kind") in ("subagent", "task", "agent"):
+        return True
+    ident = str(a.get("id") or "")
+    return ident.startswith("agent-") or ident.startswith("agent_")
+
+
 def short_of(a):
     return a.get("id") or (a.get("sessionId") or "")[:8]
 
@@ -245,6 +259,8 @@ def live_sessions(working_only=False):
     and resuming it later would only waste a turn, so it is left alone."""
     out = []
     for a in agents():
+        if is_subagent(a):
+            continue
         if a.get("state") == "done":
             continue
         if not (is_working(a) or alive(a.get("pid"))):
@@ -376,6 +392,11 @@ def send_to_sessions(targets, text, tag):
         "printed for it. Skip any name that is not in the listing at all. "
         "Do not message anything that is not on that list, and do not message "
         "yourself.\n"
+        "   Every name above is a top-level session. Subagents are never to be "
+        "messaged: if a listing row is a subagent, or a task/child of another "
+        "session, or its ref begins with `agent-`, skip it even if its name "
+        "looks like one of the above. Their parent is on the list and will "
+        "wrap them up itself.\n"
         "3. The message text is everything between the BEGIN and END lines "
         "below. Send it verbatim, unchanged, to every one of them.\n"
         "4. Reply with a single line: how many you sent, and which refs you "
