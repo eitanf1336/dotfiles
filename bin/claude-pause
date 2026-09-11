@@ -551,8 +551,16 @@ def run_one(job):
             fh.write(f"$ {' '.join(cmd[:5])} …\n")
             fh.flush()
             try:
+                # A resumed session almost always restarts background work
+                # (agents, builds, test runs). Headless claude otherwise kills
+                # those at a 600s ceiling, so the session answers "working",
+                # gets shot ten minutes later, and the resume looks clean in
+                # the log while nothing is actually running. 0 = wait for them;
+                # the 6h timeout below is still the real cap.
+                env = dict(os.environ,
+                           CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="0")
                 p = subprocess.run(cmd, cwd=job["cwd"], capture_output=True,
-                                   text=True, timeout=6 * 3600)
+                                   text=True, timeout=6 * 3600, env=env)
             except (OSError, subprocess.TimeoutExpired) as e:
                 fh.write(f"\n[claude-resume] {e}\n")
                 return -1
