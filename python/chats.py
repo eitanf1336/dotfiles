@@ -322,8 +322,8 @@ SETTINGS_STORE = HOME / ".claude" / "chats" / "settings.json"
 # login per config directory, so an account is really a config dir: this maps a
 # project key to the one its chats belong to (the deed job bills its own account
 # out of ~/.claude-deed). Booting the board into such a project re-execs it with
-# CLAUDE_CONFIG_DIR set, so every `claude` it spawns — new chat, attach, resume,
-# `claude agents` — speaks to that account and not whichever is default.
+# CLAUDE_CONFIG_DIR set, so every `claude` it spawns (new chat, attach, resume,
+# `claude agents`) speaks to that account and not whichever one is default.
 # Deliberately its own file: the board rewrites projects.json wholesale from
 # memory whenever you touch the P panel, so a stale instance would drop it.
 PROJECT_CONFIG_DIRS_STORE = HOME / ".claude" / "chats" / "project_config_dirs.json"
@@ -613,7 +613,7 @@ def scan_chats():
 JOBS_DIR = HOME / ".claude" / "jobs"
 # Claude's own settings file. It lives beside the config dir in use, so a board
 # running on an alternate account (CLAUDE_CONFIG_DIR, e.g. the deed board) marks
-# folders trusted in THAT account's file instead of the main one's — otherwise
+# folders trusted in THAT account's file instead of the main one's, otherwise
 # every chat it opens re-asks "do you trust this folder?".
 _CFG_DIR = os.environ.get("CLAUDE_CONFIG_DIR")
 CLAUDE_JSON = (Path(os.path.expanduser(_CFG_DIR)) / ".claude.json"
@@ -3012,7 +3012,7 @@ def main():
             boot_view = key
 
     # Account-bound project: hand the whole board over to that account before
-    # anything is drawn, so every child process inherits it. One re-exec max —
+    # anything is drawn, so every child process inherits it. One re-exec max:
     # the guard variable stops a loop if the binding somehow never takes.
     target = boot_view if boot_view not in (_KEEP_PROJECT, None) else (
         boot_project if boot_new else None)
@@ -3126,7 +3126,7 @@ def main():
                 != os.path.realpath(want)):
             print(f"\n▶ {app.display_title(c)[:55]}")
             print(f"  runs on another Claude account ({os.path.basename(want)})"
-                  " — switching the board over …")
+                  ": switching the board over …")
             os.environ["CLAUDE_CONFIG_DIR"] = want
             os.environ["CHATS_ACCOUNT_REEXEC"] = "1"
             try:
@@ -3134,7 +3134,7 @@ def main():
                           [sys.executable, os.path.abspath(__file__),
                            "--open", c["id"]], os.environ)
             except Exception:
-                print("  couldn't switch accounts — not opening it on the wrong one.")
+                print("  couldn't switch accounts, so not opening it on the wrong one.")
                 input("  Press Enter to return to the board …")
                 continue
 
@@ -3184,6 +3184,14 @@ def main():
                 if choice == "t":
                     print("  Ending the headless run …")
                     if kill_headless_holder(pid):
+                        # Wait for Claude to actually drop the session from its
+                        # agent list. `--resume` refuses a session the daemon
+                        # still thinks is registered, and deregistration lags
+                        # the process death by a moment.
+                        for _ in range(10):
+                            if c["id"] not in agents_active():
+                                break
+                            time.sleep(1.0)
                         print("  done, reopening the chat.")
                         action = "resume"
                     else:
