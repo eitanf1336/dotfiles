@@ -318,6 +318,27 @@ PROJECT_TAGS_STORE = HOME / ".claude" / "chats" / "chat_projects.json"
 # effort picker with 'd<n>'.
 SETTINGS_STORE = HOME / ".claude" / "chats" / "settings.json"
 
+# Projects that must run on a DIFFERENT Claude account. Claude Code keeps one
+# login per config directory, so an account is really a config dir: this maps a
+# project key to the one its chats belong to (the deed job bills its own account
+# out of ~/.claude-deed). Booting the board into such a project re-execs it with
+# CLAUDE_CONFIG_DIR set, so every `claude` it spawns — new chat, attach, resume,
+# `claude agents` — speaks to that account and not whichever is default.
+# Deliberately its own file: the board rewrites projects.json wholesale from
+# memory whenever you touch the P panel, so a stale instance would drop it.
+PROJECT_CONFIG_DIRS_STORE = HOME / ".claude" / "chats" / "project_config_dirs.json"
+
+
+def config_dir_for_project(key):
+    """Expanded config dir bound to a project key, or None if it has none."""
+    if not key:
+        return None
+    raw = _load_json(PROJECT_CONFIG_DIRS_STORE).get(key)
+    if not raw:
+        return None
+    path = os.path.abspath(os.path.expanduser(raw))
+    return path if os.path.isdir(path) else None
+
 # old sessionId -> new sessionId for chats that were reopened by resuming them
 # into a fresh BACKGROUND agent (so Ctrl+Z detaches instead of killing the work).
 # Backgrounding always mints a new session id, so the old (pre-resume) entry is
@@ -590,7 +611,13 @@ def scan_chats():
 
 
 JOBS_DIR = HOME / ".claude" / "jobs"
-CLAUDE_JSON = HOME / ".claude.json"
+# Claude's own settings file. It lives beside the config dir in use, so a board
+# running on an alternate account (CLAUDE_CONFIG_DIR, e.g. the deed board) marks
+# folders trusted in THAT account's file instead of the main one's — otherwise
+# every chat it opens re-asks "do you trust this folder?".
+_CFG_DIR = os.environ.get("CLAUDE_CONFIG_DIR")
+CLAUDE_JSON = (Path(os.path.expanduser(_CFG_DIR)) / ".claude.json"
+               if _CFG_DIR else HOME / ".claude.json")
 
 # live Claude-side status -> (icon glyph, color pair)
 STATUS_ICON = {
@@ -780,6 +807,91 @@ def _headless_turn(a):
     except (OSError, ValueError):
         return False
     return b"-p" in args or b"--print" in args
+
+
+def headless_holder(full_id, active):
+    """PID of the headless `claude --resume <id> -p` run that owns this session,
+    or None.
+
+    This is the state that used to make a chat simply refuse to open. A session
+    revived with `--resume ... -p` registers as a live agent (so the board forces
+    the attach path) but it is a PRINT run: it has no pty host and no claim
+    socket, so it exposes no agent `id` and `claude attach` answers "this session
+    is running in another terminal" and drops you straight back to the board with
+    no explanation. Nothing is broken and nothing is recoverable by retrying:
+    the chat is simply owned by a process you cannot talk to, until it exits.
+
+    Detected by the two things that are always true of it together: the live
+    record carries no attachable `id`, and the process behind it has -p/--print
+    on its command line (a terminal session he is sitting in has neither)."""
+    rec = active.get(full_id)
+    if not rec or rec.get("id"):
+        return None
+    pid = rec.get("pid")
+    if not pid:
+        return None
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as fh:
+            args = fh.read().split(b"\0")
+    except (OSError, ValueError):
+        return None
+    if b"-p" not in args and b"--print" not in args:
+        return None
+    return int(pid)
+
+
+def headless_holder_age(pid):
+    """Human 'for 3h12m' for how long a headless holder has been running."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            fields = fh.read().rsplit(b")", 1)[1].split()
+        start_ticks = int(fields[19])
+        with open("/proc/uptime") as fh:
+            up = float(fh.read().split()[0])
+        secs = int(up - start_ticks / os.sysconf("SC_CLK_TCK"))
+    except Exception:
+        return "?"
+    h, m = divmod(max(secs, 0) // 60, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m"
+
+
+def _pid_alive(pid):
+    """Is this pid a process that is still running?
+
+    `os.kill(pid, 0)` is not enough on its own: a process that has exited but
+    not yet been reaped stays addressable as a zombie, so signal-0 keeps saying
+    "alive" for something that is very much dead. Read the state field out of
+    /proc instead and count Z (and the dying X/x) as gone."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            state = fh.read().rsplit(b")", 1)[1].split()[0]
+    except OSError:
+        return False
+    return state not in (b"Z", b"X", b"x")
+
+
+def kill_headless_holder(pid, timeout=20):
+    """End a headless holder so the session can be reopened properly. SIGTERM
+    first (it gets to flush its transcript), SIGKILL only if it will not go."""
+    if not _pid_alive(pid):
+        return True
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return True  # already gone
+    for _ in range(timeout * 2):
+        time.sleep(0.5)
+        if not _pid_alive(pid):
+            return True
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        return True
+    for _ in range(10):
+        time.sleep(0.3)
+        if not _pid_alive(pid):
+            return True
+    return False
 
 
 def resolve_status(sid, active, jobs):
@@ -2149,9 +2261,13 @@ class App:
             c = self.selected_chat(nav)
             if c:
                 # Live agent -> attach (non-destructive; detach with Ctrl+Z keeps
-                # it running). Closed chat -> normal resume.
+                # it running). Closed chat -> normal resume. A chat owned by a
+                # headless `--resume -p` run can be neither: see headless_holder.
                 self.resume_target = c
-                self.resume_action = "attach" if c["id"] in self.live_ids else "resume"
+                if c["id"] in self.live_ids and headless_holder(c["id"], self._agents):
+                    self.resume_action = "headless"
+                else:
+                    self.resume_action = "attach" if c["id"] in self.live_ids else "resume"
                 return False
             cat = self.selected_header(nav)
             if cat:  # Enter on a section header -> collapse/expand it
@@ -2895,6 +3011,23 @@ def main():
         else:
             boot_view = key
 
+    # Account-bound project: hand the whole board over to that account before
+    # anything is drawn, so every child process inherits it. One re-exec max —
+    # the guard variable stops a loop if the binding somehow never takes.
+    target = boot_view if boot_view not in (_KEEP_PROJECT, None) else (
+        boot_project if boot_new else None)
+    bound = config_dir_for_project(target)
+    if bound and not os.environ.get("CHATS_ACCOUNT_REEXEC"):
+        if os.path.realpath(os.environ.get("CLAUDE_CONFIG_DIR") or "") != os.path.realpath(bound):
+            os.environ["CLAUDE_CONFIG_DIR"] = bound
+            os.environ["CHATS_ACCOUNT_REEXEC"] = "1"
+            try:
+                os.execve(sys.executable,
+                          [sys.executable, os.path.abspath(__file__)] + sys.argv[1:],
+                          os.environ)
+            except Exception:
+                pass
+
     last_id = boot_open
     # One-shot: only the FIRST board pass auto-opens. Coming back from that chat
     # (Ctrl+Z) must land on the board, not bounce straight back into the chat.
@@ -2982,6 +3115,29 @@ def main():
         run_cwd = cwd if (cwd and cwd != "(unknown)" and os.path.isdir(cwd)) else None
         short = short_id(c["id"], app._agents)
 
+        # Account-bound project (the deed job): this chat belongs to a different
+        # Claude login, and opening it from a board running on the default one
+        # would bill the wrong account and register the agent with the wrong
+        # daemon. Hand the whole board over to that account and come straight
+        # back into this chat, instead of quietly doing the wrong thing.
+        want = config_dir_for_project(app.tags.get(c["id"]))
+        if (want and action != "stop"
+                and os.path.realpath(os.environ.get("CLAUDE_CONFIG_DIR") or "")
+                != os.path.realpath(want)):
+            print(f"\n▶ {app.display_title(c)[:55]}")
+            print(f"  runs on another Claude account ({os.path.basename(want)})"
+                  " — switching the board over …")
+            os.environ["CLAUDE_CONFIG_DIR"] = want
+            os.environ["CHATS_ACCOUNT_REEXEC"] = "1"
+            try:
+                os.execve(sys.executable,
+                          [sys.executable, os.path.abspath(__file__),
+                           "--open", c["id"]], os.environ)
+            except Exception:
+                print("  couldn't switch accounts — not opening it on the wrong one.")
+                input("  Press Enter to return to the board …")
+                continue
+
         # A live background agent must ALWAYS be attached, never resumed. The
         # board's live-agent set (self.live_ids) is refreshed on a throttle, so
         # by the time you hit Enter it can be a couple of seconds stale and miss
@@ -2996,8 +3152,48 @@ def main():
         if action == "resume":
             live_now = agents_active()
             if c["id"] in live_now or c["id"] in app.live_ids:
-                action = "attach"
-                short = short_id(c["id"], live_now or app._agents)
+                # ...unless a headless `--resume -p` run owns it, in which case
+                # attach cannot work at all and forcing it is what produced the
+                # silent bounce back to the board.
+                if headless_holder(c["id"], live_now or app._agents):
+                    action = "headless"
+                else:
+                    action = "attach"
+                    short = short_id(c["id"], live_now or app._agents)
+
+        # 'headless': the chat is owned by a `claude --resume <id> -p` run.
+        # Attach is impossible (no pty host) and a plain resume would be forced
+        # into that same dead attach, so the board used to just blink and come
+        # back. Say what is holding it and offer the only two real ways out.
+        if action == "headless":
+            pid = headless_holder(c["id"], agents_active() or app._agents)
+            if not pid:
+                # It exited between the keypress and here: a normal chat now.
+                action = "resume"
+            else:
+                age = headless_holder_age(pid)
+                print(f"\n■ {app.display_title(c)[:60]}")
+                print(f"  This chat is being driven by a headless "
+                      f"`claude --resume -p` run (pid {pid}, going {age}).")
+                print("  That kind of run owns the session but has no terminal to")
+                print("  attach to, which is why opening it does nothing.\n")
+                print("  [t] take it back: end that run, reopen the chat properly")
+                print("  [f] fork a copy: leave it running, open a copy alongside")
+                print("  [Enter] leave it alone\n")
+                choice = (input("  Choice: ").strip().lower() or "")
+                if choice == "t":
+                    print("  Ending the headless run …")
+                    if kill_headless_holder(pid):
+                        print("  done, reopening the chat.")
+                        action = "resume"
+                    else:
+                        print(f"  couldn't end pid {pid}; leaving it alone.")
+                        input("  Press Enter to return to the board …")
+                        continue
+                elif choice == "f":
+                    action = "fork"
+                else:
+                    continue
 
         # 'stop' just ends a live agent, then returns to the board.
         if action == "stop":
