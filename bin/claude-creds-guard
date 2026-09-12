@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""claude-creds-guard - keep every Claude login on this machine parked and
+restorable, and put one back when Claude Code throws it away.
+
+Two things this exists for:
+
+1. AUTOMATIC SAVING. Claude Code rotates the OAuth refresh token every time it
+   refreshes, which retires the previous one. A slot saved yesterday therefore
+   holds a token that no longer works, and restoring it logs you out for real.
+   `claude-account sync` already parked the MAIN config's active slot every ten
+   minutes; the deed config had nothing. This parks both, every two minutes,
+   through the same tools that own the slot format.
+
+2. RESTORING A WIPE. When two Claude processes refresh the same token at once
+   (a daemon restarting for a version upgrade plus a session already running),
+   the loser gets invalid_grant and answers by writing accessToken and
+   refreshToken back as EMPTY STRINGS. The file stays present and non-zero, so
+   nothing notices, and the good token the winner had just written is gone.
+   That is how the deed account and the 'eitan' slot were both emptied.
+
+So: if the live file still has a token, park it. If it has been blanked, put the
+parked copy back. If the parked copy turns out to be dead as well, say so once
+and stop, because at that point only a browser login can help.
+
+It will never park a blank over a good copy, which is the one way a naive
+"copy it every minute" job would make things worse.
+"""
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+ACCOUNTS = os.path.join(HOME, ".claude", "accounts")
+STATE = os.path.join(ACCOUNTS, ".guard-state.json")
+
+
+def configs():
+    """Every Claude config dir worth guarding, with the tool that owns its slot.
+
+    Saving goes through claude-account / claude-account-deed rather than a raw
+    copy, so the slot's identity and metadata stay consistent with how a manual
+    save writes them. Restoring is done here, because neither tool has a notion
+    of putting a login back without being told to."""
+    return [
+        {
+            "name": "main",
+            "cred": os.path.join(HOME, ".claude", ".credentials.json"),
+            "active": os.path.join(ACCOUNTS, "active"),
+            "save": lambda slot: ["claude-account", "sync", "-q"],
+        },
+        {
+            "name": "deed",
+            "cred": os.path.join(HOME, ".claude-deed", ".credentials.json"),
+            "active": os.path.join(HOME, ".claude-deed", ".active-account"),
+            "save": lambda slot: ["claude-account-deed", "save", slot],
+        },
+    ]
+
+
+def log(msg):
+    print(f"claude-creds-guard: {msg}", flush=True)
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def token(path):
+    """The refresh token in a credentials file, or '' when it holds none."""
+    doc = read_json(path)
+    if not isinstance(doc, dict):
+        return ""
+    oauth = doc.get("claudeAiOauth") or doc
+    if not isinstance(oauth, dict):
+        return ""
+    return str(oauth.get("refreshToken") or "")
+
+
+def fingerprint(tok):
+    """A token is a secret and the state file has no business holding a second
+    copy of one. Compare fingerprints instead."""
+    return hashlib.sha256(tok.encode()).hexdigest()[:16] if tok else ""
+
+
+def slot_name(cfg):
+    try:
+        with open(cfg["active"], encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def copy(src, dst):
+    """Copy credentials atomically, with the permissions Claude uses."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    tmp = f"{dst}.{os.getpid()}.tmp"
+    shutil.copyfile(src, tmp)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, dst)
+
+
+def load_state():
+    return read_json(STATE) or {}
+
+
+def save_state(state):
+    os.makedirs(ACCOUNTS, exist_ok=True)
+    tmp = f"{STATE}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE)
+
+
+def guard(cfg, state):
+    """Park or restore one config dir. Returns True if it needs a human."""
+    if not os.path.isfile(cfg["cred"]):
+        return False                       # never logged in here: nothing to do
+    slot = slot_name(cfg)
+    if not slot:
+        return False                       # no slot claimed: nothing to park to
+    slot_cred = os.path.join(ACCOUNTS, slot, "credentials.json")
+    live_tok, slot_tok = token(cfg["cred"]), token(slot_cred)
+    mine = state.setdefault(cfg["name"], {})
+
+    if live_tok:
+        if live_tok != slot_tok:
+            cmd = cfg["save"](slot)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if r.returncode == 0:
+                log(f"{cfg['name']}: parked a fresh token in '{slot}'")
+            else:
+                log(f"{cfg['name']}: could not park the token: "
+                    f"{(r.stderr or r.stdout).strip()[:120]}")
+        if mine.get("restored") and mine["restored"] != fingerprint(live_tok):
+            mine.clear()                   # a different login is in play now
+        return False
+
+    # The live file has been blanked.
+    if mine.get("restored") == fingerprint(slot_tok):
+        # Already put this exact token back and it was blanked again, so the
+        # parked copy is dead too and only a browser login can fix it.
+        if not mine.get("announced"):
+            mine["announced"] = True
+            log(f"{cfg['name']}: login is blank and the parked token is dead "
+                f"too: log in again (slot '{slot}')")
+        return True
+    if not slot_tok:
+        if not mine.get("announced"):
+            mine["announced"] = True
+            log(f"{cfg['name']}: login is blank and slot '{slot}' is empty: "
+                "log in again")
+        return True
+    copy(slot_cred, cfg["cred"])
+    mine.update(restored=fingerprint(slot_tok),
+                at=time.strftime("%Y-%m-%dT%H:%M:%S"), announced=False)
+    log(f"{cfg['name']}: login was blank, restored the copy parked in '{slot}'")
+    return False
+
+
+def main():
+    state = load_state()
+    before = json.dumps(state, sort_keys=True)
+    needs_human = False
+    for cfg in configs():
+        try:
+            needs_human |= guard(cfg, state)
+        except Exception as e:              # one broken config must not stop the other
+            log(f"{cfg['name']}: {type(e).__name__}: {e}")
+    if json.dumps(state, sort_keys=True) != before:
+        save_state(state)
+    return 1 if needs_human else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

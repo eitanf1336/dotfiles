@@ -1,0 +1,10 @@
+[Unit]
+Description=Park every Claude login as it rotates, and restore one if Claude blanks it
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/claude-creds-guard
+# File comparison plus a copy: no network, nothing to rate-limit.
+Nice=10
+# Exit 1 means "a browser login is needed", not a failure worth alerting on.
+SuccessExitStatus=0 1

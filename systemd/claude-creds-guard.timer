@@ -1,5 +1,5 @@
 [Unit]
-Description=Guard the deed Claude login
+Description=Guard the Claude logins
 
 [Timer]
 OnBootSec=1min
