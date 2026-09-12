@@ -47,6 +47,23 @@ def die(msg):
     sys.exit(1)
 
 
+def has_tokens(path):
+    """Does this credentials file still hold a login, or is it a husk?
+
+    A refresh that loses a race makes Claude Code write accessToken and
+    refreshToken back as EMPTY STRINGS and keep the rest of the file. It stays
+    present and non-zero, so existence checks pass while the login is gone.
+    Installing such a file logs the config out; parking one destroys the last
+    good copy. Both happened here on 2026-09-12."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    oauth = d.get("claudeAiOauth") or d
+    return bool(oauth.get("refreshToken") or oauth.get("accessToken"))
+
+
 def slots():
     try:
         return sorted(n for n in os.listdir(SLOTS)
@@ -111,6 +128,10 @@ def cmd_use(name, force):
         die(f"{Y}A deed session is running. Switching now would bill the rest of its\n"
             f"task to the other account. Finish it, or pass --force.{X}")
     d = os.path.join(SLOTS, name)
+    if not has_tokens(os.path.join(d, "credentials.json")):
+        die(f"{R}Slot {name!r} holds a blanked login{X} (empty tokens).\n"
+            "Installing it would log the deed config out. Log in as that\n"
+            f"account and `claude-account-deed save {name}` to refill it first.")
     # 1. credentials
     os.makedirs(DEED, exist_ok=True)
     if os.path.isfile(CRED):
@@ -143,6 +164,9 @@ def cmd_use(name, force):
 def cmd_save(name):
     if not os.path.isfile(CRED):
         die(f"{R}The deed config has no login to save.{X}")
+    if not has_tokens(CRED):
+        die(f"{R}The deed login is blank{X} (empty tokens).\n"
+            f"Refusing to park it over {name!r} and destroy the last good copy.")
     d = os.path.join(SLOTS, name)
     os.makedirs(d, exist_ok=True)
     shutil.copyfile(CRED, os.path.join(d, "credentials.json"))

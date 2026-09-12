@@ -206,6 +206,21 @@ def have_live_creds():
     return os.path.isfile(CRED) and os.path.getsize(CRED) > 0
 
 
+def has_tokens(path):
+    """Does this credentials file still hold a login, or is it a husk?
+
+    When a token refresh loses a race (two Claude processes refreshing the same
+    rotating token), Claude Code answers invalid_grant by writing accessToken
+    and refreshToken back as EMPTY STRINGS and keeping the rest of the file. The
+    file is then still there and still non-zero, so every size check passes
+    while the login is gone. Parking that over a good slot destroys the only
+    copy; installing it as the live login logs you out. Both have happened here:
+    the 'eitan' slot was silently emptied on 2026-09-11 that way."""
+    d = read_json(path, {}) or {}
+    oauth = d.get("claudeAiOauth") or d
+    return bool(oauth.get("refreshToken") or oauth.get("accessToken"))
+
+
 def token_of(path):
     d = read_json(path, {}) or {}
     oauth = d.get("claudeAiOauth") or {}
@@ -342,6 +357,10 @@ def snapshot(name, with_usage=True):
     if not have_live_creds():
         die(f"{RED}Nobody is logged in{RST} (no {CRED}).\n"
             "Run `claude auth login` first, then `claude-account save <name>`.")
+    if not has_tokens(CRED):
+        die(f"{RED}The live login is blank{RST} (empty tokens in {CRED}).\n"
+            f"Refusing to park it over '{name}' - that would destroy the last\n"
+            "good copy. Log in again first, then save.")
     os.makedirs(slot(name), mode=0o700, exist_ok=True)
     os.chmod(slot(name), 0o700)
     shutil.copyfile(CRED, slot_cred(name))
@@ -397,6 +416,11 @@ def activate(name):
     src = slot_cred(name)
     if not os.path.isfile(src):
         die(f"{RED}No saved account called {name!r}.{RST} Run `claude-account` to list them.")
+    if not has_tokens(src):
+        die(f"{RED}Slot '{name}' holds a blanked login{RST} (empty tokens).\n"
+            "Switching to it would log you out of Claude everywhere on this\n"
+            f"machine. Log in as that account and `claude-account save {name}`\n"
+            "to refill the slot first.")
     shutil.copyfile(src, CRED)
     os.chmod(CRED, 0o600)
     apply_identity(read_json(slot_identity(name), {}) or {})
@@ -521,6 +545,12 @@ def cmd_use(args):
     if name not in profiles():
         die(f"{RED}No saved account called {name!r}.{RST}\nSaved: "
             + (", ".join(profiles()) or "(none)"))
+
+    if not has_tokens(slot_cred(name)):
+        die(f"{RED}Slot '{name}' holds a blanked login{RST} (empty tokens).\n"
+            "Switching to it would log you out of Claude everywhere on this\n"
+            f"machine. Log in as that account and `claude-account save {name}`\n"
+            "to refill the slot first.")
 
     cur = active_name()
     if cur == name:
