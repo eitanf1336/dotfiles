@@ -302,6 +302,16 @@ def collect(data):
     for lim in data.get("limits") or []:
         kind = lim.get("kind") or lim.get("group") or ""
         label = LABELS.get(kind, kind.replace("_", " ").title() or "Limit")
+        # A "scoped" limit is a per-model cap (currently Fable). The API only
+        # names the model inside scope, so "Weekly Scoped" told you nothing
+        # about which model was at 65%.
+        scope = lim.get("scope") or {}
+        model = (scope.get("model") or {}).get("display_name")
+        if model:
+            group = lim.get("group") or ""
+            prefix = "Weekly" if group == "weekly" else (
+                "Session" if group == "session" else label)
+            label = f"{prefix} ({model})"
         pct = lim.get("percent")
         if pct is None:
             continue
