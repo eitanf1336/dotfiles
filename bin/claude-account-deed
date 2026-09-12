@@ -128,10 +128,7 @@ def cmd_use(name, force):
         die(f"{Y}A deed session is running. Switching now would bill the rest of its\n"
             f"task to the other account. Finish it, or pass --force.{X}")
     d = os.path.join(SLOTS, name)
-    if not has_tokens(os.path.join(d, "credentials.json")):
-        die(f"{R}Slot {name!r} holds a blanked login{X} (empty tokens).\n"
-            "Installing it would log the deed config out. Log in as that\n"
-            f"account and `claude-account-deed save {name}` to refill it first.")
+    empty = not has_tokens(os.path.join(d, "credentials.json"))
     # 1. credentials
     os.makedirs(DEED, exist_ok=True)
     if os.path.isfile(CRED):
@@ -158,6 +155,10 @@ def cmd_use(name, force):
     with open(ACTIVE, "w", encoding="utf-8") as fh:
         fh.write(name + "\n")
     print(f"{G}deed config now uses {name} ({email_of(ident_path) or 'unknown'}){X}")
+    if empty:
+        print(f"{Y}That slot has no token in it, so you are not logged in yet: "
+              f"run /login in a deed chat and it will be saved back into "
+              f"{name!r} automatically.{X}")
     print("Open deed chats move on their next message. The main login is untouched.")
 
 

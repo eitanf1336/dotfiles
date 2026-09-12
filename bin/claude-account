@@ -416,11 +416,6 @@ def activate(name):
     src = slot_cred(name)
     if not os.path.isfile(src):
         die(f"{RED}No saved account called {name!r}.{RST} Run `claude-account` to list them.")
-    if not has_tokens(src):
-        die(f"{RED}Slot '{name}' holds a blanked login{RST} (empty tokens).\n"
-            "Switching to it would log you out of Claude everywhere on this\n"
-            f"machine. Log in as that account and `claude-account save {name}`\n"
-            "to refill the slot first.")
     shutil.copyfile(src, CRED)
     os.chmod(CRED, 0o600)
     apply_identity(read_json(slot_identity(name), {}) or {})
@@ -546,11 +541,7 @@ def cmd_use(args):
         die(f"{RED}No saved account called {name!r}.{RST}\nSaved: "
             + (", ".join(profiles()) or "(none)"))
 
-    if not has_tokens(slot_cred(name)):
-        die(f"{RED}Slot '{name}' holds a blanked login{RST} (empty tokens).\n"
-            "Switching to it would log you out of Claude everywhere on this\n"
-            f"machine. Log in as that account and `claude-account save {name}`\n"
-            "to refill the slot first.")
+    slot_is_empty = not has_tokens(slot_cred(name))
 
     cur = active_name()
     if cur == name:
@@ -585,6 +576,10 @@ def cmd_use(args):
     backup_current()
     activate(name)
 
+    if slot_is_empty:
+        info(f"{YEL}Slot '{name}' has no token in it, so you are not logged in "
+             f"yet:{RST}\n{DIM}run `/login` (or `claude auth login`) and it will "
+             f"be saved back into '{name}' automatically.{RST}")
     m = read_json(slot_meta(name), {}) or {}
     who = m.get("email") or "?"
     plan = f" [{m['plan']}]" if m.get("plan") else ""
