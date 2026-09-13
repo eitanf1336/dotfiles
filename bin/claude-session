@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""claude-session — keep the chats you had open, open across a logout.
+"""claude-session: keep the chats you had open, open across a logout.
 
 The claude-c board runs inside a terminal, and a chat runs inside the board.
 Logging out kills the terminal, which kills the board, which kills the chat you
@@ -18,16 +18,32 @@ shuts down, so the file on disk is never more than a minute stale. `restore`
 runs from ~/.config/autostart at login.
 
 How a chat is restored: `claude-c --open <id>` boots the board straight into
-that chat, taking the board's normal Enter path — so an agent that is still
+that chat, taking the board's normal Enter path, so an agent that is still
 live gets attached to, and one that has settled gets resumed. Same thing you
 would have done by hand.
 
-Tiling: the Terminal Tiler extension (Super+Return) records which of its
-columns were on which monitor when the session ended, and exposes a D-Bus
-method to spawn a terminal directly into a column. If the extension is not
-there, terminals still come back, just not tiled.
+Where the terminal comes from matters (2026-09-13). The first versions spawned
+terminator straight from this script. At login this script runs inside its own
+autostart systemd scope, terminator is single-process (every window lives in
+the first instance), and that first instance stayed in the scope. When restore
+exited the scope went down and every restored window went with it, silently,
+because stderr was /dev/null. So now:
+  * terminals are spawned BY THE TILER (gnome-shell owns them, exactly like
+    Super+Return), or failing that through `systemd-run` so they get a unit of
+    their own and their errors land in the journal;
+  * restore checks every chat actually came up, retries the missing ones once,
+    and raises a desktop notification if any are still missing, instead of
+    printing "restored 8" over an empty desktop.
+
+Tiling: the Terminal Tiler extension (Super+Return) answers GetLayout with its
+live per-monitor column titles. Claude Code overwrites the window title with
+the chat's name ("◐ german deed processing"), so the chat id almost never
+appears in a title; `save` matches titles against the job names in
+~/.claude*/jobs/<id>/state.json instead, while the session is still healthy,
+and stores monitor + column in the snapshot itself.
 """
 
+import ast
 import json
 import os
 import shlex
@@ -44,6 +60,10 @@ LAYOUT = STATE / "tiler-layout.json"   # written by the Terminal Tiler extension
 TERMINAL = "terminator"
 BUS = ("--session", "--dest", "org.gnome.Shell",
        "--object-path", "/eitan/TerminalTiler")
+
+TILER_WAIT = 30      # seconds to wait at login for the extension to answer
+UP_WAIT = 45         # seconds for a spawned chat to show up before retrying
+RETRY_WAIT = 30      # and again after the retry
 
 
 # ---------------------------------------------------------------- inspection
@@ -81,11 +101,18 @@ def _descendants(pid):
     return seen
 
 
+def _same_chat(a, b):
+    """Ids show up both short (8 hex) and as full uuids."""
+    return bool(a and b) and (a.startswith(b) or b.startswith(a))
+
+
 def open_boards():
     """Every running claude-c board, with the chat it currently has open.
 
     A board is `python3 .../chats.py [project]`; the chat it is showing is a
-    `claude attach <id>` / `claude --resume <id>` somewhere below it."""
+    `claude attach <id>` / `claude --resume <id>` somewhere below it. `opening`
+    is the id from `--open <id>`, which is there from the first instant, before
+    the board has got as far as starting claude."""
     boards = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -102,29 +129,122 @@ def open_boards():
                     and ka[1] in ("attach", "--resume")):
                 chat = {"id": ka[2], "cwd": _cwd(kid)}
                 break
+        opening = None
+        if "--open" in a[2:]:
+            i = a.index("--open")
+            opening = a[i + 1] if i + 1 < len(a) else None
         boards.append({
             "pid": pid,
             "project": a[2] if len(a) > 2 and not a[2].startswith("-") else None,
             "cwd": _cwd(pid),
             "chat": chat,
+            "opening": opening,
         })
     boards.sort(key=lambda b: b["pid"])
     return boards
 
 
-def tiler_layout():
-    """Per-monitor column order, as the tiler extension last saw it.
+def open_chat_ids():
+    ids = set()
+    for b in open_boards():
+        if b["chat"]:
+            ids.add(b["chat"]["id"])
+        if b["opening"]:
+            ids.add(b["opening"])
+    return ids
 
-    Shape: {"monitors": {"0": ["<title>", ...], ...}, "saved": <epoch>}
-    Titles are terminal window titles; claude-c stamps its chat id into its
-    own, which is how a column is matched back to a conversation."""
+
+def _is_open(chat_id, ids):
+    return any(_same_chat(chat_id, i) for i in ids)
+
+
+# -------------------------------------------------------------------- tiler
+
+def live_layout(timeout=3):
+    """The tiler's current columns, straight from the extension over D-Bus.
+
+    {"monitors": {"0": ["<title>", ...]}, "saved": <epoch>} or None when the
+    extension is not answering (not loaded yet, or the shell is going down)."""
+    try:
+        r = subprocess.run(
+            ["gdbus", "call", *BUS, "--method",
+             "eitan.TerminalTiler.GetLayout"],
+            capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        # gdbus prints a GVariant tuple, ('<json>',), which is a Python literal.
+        return json.loads(ast.literal_eval(r.stdout.strip())[0])
+    except (ValueError, SyntaxError, IndexError, TypeError):
+        return None
+
+
+def tiler_layout_file():
+    """Legacy: the layout the extension dumps to disk on every column change."""
     try:
         return json.loads(_read(LAYOUT))
     except (ValueError, OSError):
         return {}
 
 
+def job_names():
+    """Chat id -> the name Claude Code shows in the window title."""
+    names = {}
+    for jobs in HOME.glob(".claude*/jobs"):
+        for st in jobs.glob("*/state.json"):
+            try:
+                name = json.loads(st.read_text()).get("name")
+            except (OSError, ValueError):
+                continue
+            if name:
+                names[st.parent.name] = name
+    return names
+
+
+def match_columns(layout, chat_ids):
+    """Chat id -> {monitor, column}, by matching column titles to chats.
+
+    A title is either `claude-c <id>` (stamped by the board) or Claude Code's
+    own "<spinner> <chat name>". Titles that match nothing (plain shells) are
+    skipped; a name used twice is handed out in column order."""
+    names = job_names()
+    wanted = {}
+    for cid in chat_ids:
+        for jid, name in names.items():
+            if _same_chat(cid, jid):
+                wanted[cid] = name
+                break
+    where = {}
+    for mon, titles in (layout.get("monitors") or {}).items():
+        for col, title in enumerate(titles):
+            title = str(title).strip()
+            hit = None
+            for cid in chat_ids:
+                if cid in where:
+                    continue
+                if any(len(tok) >= 8 and _same_chat(cid, tok)
+                       for tok in title.split()):
+                    hit = cid
+                    break
+                name = wanted.get(cid)
+                if name and (title == name or title.endswith(" " + name)):
+                    hit = cid
+                    break
+            if hit:
+                where[hit] = {"monitor": int(mon), "column": col}
+    return where
+
+
 # ------------------------------------------------------------------- save
+
+def _previous_session():
+    try:
+        return json.loads(SESSION.read_text())
+    except (OSError, ValueError):
+        return {}
+
 
 def save():
     STATE.mkdir(parents=True, exist_ok=True)
@@ -145,10 +265,22 @@ def save():
             "cwd": chat["cwd"] or b["cwd"],
             "project": b["project"],
         })
-    # Deliberately NOT recording the tiling here. The tiler writes its layout
-    # from the extension's disable(), which runs during the same teardown as
-    # this save, so whichever goes first would win a race. Matching happens in
-    # restore() instead, where both files are already on disk.
+
+    # Where each chat sits, taken live from the tiler while the session is
+    # healthy. During logout the shell may already be gone and not answer; then
+    # a chat keeps the spot the previous snapshot recorded for it.
+    layout = live_layout() if entries else None
+    spots = match_columns(layout, [e["chat"] for e in entries]) if layout else {}
+    before = {e.get("chat"): e for e in (_previous_session().get("chats") or [])}
+    for e in entries:
+        spot = spots.get(e["chat"])
+        if spot is None and layout is None:
+            old = before.get(e["chat"]) or {}
+            if old.get("monitor") is not None:
+                spot = {"monitor": old["monitor"], "column": old.get("column")}
+        if spot:
+            e.update(spot)
+
     payload = {"saved": time.time(), "chats": entries}
     tmp = SESSION.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, indent=2))
@@ -209,37 +341,82 @@ def last_pre_boot_session():
 
 # ---------------------------------------------------------------- restore
 
-def _spawn_plain(cmd, cwd):
-    argv = [TERMINAL, "--working-directory", cwd or str(HOME),
+def _log(msg):
+    print(msg, flush=True)    # autostart stdout lands in the user journal
+
+
+def _notify(summary, body):
+    try:
+        subprocess.run(["notify-send", "-a", "claude-session", "-i",
+                        "utilities-terminal", summary, body],
+                       timeout=5, capture_output=True)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _terminal_argv(cmd, cwd):
+    return [TERMINAL, "--working-directory", cwd or str(HOME),
             "-x", "bash", "-lc", cmd]
-    subprocess.Popen(argv, start_new_session=True,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _spawn_plain(cmd, cwd, chat_id):
+    """An untiled terminal in a systemd unit of its own.
+
+    Never a bare Popen: at login this script lives in the autostart scope, and
+    a terminator started from here would stay in that scope and die with it."""
+    unit = f"claude-restore-{chat_id[:8]}-{int(time.time() * 1000)}"
+    env = [f"--setenv={k}" for k in
+           ("WAYLAND_DISPLAY", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR", "XDG_CURRENT_DESKTOP", "PATH")
+           if os.environ.get(k)]
+    try:
+        r = subprocess.run(
+            ["systemd-run", "--user", "--collect", "--quiet",
+             f"--unit={unit}", *env, "--", *_terminal_argv(cmd, cwd)],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return True
+        _log(f"systemd-run failed for {chat_id}: {r.stderr.strip()}")
+    except (OSError, subprocess.SubprocessError) as e:
+        _log(f"systemd-run failed for {chat_id}: {e}")
+    return False
 
 
 def _spawn_tiled(cmd, cwd, monitor):
     """Ask the Terminal Tiler to open this terminal as one of its columns.
 
-    Returns False if the extension isn't answering, so the caller can fall back
-    to an ordinary window rather than losing the chat."""
-    full = (f"{TERMINAL} --working-directory {shlex.quote(cwd or str(HOME))} "
-            f"-x bash -lc {shlex.quote(cmd)}")
+    gnome-shell does the spawning, so the terminal belongs to the shell (same as
+    Super+Return), not to this script's short-lived autostart scope. Returns
+    False if the extension isn't answering."""
+    full = shlex.join(_terminal_argv(cmd, cwd))
     try:
         r = subprocess.run(
             ["gdbus", "call", *BUS, "--method",
              "eitan.TerminalTiler.SpawnTiled", str(monitor), full],
-            capture_output=True, timeout=5)
+            capture_output=True, text=True, timeout=5)
         return r.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
 
-def placements():
-    """Chat id -> {monitor, column}, from the layout the tiler dumped at logout.
+def wait_for_tiler(limit=TILER_WAIT):
+    """At login this runs about when the shell does; give the extension a moment
+    to load before deciding there is no tiler."""
+    deadline = time.time() + limit
+    while True:
+        layout = live_layout()
+        if layout is not None:
+            return layout
+        if time.time() >= deadline:
+            return None
+        time.sleep(1)
 
-    claude-c stamps its chat id into the terminal's window title, so a column's
-    title is enough to say which conversation used to live in it."""
+
+def legacy_placements():
+    """Chat id -> spot, from the extension's on-disk dump (older snapshots
+    carry no placement of their own). Rarely hits: Claude overwrites titles."""
     where = {}
-    for mon, titles in (tiler_layout().get("monitors") or {}).items():
+    for mon, titles in (tiler_layout_file().get("monitors") or {}).items():
         for col, title in enumerate(titles):
             for tok in str(title).split():
                 if len(tok) >= 8 and all(c in "0123456789abcdef-" for c in tok):
@@ -247,22 +424,22 @@ def placements():
     return where
 
 
-def _place(chat_id, where):
-    for key, val in where.items():
-        if key.startswith(chat_id) or chat_id.startswith(key):
-            return val
-    return None
-
-
 def plan():
     """The chats to reopen, in the order their columns should be spawned."""
     data = last_pre_boot_session()
     if not data:
         return []
-    where = placements()
+    legacy = legacy_placements()
     out = []
     for e in data.get("chats") or []:
-        spot = _place(e["chat"], where) or {}
+        spot = {}
+        if e.get("monitor") is not None:
+            spot = {"monitor": e["monitor"], "column": e.get("column")}
+        else:
+            for key, val in legacy.items():
+                if _same_chat(e["chat"], key):
+                    spot = val
+                    break
         out.append({**e,
                     "monitor": spot.get("monitor"),
                     "column": spot.get("column")})
@@ -272,31 +449,108 @@ def plan():
     return out
 
 
-def restore():
-    chats = plan()
-    if not chats:
-        print("nothing saved to restore")
-        return 0
+def _spread_unplaced(chats, layout):
+    """Chats with no recorded spot get spread over the screens instead of all
+    stacking into one monitor's columns."""
+    mons = sorted({e["monitor"] for e in chats if e["monitor"] is not None})
+    if not mons and layout:
+        mons = sorted(int(m) for m in (layout.get("monitors") or {}))
+    if not mons:
+        mons = [0]
+    i = 0
+    for e in chats:
+        if e["monitor"] is None:
+            e["monitor"] = mons[i % len(mons)]
+            e["spread"] = True
+            i += 1
 
+
+def _command(e):
+    cmd = f"claude-c --open {shlex.quote(e['chat'])}"
+    if e.get("project"):
+        cmd += f" {shlex.quote(e['project'])}"
+    # Drop to a shell afterwards so closing the chat leaves a usable terminal
+    # instead of the window vanishing.
+    return cmd + "; exec bash"
+
+
+def _launch(chats, tiler_up):
+    """Spawn one terminal per chat. Returns how many went through the tiler."""
     n_tiled = 0
     for e in chats:
-        cmd = f"claude-c --open {shlex.quote(e['chat'])}"
-        if e.get("project"):
-            cmd += f" {shlex.quote(e['project'])}"
-        # Drop to a shell afterwards so closing the chat leaves a usable
-        # terminal instead of the window vanishing.
-        cmd += "; exec bash"
+        cmd = _command(e)
         done = False
-        if e.get("monitor") is not None:
+        if tiler_up:
             done = _spawn_tiled(cmd, e.get("cwd"), e["monitor"])
             n_tiled += bool(done)
         if not done:
-            _spawn_plain(cmd, e.get("cwd"))
+            done = _spawn_plain(cmd, e.get("cwd"), e["chat"])
+        if not done:
+            _log(f"could not launch a terminal for {e['chat']}")
         # Let each window map and be claimed before the next one, or the tiler
         # hands columns to whichever window happens to appear first.
         time.sleep(1.2)
+    return n_tiled
 
-    print(f"restored {len(chats)} chats ({n_tiled} tiled)")
+
+def _wait_up(chats, limit):
+    """Which of `chats` came up (a board opening or showing that chat) within
+    `limit` seconds. A chat counts as up once seen, even if it is closed again
+    before the time is over, so a chat you close straight away is not retried."""
+    pending = {e["chat"]: e for e in chats}
+    up = []
+    deadline = time.time() + limit
+    while pending:
+        ids = open_chat_ids()
+        for cid in list(pending):
+            if _is_open(cid, ids):
+                up.append(pending.pop(cid))
+        if not pending or time.time() >= deadline:
+            break
+        time.sleep(2)
+    return up, list(pending.values())
+
+
+def restore():
+    chats = plan()
+    if not chats:
+        _log("nothing saved to restore")
+        return 0
+
+    # Re-running restore (or a chat you already reopened by hand) must not
+    # produce a second terminal fighting over the same conversation.
+    already = open_chat_ids()
+    skipped = [e for e in chats if _is_open(e["chat"], already)]
+    chats = [e for e in chats if not _is_open(e["chat"], already)]
+    if not chats:
+        _log(f"all {len(skipped)} saved chats are already open")
+        return 0
+
+    layout = wait_for_tiler()
+    tiler_up = layout is not None
+    if not tiler_up:
+        _log("Terminal Tiler not answering; restoring untiled")
+    _spread_unplaced(chats, layout)
+
+    n_tiled = _launch(chats, tiler_up)
+    up, missing = _wait_up(chats, UP_WAIT)
+
+    if missing:
+        _log(f"{len(missing)} chats did not come up, retrying: "
+             + " ".join(e["chat"] for e in missing))
+        tiler_up = live_layout() is not None
+        _launch(missing, tiler_up)
+        more, missing = _wait_up(missing, RETRY_WAIT)
+        up += more
+
+    _log(f"restored {len(up)}/{len(chats)} chats ({n_tiled} via the tiler"
+         + (f", {len(skipped)} were already open" if skipped else "") + ")")
+    if missing:
+        ids = " ".join(e["chat"] for e in missing)
+        _log(f"still missing: {ids}")
+        _notify(f"Restored {len(up)} of {len(chats)} Claude chats",
+                f"Did not come back: {ids}\nRun `claude-session restore` to try again.")
+        return 1
     return 0
 
 
@@ -309,13 +563,13 @@ def show():
         return 1
     age = int(time.time() - data.get("saved", 0))
     print(f"restoring the snapshot from {age}s ago ({len(data.get('chats') or [])} chats)")
-    if not LAYOUT.exists():
-        print("(no tiler layout yet — it is written at logout, so the first "
-              "restore comes back untiled)")
+    ids = open_chat_ids()
     for e in plan():
         spot = (f"monitor {e['monitor']} col {e['column']}"
-                if e.get("monitor") is not None else "untiled")
-        print(f"  {e['chat']:<12} {spot:<22} {e.get('project') or '-':<12} {e.get('cwd') or ''}")
+                if e.get("monitor") is not None else "unplaced")
+        state = "open now" if _is_open(e["chat"], ids) else ""
+        print(f"  {e['chat']:<12} {spot:<22} {e.get('project') or '-':<12} "
+              f"{state:<9} {e.get('cwd') or ''}")
     return 0
 
 
@@ -323,7 +577,8 @@ def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "list"
     if cmd == "save":
         entries = save()
-        print(f"saved {len(entries)} open chats -> {SESSION}")
+        placed = sum(1 for e in entries if e.get("monitor") is not None)
+        print(f"saved {len(entries)} open chats ({placed} placed) -> {SESSION}")
         return 0
     if cmd == "restore":
         return restore()
