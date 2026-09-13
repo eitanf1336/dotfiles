@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""claude-c-file: file the current Claude chat on the claude-c board and drop
+the terminal it is open in back onto the board.
+
+  claude-c-file done            file as "Done"
+  claude-c-file not-committed   file as "Done, Not Committed" (the board's key 5)
+
+Meant to be run from inside a chat (the /done and /cdone slash commands): the
+chat is $CLAUDE_CODE_SESSION_ID. Pass --session <id> to file another one.
+
+Filing uses claude-c's own locked JSON writer, so a board open elsewhere never
+loses the edit, and stamps the move time the way pressing 1-6 does (that stamp
+drives the board's recency sort).
+
+Returning to the board: the chat is shown by a `claude attach <id>` (or a
+`claude --resume <id>`) that a board is waiting on. Ending that client is what
+Ctrl+Z does, so the board redraws, and a background agent keeps running.
+It is ended a few seconds late, from a detached process, so Claude still gets
+to print its one-line reply before the terminal flips back.
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CHATS_PY = Path.home() / ".claude" / "chats" / "chats.py"
+DELAY = 3.0
+
+
+def load_board():
+    loader = importlib.machinery.SourceFileLoader("claude_c_board", str(CHATS_PY))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def category_for(word, board):
+    if word == "done":
+        return "Done"
+    if word in ("not-committed", "cdone", "uncommitted"):
+        # The board's own spelling, looked up rather than retyped.
+        return next(c for c in board.CATEGORIES
+                    if c.startswith("Done") and c != "Done")
+    return None
+
+
+def _argv(pid):
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except OSError:
+        return []
+    return [a for a in raw.split("\0") if a]
+
+
+def _same(a, b):
+    return bool(a and b) and (a.startswith(b) or b.startswith(a))
+
+
+def chat_clients(session_id):
+    """PIDs of the claude clients showing this chat in a terminal."""
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        a = _argv(int(entry))
+        if len(a) < 3 or a[0].rsplit("/", 1)[-1] != "claude":
+            continue
+        if a[1] == "attach" and _same(a[2], session_id):
+            pids.append(int(entry))
+        elif "--resume" in a:
+            i = a.index("--resume")
+            if i + 1 < len(a) and _same(a[i + 1], session_id):
+                pids.append(int(entry))
+    return pids
+
+
+def end_later(pids, delay):
+    """Hand the teardown to a process of its own, so this command (and the
+    turn that ran it) is not part of what gets ended."""
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--end",
+         str(delay), *map(str, pids)],
+        start_new_session=True, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _end(delay, pids):
+    time.sleep(delay)
+    for pid in pids:
+        try:
+            # The board runs each chat in a session of its own, so the whole
+            # group is the chat; same SIGTERM the board sends on Ctrl+Z.
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+
+def main(argv):
+    if argv[:1] == ["--end"]:
+        _end(float(argv[1]), [int(p) for p in argv[2:]])
+        return 0
+
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if "--session" in argv:
+        i = argv.index("--session")
+        session = argv[i + 1] if i + 1 < len(argv) else None
+        del argv[i:i + 2]
+    if not argv or not session:
+        print(__doc__.strip())
+        return 2
+
+    board = load_board()
+    cat = category_for(argv[0], board)
+    if not cat:
+        print(f"unknown category {argv[0]!r}: use done or not-committed")
+        return 2
+
+    board._json_set(board.STORE, session, cat)
+    board._json_set(board.MOVED_STORE, session, time.time())
+
+    pids = chat_clients(session)
+    if pids:
+        end_later(pids, DELAY)
+        print(f"Filed as “{cat}”. Back to the board in {int(DELAY)}s.")
+    else:
+        print(f"Filed as “{cat}”. Not open in a claude-c board, so nothing to close.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
