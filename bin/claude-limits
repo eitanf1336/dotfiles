@@ -365,13 +365,20 @@ def show_all(quiet=False, fresh=False):
     except OSError:
         active = None
     width = max(len(n) for n in names)
+    readings = [(n,) + get_usage(n, fresh=fresh) for n in names]
+    # Per-model weekly caps (currently Fable) get their own column whenever any
+    # account reports one, so the table isn't blind to the cap that bites first.
+    cols = list(ALL_COLS)
+    for _n, data, _age, _err in readings:
+        for label, *_ in (collect(data) if data else []):
+            if label.startswith("Weekly (") and label not in cols:
+                cols.append(label)
     if not quiet:
         print(f"{BLD}Claude usage limits{RST} {DIM}(all accounts){RST}\n")
-        head = "  ".join(c.ljust(CELL_W) for c in ALL_COLS)
+        head = "  ".join(c.ljust(CELL_W) for c in cols)
         print(f"   {' ' * width}  {DIM}{head}{RST}")
-    for n in names:
+    for n, data, age, err in readings:
         mark = f"{GRN}*{RST}" if n == active else " "
-        data, age, err = get_usage(n, fresh=fresh)
         rows = collect(data) if data else []
         if not rows:
             why = err.describe(n) if err else "no limits reported"
@@ -381,7 +388,7 @@ def show_all(quiet=False, fresh=False):
         for label, pct, sev, reset in rows:
             by.setdefault(label, (pct, sev, reset))
         cells = []
-        for col in ALL_COLS:
+        for col in cols:
             v = by.get(col)
             if not v:
                 cells.append(f"{GRY}{'n/a'.ljust(CELL_W)}{RST}")
