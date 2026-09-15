@@ -18,6 +18,7 @@ Usage:
   claude-account rm <name>       forget a saved account
   claude-account restore         undo the last switch
   claude-account sync            fold the live tokens back into the active slot
+  claude-account refresh <name>  refresh a parked login now (--force: even if still fresh)
 
 Options:
   -f, --force    switch even while Claude is mid-task
@@ -29,10 +30,17 @@ Switching is live. Claude Code re-reads the credentials file on every turn
 (verified), so chats you already have open move to the new account on their
 next message - nothing to restart, nothing to reopen.
 
+A login parked for hours has an expired token, and switching it in used to hand
+that dead token to every open chat at once: they all raced to refresh it and
+lost with "another Claude Code process is refreshing it". So `use` refreshes the
+parked login first, while no Claude process can touch it, and holds Claude's own
+refresh lock for the moment of the swap.
+
 The one case that isn't seamless is a chat or agent that is working *right now*:
 switching under it would move the rest of that task onto the other account, so
 the switch refuses unless you pass --force. Idle open chats are never in the way.
 """
+import contextlib
 import json
 import os
 import re
@@ -61,6 +69,22 @@ IDENTITY_KEYS = ("oauthAccount", "userID")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 UA = "claude-cli/2.1.221 (claude-account)"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# How Claude Code refreshes a login (read out of the 2.1.272 binary). Used only
+# on a parked login just before it goes live, see refresh_parked().
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+DEFAULT_SCOPES = ("user:profile", "user:inference", "user:sessions:claude_code",
+                  "user:mcp_servers", "user:file_upload")
+OPTIONAL_SCOPES = ("user:projects:read", "user:projects:write", "user:plugins")
+REFRESH_LOCK_STALE = 60     # seconds untouched before Claude calls its lock abandoned
+FRESH_FOR = 3600            # a login going live with less than this left is refreshed first
+
+# Config dirs that install logins from this slot store, with the file naming the
+# slot each one uses: claude-account-deed points ~/.claude-deed at these slots.
+CONFIG_DIRS = ((CLAUDE_DIR, ACTIVE),
+               (os.path.join(HOME, ".claude-deed"),
+                os.path.join(HOME, ".claude-deed", ".active-account")))
 
 use_color = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 if use_color:
@@ -422,6 +446,211 @@ def activate(name):
     set_active(name)
 
 
+# -------------------------------------------------------------- token refresh
+
+def oauth_of(path):
+    """The claudeAiOauth block of a credentials file, or {}."""
+    return (read_json(path, {}) or {}).get("claudeAiOauth") or {}
+
+
+def write_creds(path, oauth):
+    """Replace the claudeAiOauth block of a credentials file, compact the way
+    Claude writes it, keeping anything else in the file."""
+    doc = read_json(path, {}) or {}
+    doc["claudeAiOauth"] = oauth
+    atomic_write(path, json.dumps(doc, separators=(",", ":")), 0o600)
+
+
+def marker(path):
+    """The slot name a config dir's active-account file points at, or ''."""
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def take_lock(path, deadline):
+    """Take a lock the way proper-lockfile (Claude's lock library) does: mkdir,
+    and treat a lock nobody has touched for REFRESH_LOCK_STALE as abandoned."""
+    while time.time() < deadline:
+        try:
+            os.mkdir(path)
+            return True
+        except FileExistsError:
+            try:
+                age = time.time() - os.stat(path).st_mtime
+            except OSError:
+                continue                    # released between mkdir and stat
+            if age > REFRESH_LOCK_STALE:
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
+            else:
+                time.sleep(0.2)
+        except OSError:
+            return False                    # no such config dir: nothing to guard
+    return False
+
+
+@contextlib.contextmanager
+def refresh_lock(config_dir, wait=15.0):
+    """Hold Claude Code's token-refresh lock for one config dir.
+
+    Claude serialises refreshes on <config_dir>/.oauth_refresh.lock, and on
+    <config_dir>.lock, which older versions still take. While we hold both, no
+    Claude process there can rotate the token we are moving. Yields whether both
+    were taken; after `wait` seconds we carry on without them rather than let a
+    stuck process block a switch."""
+    deadline = time.time() + wait
+    paths = (os.path.join(config_dir, ".oauth_refresh.lock"),
+             os.path.realpath(config_dir) + ".lock")
+    held = []
+    for p in paths:
+        if not take_lock(p, deadline):
+            break
+        held.append(p)
+    try:
+        yield len(held) == len(paths)
+    finally:
+        for p in reversed(held):
+            try:
+                os.rmdir(p)
+            except OSError:
+                pass
+
+
+class DeadLogin(Exception):
+    """The server rejected a refresh token. Only a browser login helps."""
+
+
+def oauth_error(err):
+    """(code, description) out of a token endpoint error response."""
+    try:
+        body = json.loads(err.read().decode() or "{}")
+    except (OSError, ValueError):
+        return "", ""
+    e = body.get("error")
+    if isinstance(e, dict):
+        return str(e.get("type") or ""), str(e.get("message") or "")
+    return str(e or ""), str(body.get("error_description") or "")
+
+
+def post_refresh(oauth, timeout=20):
+    """Refresh a token the way Claude Code does and return the new
+    claudeAiOauth block. Raises DeadLogin on invalid_grant, and OSError or
+    ValueError for anything that might work next time."""
+    stored = list(oauth.get("scopes") or [])
+    if oauth.get("clientId") or not ("user:inference" in stored
+                                     or oauth.get("subscriptionType")):
+        attempts = [stored]
+    else:
+        wide = list(DEFAULT_SCOPES) + [s for s in OPTIONAL_SCOPES if s in stored]
+        attempts = [wide, stored] if set(wide) != set(stored) else [wide]
+    for i, scopes in enumerate(attempts):
+        body = json.dumps({"grant_type": "refresh_token",
+                           "refresh_token": oauth["refreshToken"],
+                           "client_id": oauth.get("clientId") or CLIENT_ID,
+                           "scope": " ".join(scopes)}).encode()
+        req = urllib.request.Request(TOKEN_URL, data=body, method="POST", headers={
+            "Content-Type": "application/json", "User-Agent": UA})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = json.loads(r.read().decode())
+            break
+        except urllib.error.HTTPError as e:
+            code, why = oauth_error(e)
+            if code == "invalid_grant":
+                raise DeadLogin(why or code)
+            if code == "invalid_scope" and i + 1 < len(attempts):
+                continue                    # Claude retries with the stored scopes too
+            raise
+    if not data.get("access_token") or not isinstance(data.get("expires_in"), (int, float)):
+        raise ValueError("the token endpoint answered without a token")
+    now = int(time.time() * 1000)
+    new = dict(oauth)
+    new["accessToken"] = data["access_token"]
+    new["refreshToken"] = data.get("refresh_token") or oauth["refreshToken"]
+    new["expiresAt"] = now + int(data["expires_in"] * 1000)
+    if isinstance(data.get("refresh_token_expires_in"), (int, float)):
+        new["refreshTokenExpiresAt"] = now + int(data["refresh_token_expires_in"] * 1000)
+    granted = (data.get("scope") or "").split()
+    if granted:
+        new["scopes"] = granted
+    return new
+
+
+def refresh_parked(name, fresh_for=FRESH_FOR, force=False):
+    """Refresh slot <name>'s login before it goes live. Returns (state, detail).
+
+    A slot sits parked for hours, so by the time it is switched in its access
+    token has usually expired. Every open Claude process then finds the dead
+    token on its next turn and tries to refresh it at the same moment; they
+    queue on Claude's refresh lock, and the ones that give up show "another
+    Claude Code process is refreshing it". That was every switch until
+    2026-09-15. Nothing uses a parked token, so refreshing it here cannot race,
+    and the live file only ever receives a token with hours left on it.
+
+    state: 'fresh' nothing to do, 'refreshed', 'empty' no token, 'live' in use
+    elsewhere under a newer token, 'dead' the server rejected it, 'failed'
+    network or server trouble."""
+    path = slot_cred(name)
+    oauth = oauth_of(path)
+    rt = oauth.get("refreshToken")
+    if not rt:
+        return "empty", ""
+    left = oauth.get("expiresAt", 0) / 1000 - time.time()
+    if left > fresh_for and not force:
+        return "fresh", f"{int(left // 60)}m left"
+
+    # The same login can be live in another config dir right now.
+    twins = []
+    for config_dir, active_file in CONFIG_DIRS:
+        live_rt = oauth_of(os.path.join(config_dir, ".credentials.json")).get("refreshToken")
+        if live_rt == rt:
+            twins.append(config_dir)
+        elif live_rt and marker(active_file) == name:
+            # Live there under a newer token: the slot's copy was rotated away
+            # already, and that dir's Claude keeps its own login fresh.
+            return "live", f"in use in {config_dir}"
+
+    with contextlib.ExitStack() as locks:
+        for config_dir in twins:
+            locks.enter_context(refresh_lock(config_dir))
+        if oauth_of(path).get("refreshToken") != rt or any(
+                oauth_of(os.path.join(d, ".credentials.json")).get("refreshToken") != rt
+                for d in twins):
+            return "live", "it changed while we waited for the lock"
+        try:
+            new = post_refresh(oauth)
+        except DeadLogin as e:
+            return "dead", str(e)
+        except (OSError, ValueError) as e:
+            return "failed", str(e)
+        # The server retired the old refresh token the moment it answered, so
+        # the new pair goes to disk before anything else happens.
+        write_creds(path, new)
+        for config_dir in twins:
+            write_creds(os.path.join(config_dir, ".credentials.json"), new)
+    return "refreshed", f"{int((new['expiresAt'] / 1000 - time.time()) // 60)}m left"
+
+
+def report_refresh(name, state, detail, quiet=False):
+    """One line about what refresh_parked did. Quiet stays silent when nothing
+    happened, so `use` and claude-account-deed only speak up when it matters."""
+    if state == "refreshed":
+        info(f"{DIM}Refreshed '{name}' before it goes live ({detail}).{RST}")
+    elif state == "dead":
+        info(f"{YEL}The server rejected the login saved in '{name}' ({detail}).{RST} "
+             f"{DIM}Run /login once it is live.{RST}")
+    elif state == "failed":
+        info(f"{YEL}Could not refresh '{name}' first ({detail}).{RST} "
+             f"{DIM}Open chats will refresh it themselves.{RST}")
+    elif not quiet:
+        info(f"{DIM}'{name}': {state}" + (f", {detail}" if detail else "") + f".{RST}")
+
+
 # --------------------------------------------------------------------- actions
 
 def cmd_list(args):
@@ -553,8 +782,14 @@ def cmd_use(args):
     if not busy_guard(force):
         return 2
 
+    # A parked login has usually expired by now. Refresh it while it is still
+    # parked, so the open chats are handed hours of token instead of racing
+    # each other to refresh a dead one.
+    report_refresh(name, *refresh_parked(name), quiet=True)
+
     # Tokens rotate as they refresh, so fold the live ones back into the slot
     # we're leaving. Skip it if the live login isn't the one we think it is.
+    folded = False
     if cur and have_live_creds():
         cur_meta = read_json(slot_meta(cur), {}) or {}
         st = live_status() or {}
@@ -563,6 +798,7 @@ def cmd_use(args):
             info(f"{DIM}Saving current tokens back into '{cur}'...{RST}")
             try:
                 snapshot(cur)
+                folded = True
             except SystemExit:
                 raise
             except Exception as e:  # never block a switch on bookkeeping
@@ -573,8 +809,19 @@ def cmd_use(args):
     elif have_live_creds() and not cur:
         info(f"{YEL}Current login isn't saved in any slot - backing it up only.{RST}")
 
-    backup_current()
-    activate(name)
+    # Swap under Claude's own refresh lock. A chat refreshing the outgoing login
+    # right now finishes first, so the token parked here is one the server still
+    # accepts. Without the lock that chat's write lands after the swap, gets
+    # discarded because the file no longer holds the token it posted, and the
+    # parked copy is already dead.
+    with refresh_lock(CLAUDE_DIR) as locked:
+        if not locked:
+            info(f"{DIM}Claude's refresh lock stayed busy - switching without it.{RST}")
+        if folded and has_tokens(CRED):
+            with open(CRED) as fh:
+                atomic_write(slot_cred(cur), fh.read(), 0o600)
+        backup_current()
+        activate(name)
 
     if slot_is_empty:
         info(f"{YEL}Slot '{name}' has no token in it, so you are not logged in "
@@ -754,6 +1001,20 @@ def cmd_sync(args):
     return 0
 
 
+def cmd_refresh(args):
+    """Refresh a parked login now, exactly as `use` does just before switching
+    to it. claude-account-deed runs this before it installs a slot."""
+    pos = [a for a in args if not a.startswith("-")]
+    if not pos:
+        die(f"Usage: {CYA}claude-account refresh <name>{RST} {DIM}[--force]{RST}")
+    name = check_name(pos[0])
+    if name not in profiles():
+        die(f"{RED}No saved account called {name!r}.{RST}")
+    state, detail = refresh_parked(name, force="-f" in args or "--force" in args)
+    report_refresh(name, state, detail, quiet="-q" in args or "--quiet" in args)
+    return 1 if state in ("dead", "failed") else 0
+
+
 def cmd_rm(args):
     pos = [a for a in args if not a.startswith("-")]
     if not pos:
@@ -852,6 +1113,7 @@ COMMANDS = {
     "whoami": cmd_whoami, "who": cmd_whoami, "status": cmd_whoami,
     "restore": cmd_restore, "undo": cmd_restore,
     "sync": cmd_sync,
+    "refresh": cmd_refresh,
 }
 
 

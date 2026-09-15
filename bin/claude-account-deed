@@ -127,6 +127,15 @@ def cmd_use(name, force):
     if busy() and not force:
         die(f"{Y}A deed session is running. Switching now would bill the rest of its\n"
             f"task to the other account. Finish it, or pass --force.{X}")
+    # 0. a parked login has usually expired: refresh it before it goes live, or
+    #    every open deed chat races the others to refresh it at once
+    try:
+        r = subprocess.run(["claude-account", "refresh", name, "-q"],
+                           capture_output=True, text=True, timeout=60)
+        if r.stdout.strip():
+            print(r.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        pass
     d = os.path.join(SLOTS, name)
     empty = not has_tokens(os.path.join(d, "credentials.json"))
     # 1. credentials
