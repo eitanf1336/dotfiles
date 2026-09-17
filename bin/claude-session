@@ -355,8 +355,14 @@ def _notify(summary, body):
 
 
 def _terminal_argv(cmd, cwd):
+    # One -e string, never -x. Terminator is single-process: every launch after
+    # the first is forwarded over D-Bus to the running instance, which joins a
+    # -x argv with plain spaces and re-runs it through `bash -c`. That drops the
+    # quoting, so `bash -lc "claude-c --open ID"` became `bash -lc claude-c
+    # --open ID` and every chat but the first opened as a blank board
+    # (2026-09-17). An -e string goes through `bash -c` intact on both paths.
     return [TERMINAL, "--working-directory", cwd or str(HOME),
-            "-x", "bash", "-lc", cmd]
+            "-e", shlex.join(["bash", "-lc", cmd])]
 
 
 def _spawn_plain(cmd, cwd, chat_id):
