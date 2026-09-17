@@ -256,3 +256,13 @@ gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-left \
 gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-right \
     "['<Super>Page_Down', '<Super>KP_Next', '<Control><Alt>Right']"
 echo "Freed <Super><Alt>Left/Right for terminal-tiler focus movement."
+
+# Tiling Assistant's monitor-switch grace period crashes GNOME Shell (= a
+# sudden logout). When a window is dragged onto another monitor it arms a
+# 150ms timer that later calls get_work_area_for_monitor() on the window; if
+# the window closed mid-drag (a Chrome tab drag-out does this), mutter hits
+# g_assert_not_reached in meta_window_get_workspaces and aborts. Seen twice on
+# 2026-09-17 (09:31, 09:35), both stacks at moveHandler.js:482 -> :497.
+# Off, the preview just follows the pointer's monitor immediately.
+gsettings set org.gnome.shell.extensions.tiling-assistant monitor-switch-grace-period false
+echo "Disabled Tiling Assistant monitor-switch grace period (shell crash)."
