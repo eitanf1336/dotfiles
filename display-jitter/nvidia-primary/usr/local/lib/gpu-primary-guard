@@ -1,0 +1,37 @@
+#!/bin/bash
+# gpu-primary-guard: undo the NVIDIA-primary udev rule if the desktop stops
+# coming up, so a bad switch cannot leave a login loop or a dead screen behind.
+#
+# Two counters in /var/lib/gpu-primary, both reset to 0 by gpu-primary-ok once
+# GNOME Shell actually answers on D-Bus:
+#   bootcount   +1 per boot (this script with --boot, before GDM)
+#   logincount  +1 per graphical login attempt (user unit gpu-primary-login)
+# Two boots or two logins in a row that never reached a live shell -> remove
+# the rule. Without --boot it only checks (run by gpu-primary-guard.path
+# whenever logincount changes).
+set -u
+RULE=/etc/udev/rules.d/61-mutter-primary-gpu.rules
+STATE=/var/lib/gpu-primary
+
+[ -e "$RULE" ] || exit 0        # nothing to guard
+
+read_n() { local n; n=$(cat "$STATE/$1" 2>/dev/null); case "$n" in ''|*[!0-9]*) n=0;; esac; echo "$n"; }
+
+revert() {
+  rm -f "$RULE"
+  udevadm control --reload-rules 2>/dev/null
+  udevadm trigger -s drm 2>/dev/null
+  echo 0 > "$STATE/bootcount"; echo 0 > "$STATE/logincount"
+  echo "gpu-primary-guard: $1 without a working desktop -> reverted to Intel primary GPU" \
+    | systemd-cat -t gpu-primary-guard -p warning
+  exit 0
+}
+
+b=$(read_n bootcount); l=$(read_n logincount)
+if [ "${1:-}" = "--boot" ]; then
+  [ "$b" -ge 2 ] && revert "$b boots"
+  echo "$((b + 1))" > "$STATE/bootcount"
+  chown eitan:eitan "$STATE/bootcount" 2>/dev/null
+fi
+[ "$l" -ge 3 ] && revert "$((l - 1)) logins"
+exit 0

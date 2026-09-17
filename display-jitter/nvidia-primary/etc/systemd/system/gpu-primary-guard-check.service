@@ -1,0 +1,6 @@
+[Unit]
+Description=Revert NVIDIA-primary GPU rule after repeated failed logins
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/gpu-primary-guard

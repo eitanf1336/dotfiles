@@ -1,0 +1,9 @@
+[Unit]
+Description=Re-check the NVIDIA-primary rule whenever a login attempt is counted
+
+[Path]
+PathChanged=/var/lib/gpu-primary/logincount
+Unit=gpu-primary-guard-check.service
+
+[Install]
+WantedBy=multi-user.target

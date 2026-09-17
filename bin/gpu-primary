@@ -18,7 +18,10 @@
 set -euo pipefail
 
 RULE=/etc/udev/rules.d/61-mutter-primary-gpu.rules
-NV_PATH=pci-0000:01:00.0   # ID_PATH of /dev/dri/card0 (NVIDIA)
+NV_PATH=pci-0000:01:00.0   # ID_PATH of the NVIDIA card (card numbers move between boots)
+NV_DEV=/dev/dri/by-path/$NV_PATH-card
+SETUP="$(dirname "$(readlink -f "$0")")/../code/linux-setup/display-jitter/nvidia-primary/setup.sh"
+[ -e "$SETUP" ] || SETUP=/home/eitan/code/linux-setup/display-jitter/nvidia-primary/setup.sh
 
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
@@ -39,7 +42,9 @@ run_root() { local sc; sc=$(mktemp); printf '%s\n' "$1" > "$sc"; chmod 0755 "$sc
 
 case "${1:-status}" in
   nvidia)
+    # Install the guard first (reverts after 2 failed boots or logins), then the rule.
     run_root "set -e
+bash '$SETUP'
 cat > '$RULE' <<'RULEEOF'
 # Managed by \`gpu-primary\`. Makes mutter render on the NVIDIA dGPU instead of
 # the Intel iGPU, so the HDMI monitor is scanned out directly rather than
@@ -50,7 +55,7 @@ RULEEOF
 chmod 0644 '$RULE'
 udevadm control --reload-rules
 udevadm trigger -s drm"
-    echo "primary GPU -> NVIDIA (card0). Takes effect at next login."
+    echo "primary GPU -> NVIDIA ($(readlink -f $NV_DEV)). Takes effect at next login."
     ;;
   intel|default|reset)
     if [ -e "$RULE" ]; then
@@ -62,14 +67,15 @@ udevadm trigger -s drm"
     echo "primary GPU -> stock mutter choice (Intel). Takes effect at next login."
     ;;
   status)
-    if [ -e "$RULE" ]; then echo "configured: NVIDIA (card0)  [$RULE]"
+    if [ -e "$RULE" ]; then echo "configured: NVIDIA ($(readlink -f $NV_DEV))  [$RULE]"
     else echo "configured: stock mutter choice (no rule installed)"; fi
-    tag=$(udevadm info -q all -n /dev/dri/card0 2>/dev/null | grep -c 'mutter-device-preferred-primary' || true)
-    echo "udev tag live on card0: $([ "${tag:-0}" -gt 0 ] && echo yes || echo no)"
+    tag=$(udevadm info -q all -n "$NV_DEV" 2>/dev/null | grep -c 'mutter-device-preferred-primary' || true)
+    echo "udev tag live on NVIDIA: $([ "${tag:-0}" -gt 0 ] && echo yes || echo no)"
     running=$(journalctl -b --no-pager 2>/dev/null | grep 'selected primary' | tail -1 || true)
     echo "running session:  ${running#*gnome-shell*: }"
     n=$(journalctl -b --no-pager 2>/dev/null | grep -c 'lock front buffer' || true)
     echo "front-buffer failures this boot: ${n:-0}"
+    echo "guard counters: boot=$(cat /var/lib/gpu-primary/bootcount 2>/dev/null || echo -) login=$(cat /var/lib/gpu-primary/logincount 2>/dev/null || echo -)"
     ;;
   *) usage ;;
 esac

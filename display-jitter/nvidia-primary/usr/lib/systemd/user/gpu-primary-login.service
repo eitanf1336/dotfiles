@@ -1,0 +1,10 @@
+[Unit]
+Description=Count a graphical login attempt for gpu-primary-guard
+Before=graphical-session-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/gpu-primary-login
+
+[Install]
+WantedBy=graphical-session-pre.target

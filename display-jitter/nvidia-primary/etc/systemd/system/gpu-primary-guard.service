@@ -1,0 +1,14 @@
+[Unit]
+Description=Revert NVIDIA-primary GPU rule if boots or logins stop reaching a desktop
+Before=gdm.service display-manager.service
+DefaultDependencies=no
+After=local-fs.target systemd-udevd.service
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/gpu-primary-guard --boot
+RemainAfterExit=no
+
+[Install]
+WantedBy=sysinit.target
