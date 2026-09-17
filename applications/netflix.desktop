@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Name=Netflix
+Comment=Stream Netflix series and movies
+Exec=/home/eitan/bin/netflix
+Terminal=false
+Type=Application
+Icon=/home/eitan/.local/share/icons/webapps/netflix.png
+Categories=AudioVideo;Video;Player;Network;
+StartupWMClass=chrome-www.netflix.com__browse-Default

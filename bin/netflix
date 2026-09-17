@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Netflix as a standalone desktop app (Chrome --app mode), detached from the
+# terminal so closing the terminal does not take it down with it.
+#
+# Uses a DEDICATED Chrome profile (--user-data-dir) so Netflix gets its own
+# standalone window and its own dock icon, instead of being absorbed by a
+# running Chrome and grouped under the Chrome icon. Sign in to Netflix once in
+# this profile; it persists after that.
+# Google Chrome (not Chromium) ships Widevine, which Netflix needs for DRM
+# playback, so this launcher deliberately uses /usr/bin/google-chrome.
+URL="https://www.netflix.com/browse"
+PROFILE="$HOME/.local/share/netflix-app"
+setsid -f /usr/bin/google-chrome \
+  --app="$URL" \
+  --user-data-dir="$PROFILE" \
+  --class=Netflix \
+  --name=Netflix \
+  "$@" \
+  >/dev/null 2>&1
