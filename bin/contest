@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Report money into The Money War (contest.eitanfrenkel.com) from the shell.
+#   contest eitan 250 "tutoring"   add money
+#   contest medina 1200            add money
+#   contest                        show the standings
+#   contest rm 7                   delete an entry by id
+set -euo pipefail
+
+URL=https://contest.eitanfrenkel.com
+KEY_FILE=~/.config/contest/key
+KEY="${CONTEST_KEY:-$( [ -f "$KEY_FILE" ] && cat "$KEY_FILE" )}"
+[ -n "$KEY" ] || { echo "no key: put the site password in $KEY_FILE or \$CONTEST_KEY" >&2; exit 1; }
+
+# One python does the HTTP and the printing: $1 = command, then its arguments.
+python3 - "$URL" "$KEY" "${1:-standings}" "${2:-}" "${3:-}" <<'PY'
+import json, sys, urllib.request
+
+url, key, cmd, a1, a2 = sys.argv[1:6]
+
+def call(path, data=None, method=None):
+    req = urllib.request.Request(f"{url}/api/{path}?key={key}", method=method,
+                                 data=json.dumps(data).encode() if data else None,
+                                 # Cloudflare 403s the default python-urllib agent string.
+                                 headers={"content-type": "application/json", "user-agent": "contest-cli"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+
+def standings():
+    rows = call("entries")["entries"]
+    tot = {"eitan": 0.0, "medina": 0.0}
+    for r in rows:
+        tot[r["who"]] += r["amount"]
+    for who, amt in tot.items():
+        print(f"{who:>7}: {amt:,.0f} ILS")
+    gap = tot["eitan"] - tot["medina"]
+    print("   lead: dead even" if gap == 0 else f"   lead: {'eitan' if gap > 0 else 'medina'} by {abs(gap):,.0f}")
+    for r in rows[-5:]:
+        print(f"   #{r['id']} {r['who']} +{r['amount']:,.0f} {r.get('note') or ''}")
+
+if cmd in ("standings", "status", ""):
+    standings()
+elif cmd in ("rm", "delete"):
+    call(f"entries/{int(a1)}", method="DELETE")
+    print(f"deleted #{a1}")
+elif cmd in ("eitan", "medina"):
+    e = call("entries", {"who": cmd, "amount": float(a1), "note": a2})["entry"]
+    print(f"logged {e['amount']:,.0f} ILS for {cmd} (#{e['id']})")
+    standings()
+else:
+    sys.exit(f"usage: contest [eitan|medina <amount> [note] | rm <id>]")
+PY
