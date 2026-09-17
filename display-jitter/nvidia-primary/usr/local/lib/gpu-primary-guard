@@ -9,21 +9,48 @@
 # Two boots or two logins in a row that never reached a live shell -> remove
 # the rule. Without --boot it only checks (run by gpu-primary-guard.path
 # whenever logincount changes).
+#
+# It also picks per login: the rule is only wanted AWAY from home. At home the
+# side screens are DisplayLink, and NVIDIA->evdi copies made them unusable
+# (2026-09-03). So while want-nvidia exists, each login gets the rule when no
+# DisplayLink device (USB vendor 17e9) is plugged in, and loses it when one is.
 set -u
 RULE=/etc/udev/rules.d/61-mutter-primary-gpu.rules
 STATE=/var/lib/gpu-primary
+WANT=$STATE/want-nvidia
+NV_PATH=pci-0000:01:00.0
+USBDEV=/sys/bus/usb/devices
+
+reload() { udevadm control --reload-rules 2>/dev/null; udevadm trigger -s drm 2>/dev/null; }
+log() { echo "gpu-primary-guard: $1" | systemd-cat -t gpu-primary-guard -p warning; }
+
+# gpu-primary-login waits for this marker, so the rule is settled before
+# GNOME Shell starts and reads the udev tags.
+[ "${1:-}" != "--boot" ] && trap 'cat "$STATE/logincount" > "$STATE/checked" 2>/dev/null' EXIT
+
+if [ "${1:-}" != "--boot" ] && [ -e "$WANT" ]; then
+  if grep -qx 17e9 "$USBDEV"/*/idVendor 2>/dev/null; then
+    if [ -e "$RULE" ]; then rm -f "$RULE"; reload; log "DisplayLink dock present -> Intel primary for this login"; fi
+    exit 0
+  elif [ ! -e "$RULE" ]; then
+    cat > "$RULE" <<RULEEOF
+# Managed by \`gpu-primary\` / gpu-primary-guard. Render on the NVIDIA dGPU when
+# no DisplayLink dock is attached. Remove with: gpu-primary intel
+ENV{ID_PATH}=="$NV_PATH", SUBSYSTEM=="drm", KERNEL=="card[0-9]", TAG+="mutter-device-preferred-primary"
+RULEEOF
+    chmod 0644 "$RULE"; reload; log "no DisplayLink dock -> NVIDIA primary for this login"
+  fi
+fi
 
 [ -e "$RULE" ] || exit 0        # nothing to guard
 
 read_n() { local n; n=$(cat "$STATE/$1" 2>/dev/null); case "$n" in ''|*[!0-9]*) n=0;; esac; echo "$n"; }
 
 revert() {
-  rm -f "$RULE"
-  udevadm control --reload-rules 2>/dev/null
-  udevadm trigger -s drm 2>/dev/null
+  rm -f "$RULE" "$WANT"
+  reload
   echo 0 > "$STATE/bootcount"; echo 0 > "$STATE/logincount"
-  echo "gpu-primary-guard: $1 without a working desktop -> reverted to Intel primary GPU" \
-    | systemd-cat -t gpu-primary-guard -p warning
+  log "$1 without a working desktop -> reverted to Intel primary GPU for good"
   exit 0
 }
 

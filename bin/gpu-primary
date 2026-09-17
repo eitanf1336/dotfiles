@@ -45,6 +45,7 @@ case "${1:-status}" in
     # Install the guard first (reverts after 2 failed boots or logins), then the rule.
     run_root "set -e
 bash '$SETUP'
+touch /var/lib/gpu-primary/want-nvidia
 cat > '$RULE' <<'RULEEOF'
 # Managed by \`gpu-primary\`. Makes mutter render on the NVIDIA dGPU instead of
 # the Intel iGPU, so the HDMI monitor is scanned out directly rather than
@@ -58,9 +59,9 @@ udevadm trigger -s drm"
     echo "primary GPU -> NVIDIA ($(readlink -f $NV_DEV)). Takes effect at next login."
     ;;
   intel|default|reset)
-    if [ -e "$RULE" ]; then
+    if [ -e "$RULE" ] || [ -e /var/lib/gpu-primary/want-nvidia ]; then
       run_root "set -e
-rm -f '$RULE'
+rm -f '$RULE' /var/lib/gpu-primary/want-nvidia
 udevadm control --reload-rules
 udevadm trigger -s drm"
     fi
@@ -75,6 +76,7 @@ udevadm trigger -s drm"
     echo "running session:  ${running#*gnome-shell*: }"
     n=$(journalctl -b --no-pager 2>/dev/null | grep -c 'lock front buffer' || true)
     echo "front-buffer failures this boot: ${n:-0}"
+    echo "auto mode (NVIDIA unless a DisplayLink dock is plugged in): $([ -e /var/lib/gpu-primary/want-nvidia ] && echo on || echo off)"
     echo "guard counters: boot=$(cat /var/lib/gpu-primary/bootcount 2>/dev/null || echo -) login=$(cat /var/lib/gpu-primary/logincount 2>/dev/null || echo -)"
     ;;
   *) usage ;;

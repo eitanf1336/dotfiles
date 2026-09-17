@@ -1,8 +1,15 @@
 #!/bin/bash
 # Count one graphical login attempt for gpu-primary-guard (see there). Runs as
-# the user at graphical-session-pre, before GNOME Shell starts.
-[ -e /etc/udev/rules.d/61-mutter-primary-gpu.rules ] || exit 0
-f=/var/lib/gpu-primary/logincount
-n=$(cat "$f" 2>/dev/null); case "$n" in ''|*[!0-9]*) n=0;; esac
-echo "$((n + 1))" > "$f" 2>/dev/null || true
+# the user at graphical-session-pre, before GNOME Shell starts, and waits (up
+# to 5s) for the root guard to settle the rule, since the shell reads the udev
+# tags once at startup.
+S=/var/lib/gpu-primary
+[ -e /etc/udev/rules.d/61-mutter-primary-gpu.rules ] || [ -e $S/want-nvidia ] || exit 0
+n=$(cat $S/logincount 2>/dev/null); case "$n" in ''|*[!0-9]*) n=0;; esac
+n=$((n + 1))
+echo "$n" > $S/logincount 2>/dev/null || exit 0
+for _ in $(seq 50); do
+  [ "$(cat $S/checked 2>/dev/null)" = "$n" ] && break
+  sleep 0.1
+done
 exit 0
