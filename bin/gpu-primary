@@ -70,7 +70,7 @@ udevadm trigger -s drm"
   status)
     if [ -e "$RULE" ]; then echo "configured: NVIDIA ($(readlink -f $NV_DEV))  [$RULE]"
     else echo "configured: stock mutter choice (no rule installed)"; fi
-    tag=$(udevadm info -q all -n "$NV_DEV" 2>/dev/null | grep -c 'mutter-device-preferred-primary' || true)
+    tag=$(udevadm info -q property -n "$NV_DEV" 2>/dev/null | grep "^CURRENT_TAGS=" | grep -c mutter-device-preferred-primary || true)
     echo "udev tag live on NVIDIA: $([ "${tag:-0}" -gt 0 ] && echo yes || echo no)"
     running=$(journalctl -b --no-pager 2>/dev/null | grep 'selected primary' | tail -1 || true)
     echo "running session:  ${running#*gnome-shell*: }"
