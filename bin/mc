@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Open Minecraft on the arena server, starting the server and daemon if they are down.
+# Usage: mc [username]        (default Eitan)
+set -euo pipefail
+ROOT="/home/eitan/code/MyProjects/MinecraftArena"
+LOG="$ROOT/runs/mc.log"
+
+# Only java processes count, so this can never match the shell that runs it.
+client_running() {
+	local p
+	for p in $(pgrep -x java 2>/dev/null); do
+		if tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | grep -q "argFiles/runClient"; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+if client_running; then
+	echo "Minecraft is already open."
+	exit 0
+fi
+if [ -z "${DISPLAY:-}" ]; then
+	echo "mc: no DISPLAY. Run this in a terminal on your own desktop." >&2
+	exit 1
+fi
+
+"$ROOT/bin/arena" up
+mkdir -p "$ROOT/runs"
+setsid -f "$ROOT/bin/mc" "$@" > "$LOG" 2>&1
+echo "Minecraft is starting, about a minute the first time. Log: $LOG"
+echo "Then in game chat: !bot <model>, !zombie, !goal <sentence>, !go 60. !help lists all."
