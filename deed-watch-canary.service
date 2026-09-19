@@ -1,0 +1,8 @@
+[Unit]
+Description=Check that something is actually watching the deed portal
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/deed-portal/credentials
+ExecStart=%h/code/MyLittleProjects/DeedPortal/pipeline/venv/bin/python \
+          %h/code/MyLittleProjects/DeedPortal/pipeline/watch_canary.py
