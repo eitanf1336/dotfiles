@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# Hold every screen black until a deadline, without suspending the machine or
+# touching anything that is running.
+#
+#   kipur on [HH:MM | "YYYY-MM-DD HH:MM"]   default: tomorrow's sunset
+#   kipur off
+#   kipur status
+set -uo pipefail
+
+DIR="$HOME/.local/share/kipur"
+CACHE="$HOME/.cache/kipur"
+STATE="$CACHE/state.json"
+PREV="$CACHE/prev.json"
+STOP="$CACHE/stop"
+PARKED="$CACHE/parked"
+UNIT="kipur-blackout"
+ENDUNIT="kipur-end"
+NL_SCHEMA="org.gnome.shell.extensions.displaylink-nightlight"
+NL_DIR="$HOME/.local/share/gnome-shell/extensions/displaylink-nightlight@eitan.local/schemas"
+SUNRISE_CFG="$HOME/.config/sunrise-alarm/config.json"
+KEYPATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/kipur-off/"
+mkdir -p "$CACHE"
+
+nl() { local op="$1"; shift; GSETTINGS_SCHEMA_DIR="$NL_DIR" gsettings "$op" "$NL_SCHEMA" "$@"; }
+
+sunset_epoch() {  # sunset for the Israeli coast, for the date given as $1 (YYYY-MM-DD)
+    python3 - "$1" <<'PY'
+import math, sys, datetime, time
+lat, lon, tz = 32.29, 34.85, 3.0
+d = datetime.date.fromisoformat(sys.argv[1])
+N = d.timetuple().tm_yday
+lngHour = lon / 15.0
+t = N + ((18 - lngHour) / 24.0)
+M = (0.9856 * t) - 3.289
+L = (M + 1.916 * math.sin(math.radians(M)) + 0.020 * math.sin(math.radians(2 * M)) + 282.634) % 360
+RA = math.degrees(math.atan(0.91764 * math.tan(math.radians(L)))) % 360
+RA = (RA + (math.floor(L / 90) * 90 - math.floor(RA / 90) * 90)) / 15.0
+sinDec = 0.39782 * math.sin(math.radians(L))
+cosDec = math.cos(math.asin(sinDec))
+cosH = (math.cos(math.radians(90.833)) - sinDec * math.sin(math.radians(lat))) / (cosDec * math.cos(math.radians(lat)))
+H = math.degrees(math.acos(cosH)) / 15.0
+UT = (H + RA - (0.06571 * t) - 6.622 - lngHour) % 24
+h = int(UT + tz); mnt = int(round(((UT + tz) - h) * 60))
+if mnt == 60: h += 1; mnt = 0
+print(int(time.mktime(datetime.datetime(d.year, d.month, d.day, h, mnt).timetuple())))
+PY
+}
+
+json_get() { python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],sys.argv[3]))" "$1" "$2" "$3" 2>/dev/null; }
+json_set() { python3 -c "
+import json,sys
+p=sys.argv[1]
+d=json.load(open(p))
+v=sys.argv[3]
+d[sys.argv[2]] = {'true':True,'false':False}.get(v,v)
+json.dump(d,open(p,'w'),indent=2)
+" "$1" "$2" "$3"; }
+
+install_escape_key() {
+    local list cur
+    cur=$(gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings)
+    if [[ "$cur" != *"kipur-off"* ]]; then
+        list=$(python3 -c "
+import ast,sys
+l=ast.literal_eval(sys.argv[1]); p=sys.argv[2]
+if p not in l: l.append(p)
+print(str(l))" "$cur" "$KEYPATH")
+        gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "$list"
+    fi
+    local S="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEYPATH"
+    gsettings set "$S" name 'End Yom Kippur blackout'
+    gsettings set "$S" command "$HOME/.local/bin/kipur off"
+    gsettings set "$S" binding '<Control><Alt><Shift>k'
+}
+
+start() {
+    local when="${1:-}" until_epoch today tomorrow
+    today=$(date +%F); tomorrow=$(date -d tomorrow +%F)
+    if [[ -z "$when" ]]; then
+        until_epoch=$(sunset_epoch "$tomorrow")
+    elif [[ "$when" =~ ^[0-9]{1,2}:[0-9]{2}$ ]]; then
+        until_epoch=$(date -d "$when" +%s)
+        [[ "$until_epoch" -le "$(date +%s)" ]] && until_epoch=$(date -d "tomorrow $when" +%s)
+    else
+        until_epoch=$(date -d "$when" +%s)
+    fi
+    if [[ -z "$until_epoch" || "$until_epoch" -le "$(date +%s)" ]]; then
+        echo "kipur: that deadline is not in the future" >&2; exit 1
+    fi
+
+    # Remember what we are about to change, so off/ can put it all back.
+    python3 - "$PREV" "$(nl get brightness)" "$(json_get "$SUNRISE_CFG" enabled true)" <<'PY'
+import json, sys
+json.dump({"nl_brightness": sys.argv[2].strip(),
+           "sunrise_enabled": sys.argv[3].strip()},
+          open(sys.argv[1], "w"), indent=2)
+PY
+    echo "{\"until\": $until_epoch, \"started\": $(date +%s)}" > "$STATE"
+    rm -f "$STOP"
+
+    # Second layer: the shell's own dim overlay, so anything that ever gets
+    # drawn above the black windows (a popup, a notification) is dark too.
+    nl set brightness 0.1 >/dev/null 2>&1
+    # The 09:30 sunrise alarm would light the room and start Spotify mid-fast.
+    [[ -f "$SUNRISE_CFG" ]] && json_set "$SUNRISE_CFG" enabled false
+    systemctl --user stop sunrise-alarm.timer 2>/dev/null
+    # No interruptions: silence the speakers and park every timer that opens a
+    # window or plays something. Claude's own keep-alive timers stay running.
+    wpctl set-mute @DEFAULT_AUDIO_SINK@ 1 2>/dev/null
+    : > "$PARKED"
+    for t in git-morning-check.timer surf-report.timer ai-detect-nag.timer \
+             snap.firmware-updater.firmware-notifier.timer advertising-post-stats.timer; do
+        if systemctl --user is-active --quiet "$t"; then
+            systemctl --user stop "$t" 2>/dev/null && echo "$t" >> "$PARKED"
+        fi
+    done
+    install_escape_key
+
+    systemctl --user stop "$UNIT.service" 2>/dev/null
+    systemd-run --user --unit="$UNIT" --description="Yom Kippur blackout" \
+        --property=Restart=on-failure --property=RestartSec=2 \
+        --setenv=GDK_BACKEND=wayland \
+        --setenv=WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
+        --setenv=DISPLAY="${DISPLAY:-:0}" \
+        --setenv=XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+        --setenv=DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
+        -- systemd-inhibit --what=sleep:idle:handle-lid-switch --who=kipur \
+           --why="Yom Kippur blackout: stay awake, keep everything running" \
+           --mode=block \
+           /usr/bin/python3 "$DIR/blackout.py" >/dev/null 2>&1
+
+    # Belt and braces: an independent timer that lifts the blackout even if the
+    # app itself is gone by then.
+    systemctl --user stop "$ENDUNIT.timer" 2>/dev/null
+    systemd-run --user --unit="$ENDUNIT" --on-calendar="$(date -d "@$until_epoch" '+%Y-%m-%d %H:%M:%S')" \
+        --timer-property=AccuracySec=10s \
+        -- "$HOME/.local/bin/kipur" off >/dev/null 2>&1
+
+    echo "Blackout on. Screens dark until $(date -d "@$until_epoch" '+%a %d %b %H:%M')."
+    echo "Nothing suspended, nothing stopped. End early: Ctrl+Alt+Shift+K, or 'kipur off'."
+}
+
+stop_all() {
+    touch "$STOP"
+    systemctl --user stop "$ENDUNIT.timer" 2>/dev/null
+    systemctl --user stop "$UNIT.service" 2>/dev/null
+    if [[ -f "$PREV" ]]; then
+        local b s
+        b=$(json_get "$PREV" nl_brightness 1.0); s=$(json_get "$PREV" sunrise_enabled True)
+        nl set brightness "$b" >/dev/null 2>&1
+        if [[ -f "$SUNRISE_CFG" ]]; then
+            if [[ "${s,,}" == "true" ]]; then
+                json_set "$SUNRISE_CFG" enabled true
+                systemctl --user start sunrise-alarm.timer 2>/dev/null
+            else
+                json_set "$SUNRISE_CFG" enabled false
+            fi
+        fi
+    else
+        nl set brightness 1.0 >/dev/null 2>&1
+    fi
+    wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 2>/dev/null
+    if [[ -f "$PARKED" ]]; then
+        while read -r t; do [[ -n "$t" ]] && systemctl --user start "$t" 2>/dev/null; done < "$PARKED"
+        rm -f "$PARKED"
+    fi
+    rm -f "$STATE"
+    echo "Blackout off. Screens back, brightness restored, sunrise alarm re-armed."
+}
+
+case "${1:-status}" in
+    on|start) shift; start "${1:-}" ;;
+    off|stop|end) stop_all ;;
+    status)
+        if systemctl --user is-active --quiet "$UNIT.service"; then
+            u=$(json_get "$STATE" until 0)
+            echo "blackout: ON until $(date -d "@${u%.*}" '+%a %d %b %H:%M')"
+        else
+            echo "blackout: off"
+        fi ;;
+    *) echo "usage: kipur {on [HH:MM|'YYYY-MM-DD HH:MM'] | off | status}" >&2; exit 1 ;;
+esac

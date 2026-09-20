@@ -26,3 +26,4 @@ These are GNOME `media-keys` custom shortcuts. Restore them with `keybindings/re
 | Read Aloud selection | `<Control><Shift>l` | `/home/eitan/code/Technion/Research/read-aloud/speak-selection.sh` |
 | Calculate selection (popup) | `<Control><Alt>c` | `/home/eitan/.local/bin/calc` |
 | New Claude chat (terminal straight into a fresh chat in System) | `<Control><Alt>y` | `/home/eitan/bin/claude-new-chat` |
+| End Yom Kippur blackout | `<Control><Alt><Shift>k` | `/home/eitan/.local/bin/kipur off` |

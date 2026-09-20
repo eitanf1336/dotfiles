@@ -266,3 +266,10 @@ echo "Freed <Super><Alt>Left/Right for terminal-tiler focus movement."
 # Off, the preview just follows the pointer's monitor immediately.
 gsettings set org.gnome.shell.extensions.tiling-assistant monitor-switch-grace-period false
 echo "Disabled Tiling Assistant monitor-switch grace period (shell crash)."
+
+paths+=("/kipur-off/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/kipur-off/"
+gsettings set "$k" name 'End Yom Kippur blackout'
+gsettings set "$k" binding '<Control><Alt><Shift>k'
+gsettings set "$k" command '/home/eitan/.local/bin/kipur off'
+
