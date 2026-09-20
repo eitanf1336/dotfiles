@@ -116,25 +116,52 @@ PY
     done
     install_escape_key
 
-    systemctl --user stop "$UNIT.service" 2>/dev/null
-    systemd-run --user --unit="$UNIT" --description="Yom Kippur blackout" \
-        --property=Restart=on-failure --property=RestartSec=2 \
-        --setenv=GDK_BACKEND=wayland \
-        --setenv=WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
-        --setenv=DISPLAY="${DISPLAY:-:0}" \
-        --setenv=XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
-        --setenv=DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
-        -- systemd-inhibit --what=sleep:idle:handle-lid-switch --who=kipur \
-           --why="Yom Kippur blackout: stay awake, keep everything running" \
-           --mode=block \
-           /usr/bin/python3 "$DIR/blackout.py" >/dev/null 2>&1
+    # Real unit files, not systemd-run transients: a transient unit dies with the
+    # session, which would leave the screens fine after a reboot but the audio
+    # muted and the alarm disarmed with nothing left to put them back.
+    local UD="$HOME/.config/systemd/user"
+    mkdir -p "$UD"
+    cat > "$UD/$UNIT.service" <<EOF
+[Unit]
+Description=Yom Kippur blackout
+PartOf=graphical-session.target
+After=graphical-session.target
 
-    # Belt and braces: an independent timer that lifts the blackout even if the
-    # app itself is gone by then.
-    systemctl --user stop "$ENDUNIT.timer" 2>/dev/null
-    systemd-run --user --unit="$ENDUNIT" --on-calendar="$(date -d "@$until_epoch" '+%Y-%m-%d %H:%M:%S')" \
-        --timer-property=AccuracySec=10s \
-        -- "$HOME/.local/bin/kipur" off >/dev/null 2>&1
+[Service]
+Type=simple
+Environment=GDK_BACKEND=wayland
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle:handle-lid-switch --who=kipur --why=Yom-Kippur-blackout --mode=block /usr/bin/python3 $DIR/blackout.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+    cat > "$UD/$ENDUNIT.service" <<EOF
+[Unit]
+Description=Lift the Yom Kippur blackout
+
+[Service]
+Type=oneshot
+ExecStart=$HOME/.local/bin/kipur off
+EOF
+    cat > "$UD/$ENDUNIT.timer" <<EOF
+[Unit]
+Description=Lift the Yom Kippur blackout at the deadline
+
+[Timer]
+OnCalendar=$(date -d "@$until_epoch" '+%Y-%m-%d %H:%M:%S')
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS 2>/dev/null
+    systemctl --user enable --now "$ENDUNIT.timer" >/dev/null 2>&1
+    systemctl --user enable "$UNIT.service" >/dev/null 2>&1
+    systemctl --user restart "$UNIT.service" >/dev/null 2>&1
 
     echo "Blackout on. Screens dark until $(date -d "@$until_epoch" '+%a %d %b %H:%M')."
     echo "Nothing suspended, nothing stopped. End early: Ctrl+Alt+Shift+K, or 'kipur off'."
@@ -142,8 +169,14 @@ PY
 
 stop_all() {
     touch "$STOP"
+    systemctl --user disable --now "$ENDUNIT.timer" 2>/dev/null
     systemctl --user stop "$ENDUNIT.timer" 2>/dev/null
+    systemctl --user disable "$UNIT.service" 2>/dev/null
     systemctl --user stop "$UNIT.service" 2>/dev/null
+    rm -f "$HOME/.config/systemd/user/$UNIT.service" \
+          "$HOME/.config/systemd/user/$ENDUNIT.service" \
+          "$HOME/.config/systemd/user/$ENDUNIT.timer"
+    systemctl --user daemon-reload 2>/dev/null
     if [[ -f "$PREV" ]]; then
         local b s
         b=$(json_get "$PREV" nl_brightness 1.0); s=$(json_get "$PREV" sunrise_enabled True)

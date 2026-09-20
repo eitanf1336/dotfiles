@@ -20,16 +20,23 @@ from gi.repository import Gtk, Gdk, GLib, Pango  # noqa: E402
 STATE = os.path.expanduser("~/.cache/kipur/state.json")
 STOP = os.path.expanduser("~/.cache/kipur/stop")
 HINT_SECONDS = 20
-ESCAPE_PRESSES = 5          # Escape this many times within ESCAPE_WINDOW ends it
-ESCAPE_WINDOW = 6.0
+# Deliberate exits only. A plain-Escape route was tried and a stray burst of
+# keystrokes lifted the blackout by accident within seconds, which is exactly
+# what a blackout must not do.
 
 
 def deadline():
+    """Epoch to stay black until. No state, or a deadline already past, means
+    there is no blackout to hold: exit rather than invent one, so a stray start
+    (a login, a restart) can never black the screens out of nowhere."""
     try:
         with open(STATE) as fh:
-            return float(json.load(fh)["until"])
+            until = float(json.load(fh)["until"])
     except Exception:
-        return time.time() + 3600
+        sys.exit(0)
+    if until <= time.time():
+        sys.exit(0)
+    return until
 
 
 class Blackout:
@@ -71,7 +78,7 @@ class Blackout:
                 "גמר חתימה טובה\n\n"
                 "screens stay dark until %s\n"
                 "everything running keeps running\n\n"
-                "Ctrl+Alt+Shift+K  ·  or Escape five times  ·  ends it"
+                "Ctrl+Alt+Shift+K  ends it early"
                 "</span>" % end)
             label.set_line_wrap(True)
             attrs = Pango.AttrList()
@@ -103,12 +110,6 @@ class Blackout:
         key = Gdk.keyval_name(event.keyval) or ""
         if ctrl and shift and key.lower() == "q":
             self.finish()
-        if key == "Escape":
-            now = time.time()
-            self.escapes = [t for t in self.escapes if now - t < ESCAPE_WINDOW]
-            self.escapes.append(now)
-            if len(self.escapes) >= ESCAPE_PRESSES:
-                self.finish()
         return True     # swallow every keystroke; nothing reaches the desktop
 
     # -- loop -------------------------------------------------------------
