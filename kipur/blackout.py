@@ -43,13 +43,14 @@ class Blackout:
     def __init__(self):
         self.until = deadline()
         self.windows = []
-        self.escapes = []
+        self.hint_timer = None
+        self.last_touch = 0.0
         self.display = Gdk.Display.get_default()
         self.build()
         self.display.connect("monitor-added", lambda *_: self.rebuild())
         self.display.connect("monitor-removed", lambda *_: self.rebuild())
         GLib.timeout_add_seconds(2, self.tick)
-        GLib.timeout_add_seconds(HINT_SECONDS, self.hide_hint)
+        self.hint_timer = GLib.timeout_add_seconds(HINT_SECONDS, self.hide_hint)
 
     # -- windows ----------------------------------------------------------
     def build(self):
@@ -66,6 +67,10 @@ class Blackout:
             win.set_accept_focus(True)
             win.connect("delete-event", lambda *_: True)   # unclosable
             win.connect("key-press-event", self.on_key)
+            win.connect("button-press-event", self.on_touch)
+            win.connect("motion-notify-event", self.on_touch)
+            win.add_events(Gdk.EventMask.POINTER_MOTION_MASK |
+                           Gdk.EventMask.BUTTON_PRESS_MASK)
 
             box = Gtk.EventBox()
             box.override_background_color(
@@ -101,10 +106,29 @@ class Blackout:
     def hide_hint(self):
         for _, label in self.windows:
             label.hide()
+        self.hint_timer = None
         return False
+
+    def show_hint(self):
+        """Bring the way out back on screen. The screens are black, so a reply
+        in a terminal is unreadable: the only place the exit shortcut can be
+        told is the black itself, whenever he touches the machine."""
+        for _, label in self.windows:
+            label.show()
+        if self.hint_timer is not None:
+            GLib.source_remove(self.hint_timer)
+        self.hint_timer = GLib.timeout_add_seconds(HINT_SECONDS, self.hide_hint)
+
+    def on_touch(self, _w, event):
+        now = time.time()
+        if now - self.last_touch > 1.0:
+            self.last_touch = now
+            self.show_hint()
+        return True
 
     # -- input ------------------------------------------------------------
     def on_key(self, _win, event):
+        self.on_touch(_win, event)
         ctrl = event.state & Gdk.ModifierType.CONTROL_MASK
         shift = event.state & Gdk.ModifierType.SHIFT_MASK
         key = Gdk.keyval_name(event.keyval) or ""
