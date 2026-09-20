@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""unswap - pull a running program's memory back out of swap, without restarting it.
+
+An app that has been sitting in zram for hours is not slow, it is frozen: every
+click waits on hundreds of megabytes being decompressed back page by page.
+Spotify was measured at 6.4 MILLION major page faults in one renderer process.
+Restarting the app fixes it and loses your place; this does not.
+
+It reads /proc/PID/pagemap to find exactly which pages are in swap, then touches
+only those through /proc/PID/mem. The target is only ever READ from.
+
+  unswap spotify          match by name (all matching processes)
+  unswap 12345 12346      by pid
+  unswap --dry spotify    report how much is in swap, change nothing
+
+Needs root (Yama ptrace_scope=1 lets a process poke only its own descendants),
+so it re-runs itself under pkexec: a password dialog appears on your screen.
+Written 2026-09-20, the day "spotify keeps freezing" turned out to be this.
+"""
+import os, re, struct, subprocess, sys
+
+PAGE = os.sysconf("SC_PAGE_SIZE")
+SWAPPED = 1 << 62
+
+
+def vmas(pid):
+    out = []
+    with open(f"/proc/{pid}/maps") as f:
+        for line in f:
+            m = re.match(r"([0-9a-f]+)-([0-9a-f]+) (\S{4})\s+\S+ \S+ \S+\s*(.*)", line)
+            if not m:
+                continue
+            perms, path = m.group(3), m.group(4).strip()
+            if perms[0] != "r" or path in ("[vsyscall]", "[vvar]", "[vvar_vclock]"):
+                continue
+            out.append((int(m.group(1), 16), int(m.group(2), 16)))
+    return out
+
+
+def swapped_pages(pm, pid):
+    for start, end in vmas(pid):
+        n = (end - start) // PAGE
+        base = (start // PAGE) * 8
+        done = 0
+        while done < n:
+            chunk = min(n - done, 8192)
+            try:
+                buf = os.pread(pm, chunk * 8, base + done * 8)
+            except OSError:
+                break
+            if not buf:
+                break
+            for i in range(len(buf) // 8):
+                if struct.unpack_from("<Q", buf, i * 8)[0] & SWAPPED:
+                    yield start + (done + i) * PAGE
+            done += chunk
+
+
+def run(pid, dry):
+    try:
+        pm = os.open(f"/proc/{pid}/pagemap", os.O_RDONLY)
+    except OSError as e:
+        return f"  pid {pid}: skipped ({e.strerror})"
+    mem = None
+    try:
+        if not dry:
+            mem = os.open(f"/proc/{pid}/mem", os.O_RDONLY)
+        n = 0
+        for addr in swapped_pages(pm, pid):
+            if mem is not None:
+                try:
+                    os.pread(mem, 1, addr)
+                except OSError:
+                    continue
+            n += 1
+    finally:
+        os.close(pm)
+        if mem is not None:
+            os.close(mem)
+    try:
+        name = open(f"/proc/{pid}/comm").read().strip()
+    except OSError:
+        name = "?"
+    verb = "in swap" if dry else "pulled back into RAM"
+    return f"  pid {pid:<8} {name:<16} {n * PAGE / 1048576:7.0f} MB {verb}"
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a not in ("--dry", "-n")]
+    dry = len(args) != len(sys.argv[1:])
+    if not args:
+        sys.exit(__doc__.strip().splitlines()[0] + "\nusage: unswap [--dry] <name|pid>...")
+
+    pids = []
+    for a in args:
+        if a.isdigit():
+            pids.append(a)
+        else:
+            found = subprocess.run(["pgrep", "-f", a], capture_output=True, text=True).stdout.split()
+            if not found:
+                print(f"unswap: nothing matching {a!r} is running", file=sys.stderr)
+            pids += found
+    def is_self(p):  # pgrep -f also matches this command line and its shell
+        try:
+            return "unswap" in open(f"/proc/{p}/cmdline").read()
+        except OSError:
+            return True
+    pids = [p for p in dict.fromkeys(pids)
+            if os.path.exists(f"/proc/{p}") and not is_self(p)]
+    if not pids:
+        sys.exit(1)
+
+    if os.geteuid() != 0:
+        env = os.environ
+        for k, v in (("DISPLAY", ":0"), ("WAYLAND_DISPLAY", "wayland-0"),
+                     ("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+                     ("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus")):
+            env.setdefault(k, v)
+        print("unswap: a password dialog will appear on your screen.", flush=True)
+        os.execvp("pkexec", ["pkexec", sys.executable, os.path.abspath(__file__),
+                             *(["--dry"] if dry else []), *pids])
+
+    print(f"unswap: {len(pids)} process(es)")
+    for pid in pids:
+        print(run(pid, dry), flush=True)
+
+
+main()

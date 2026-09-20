@@ -15,6 +15,11 @@ mkdir -p "$BIN" "$SYSD"
 echo "==> claude-spare-reaper -> $BIN"
 install -m 0755 "$HERE/claude-spare-reaper" "$BIN/claude-spare-reaper"
 
+echo "==> unswap -> $BIN"
+# Pulls an app's pages back out of zram without restarting it. See README,
+# "Spotify keeps freezing".
+install -m 0755 "$HERE/../bin/unswap" "$BIN/unswap"
+
 echo "==> systemd user units -> $SYSD"
 install -m 0644 "$HERE/claude-spare-reaper.service" "$SYSD/claude-spare-reaper.service"
 install -m 0644 "$HERE/claude-spare-reaper.timer"   "$SYSD/claude-spare-reaper.timer"
@@ -42,6 +47,7 @@ install -m 0644 "$HERE/user-dropins/session.slice.d/50-memory-protection.conf" \
         "$SYSD/session.slice.d/50-memory-protection.conf"
 systemctl --user daemon-reload
 systemctl --user set-property --runtime session.slice MemoryMin=1G MemoryLow=2G || true
+systemctl --user set-property --runtime app.slice MemoryMin=2G MemoryLow=3G || true
 
 # Long-running background user services: cap them so a parked dev server can
 # never take the whole machine. Only units that actually exist are touched.

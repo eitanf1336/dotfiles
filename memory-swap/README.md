@@ -238,6 +238,105 @@ which covers the *other* cause of the same visual symptom.
 
 ---
 
+## Cause 6: an app can be frozen while every system metric looks fine (2026-09-20)
+
+**Symptom:** "spotify keeps freezing". Not audio glitching, not slow startup:
+the window stops responding for seconds at a time, at random, all day.
+
+Nothing in the usual places showed it. Spotify's CPU was low, its RSS was a
+modest 431 MB, `free` was tight but not desperate, and the app was not in any
+uninterruptible state. The number that told the whole story was one nobody
+looks at:
+
+```bash
+awk '{print "majflt", $12}' /proc/$(pgrep -f 'snap/spotify.*--type=renderer')/stat
+```
+
+**6,465,174 major page faults** in the renderer, 3,019,852 in the main process.
+A major fault is a page that had to be fetched from *storage* (here: decompressed
+out of zram). Six million of them is not an app with a memory problem, it is an
+app being repeatedly evicted and dragged back, and every one of those round
+trips is a frame the UI does not draw.
+
+Two confirmations, both from the scope's own cgroup:
+
+```bash
+S=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/snap.spotify.spotify-*.scope
+cat $S/memory.swap.current   # 807 MB of Spotify was living in zram
+grep '^low ' $S/memory.events # low 6,264,447 -- protection breached 6.2M times
+```
+
+`memory.events low` is the counter that matters: it is the number of times
+reclaim went *through* the scope's `MemoryLow`. Spotify already had
+`MemoryLow=512M` from Cause 3's drop-in, and it had been ignored six million
+times, because **`MemoryLow` is best-effort** and `vm.swappiness` here is 180.
+A soft hint loses to an aggressive reclaimer every time.
+
+### The fix: two harder knobs
+
+`user-dropins/snap.spotify.spotify-.scope.d/60-never-freeze.conf`
+
+```ini
+[Scope]
+MemoryMin=1200M      # HARD floor: these pages are never reclaimed, at all
+MemoryLow=2G
+MemorySwapMax=0      # its anonymous pages can never enter swap again
+IOWeight=1000
+```
+
+`MemorySwapMax=0` is the one that ends the freeze. It is not a limit and it
+cannot kill anything: it says the kernel may not solve its problems by pushing
+*this* app into zram, so the zram round trips simply stop existing. `MemoryMin`
+covers the other half of the fault count, the mapped code pages that would
+otherwise be evicted back to the snap's compressed squashfs.
+
+`MemoryMin` is only real if every ancestor reserves as much (Cause 5 again), and
+the chain was quietly capped: `app.slice` asked for 1G, `session.slice` asked for
+1G, and their shared parent offered 1G, so each got about **512M effective**,
+less than Spotify alone needs. Raised together:
+
+| cgroup | was | now |
+|---|---|---|
+| `user.slice`, `user-.slice`, `user@.service` | min 1G / low 2G | **min 3G / low 4G** |
+| `app.slice` | min 1G / low 3G | **min 2G / low 3G** |
+| Spotify's scope | min 0 / low 512M | **min 1200M / low 2G**, swap 0 |
+
+### Result, measured 45 seconds after applying
+
+| | before | after |
+|---|---|---|
+| `memory.events low` breaches | ~350 / second | **0** |
+| renderer major faults | 6.4M lifetime | **+241 in 45s** |
+| Spotify in zram | 807 MB | **0 MB** |
+| Spotify resident | 140 MB | 916 MB |
+
+### `unswap`: fixing it without restarting the app
+
+Setting `MemorySwapMax=0` stops *future* swapout but does not drag back what is
+already in zram: those 807 MB still had to be faulted in one page at a time, and
+until they were, the app stayed frozen. Restarting Spotify fixes that and loses
+your place mid-song.
+
+`bin/unswap` does it live instead. It reads `/proc/PID/pagemap` to find exactly
+which pages are swapped (bit 62), then touches only those through
+`/proc/PID/mem`. The target is only ever read from.
+
+```bash
+unswap spotify          # pull it all back into RAM now
+unswap --dry chrome     # just report how much is in swap
+```
+
+It needs root (Yama `ptrace_scope=1` lets a process poke only its descendants),
+so it re-runs itself under `pkexec` and a password dialog appears on screen.
+
+### The lesson
+
+Spotify was never the problem and no per-app setting inside Spotify could have
+helped. "This one app freezes" on a loaded machine is a **reclaim** question, and
+the answer is in `memory.events` and `/proc/PID/stat` field 12, not in `top`.
+
+---
+
 ## Reproduce (fresh machine)
 
 ```bash
