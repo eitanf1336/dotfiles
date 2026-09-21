@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""Take one monitor's light down to nothing, and put it back.
+
+Painting a screen black leaves the backlight at full, so the panel still glows
+dark grey. This turns the light itself down, per monitor:
+
+  * a laptop panel  -> logind SetBrightness on its backlight device (no root)
+  * a DDC/CI monitor -> ddcutil VCP 0x10
+  * a DisplayLink screen -> nothing; it answers no DDC and has no backlight the
+    machine can reach, so black pixels are its floor.
+
+Usage:
+  screen-dark --at X,Y on|off     the monitor whose logical origin is X,Y
+  screen-dark <connector> on|off  e.g. HDMI-1, eDP-1
+  screen-dark restore-all         put every monitor this tool dimmed back
+  screen-dark status
+"""
+import fcntl
+import json
+import os
+import subprocess
+import sys
+
+CACHE = os.path.expanduser("~/.cache/screen-dark")
+BUSES = os.path.join(CACHE, "buses.json")
+BACKLIGHT_DIR = "/sys/class/backlight"
+DDC_TIMEOUT = 20
+
+
+def run(cmd, timeout=DDC_TIMEOUT):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return 1, "", "unavailable"
+
+
+# --- monitor identity -------------------------------------------------------
+
+def logical_monitors():
+    """[(x, y, connector)] straight from Mutter, so an index never has to be
+    guessed: the caller hands us a position and we name the output."""
+    rc, out, _ = run(["gdbus", "call", "-e", "-d", "org.gnome.Mutter.DisplayConfig",
+                      "-o", "/org/gnome/Mutter/DisplayConfig",
+                      "-m", "org.gnome.Mutter.DisplayConfig.GetCurrentState"], 15)
+    if rc != 0:
+        return []
+    import re
+    # logical monitors: (x, y, scale, transform, primary, [(connector, ...)], ...)
+    found = []
+    # gdbus prints "uint32" only on the first tuple of the list, so it is optional.
+    for m in re.finditer(r"\((-?\d+),\s*(-?\d+),\s*[\d.]+,\s*(?:uint32 )?\d+,\s*"
+                         r"(?:true|false),\s*\[\('([A-Za-z0-9-]+)'", out):
+        found.append((int(m.group(1)), int(m.group(2)), m.group(3)))
+    return found
+
+
+def connector_at(x, y):
+    for mx, my, conn in logical_monitors():
+        if mx == x and my == y:
+            return conn
+    return None
+
+
+# --- the two ways to take the light down ------------------------------------
+
+def backlight_device(connector):
+    """A laptop panel's backlight. Only eDP/LVDS panels have one."""
+    if not connector.startswith(("eDP", "LVDS", "DSI")):
+        return None
+    try:
+        devs = os.listdir(BACKLIGHT_DIR)
+    except OSError:
+        return None
+    return devs[0] if devs else None
+
+
+def ddc_bus(connector):
+    """The i2c bus of a DDC/CI monitor, cached: a full detect costs seconds."""
+    cache = {}
+    if os.path.exists(BUSES):
+        try:
+            cache = json.load(open(BUSES))
+        except Exception:
+            cache = {}
+    if connector in cache:
+        return cache[connector]
+
+    rc, out, _ = run(["ddcutil", "detect", "--brief"], 90)
+    if rc != 0:
+        return None
+    bus = cur = None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("I2C bus:"):
+            cur = line.split("/dev/i2c-")[-1].strip()
+        elif line.startswith("DRM connector:") and cur:
+            # card2-HDMI-A-1 -> HDMI-1, matching Mutter's connector names
+            name = line.split(":", 1)[1].strip()
+            name = name.split("-", 1)[1] if "-" in name else name
+            name = name.replace("HDMI-A-", "HDMI-").replace("DP-", "DP-")
+            cache[name] = cur
+            cur = None
+    os.makedirs(CACHE, exist_ok=True)
+    json.dump(cache, open(BUSES, "w"), indent=2)
+    return cache.get(connector)
+
+
+def statefile(connector):
+    return os.path.join(CACHE, "%s.json" % connector.replace("/", "_"))
+
+
+def dark_on(connector):
+    dev = backlight_device(connector)
+    if dev:
+        path = os.path.join(BACKLIGHT_DIR, dev, "brightness")
+        try:
+            prior = int(open(path).read().strip())
+        except OSError:
+            return "no backlight"
+        if prior == 0:
+            return "already dark"
+        save(connector, {"kind": "backlight", "device": dev, "prior": prior})
+        set_backlight(dev, 0)
+        return "backlight %s: %d -> 0" % (dev, prior)
+
+    bus = ddc_bus(connector)
+    if bus:
+        rc, out, _ = run(["ddcutil", "--bus", bus, "getvcp", "10"])
+        if rc != 0:
+            return "ddc unreachable"
+        prior = None
+        for tok in out.split():
+            if tok.rstrip(",").isdigit() and "current value" in out:
+                pass
+        import re
+        m = re.search(r"current value\s*=\s*(\d+)", out)
+        if m:
+            prior = int(m.group(1))
+        if prior is None:
+            return "ddc gave no level"
+        save(connector, {"kind": "ddc", "bus": bus, "prior": prior})
+        run(["ddcutil", "--bus", bus, "setvcp", "10", "0"])
+        return "ddc bus %s: %d -> 0" % (bus, prior)
+
+    return "no light control (DisplayLink or unknown); black pixels only"
+
+
+def dark_off(connector):
+    st = load(connector)
+    if not st:
+        return "was not dimmed"
+    if st["kind"] == "backlight":
+        set_backlight(st["device"], st["prior"])
+    else:
+        run(["ddcutil", "--bus", st["bus"], "setvcp", "10", str(st["prior"])])
+    try:
+        os.remove(statefile(connector))
+    except OSError:
+        pass
+    return "restored to %d" % st["prior"]
+
+
+def set_backlight(device, value):
+    sid = subprocess.run(["loginctl", "show-session", "self", "-p", "Id", "--value"],
+                         capture_output=True, text=True).stdout.strip()
+    if not sid:
+        sid = subprocess.run(["bash", "-c",
+                              "loginctl | awk '/%s/{print $1; exit}'" % os.environ.get("USER", "")],
+                             capture_output=True, text=True).stdout.strip()
+    run(["busctl", "call", "org.freedesktop.login1",
+         "/org/freedesktop/login1/session/%s" % sid,
+         "org.freedesktop.login1.Session", "SetBrightness", "ssu",
+         "backlight", device, str(value)], 10)
+
+
+def save(connector, data):
+    os.makedirs(CACHE, exist_ok=True)
+    json.dump(data, open(statefile(connector), "w"))
+
+
+def load(connector):
+    try:
+        return json.load(open(statefile(connector)))
+    except Exception:
+        return None
+
+
+def restore_all():
+    if not os.path.isdir(CACHE):
+        return "nothing to restore"
+    done = []
+    for f in os.listdir(CACHE):
+        if f.endswith(".json") and f != "buses.json":
+            done.append("%s: %s" % (f[:-5], dark_off(f[:-5])))
+    return "\n".join(done) if done else "nothing was dimmed"
+
+
+def lock():
+    """One brightness change at a time. Super+B pressed twice quickly would
+    otherwise put two ddcutil conversations on the same i2c bus at once, and
+    the monitor answers neither of them properly."""
+    os.makedirs(CACHE, exist_ok=True)
+    fh = open(os.path.join(CACHE, "lock"), "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    except OSError:
+        pass
+    return fh
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip()); return 0
+    if args[0] == "restore-all":
+        _l = lock()
+        print(restore_all()); return 0
+    if args[0] == "status":
+        for m in logical_monitors():
+            st = load(m[2])
+            print("%-10s at %d,%d  %s" % (m[2], m[0], m[1],
+                  "DIMMED (was %s)" % st["prior"] if st else "normal"))
+        return 0
+
+    if args[0] == "--at":
+        if len(args) < 3:
+            print("usage: screen-dark --at X,Y on|off", file=sys.stderr); return 1
+        try:
+            x, y = (int(v) for v in args[1].split(","))
+        except ValueError:
+            print("bad position", file=sys.stderr); return 1
+        connector = connector_at(x, y)
+        action = args[2]
+        if not connector:
+            print("no monitor at %d,%d" % (x, y), file=sys.stderr); return 1
+    else:
+        connector, action = args[0], (args[1] if len(args) > 1 else "on")
+
+    _l = lock()
+    print("%s: %s" % (connector, dark_on(connector) if action == "on" else dark_off(connector)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

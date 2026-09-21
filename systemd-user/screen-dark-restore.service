@@ -1,0 +1,10 @@
+[Unit]
+Description=Put back any monitor brightness left turned down
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/screen-dark restore-all
+
+[Install]
+WantedBy=graphical-session.target

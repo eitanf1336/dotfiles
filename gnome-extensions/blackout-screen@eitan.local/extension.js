@@ -2,9 +2,30 @@ import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
+import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+
+// Helper that takes the monitor's actual light down as well as painting it
+// black. An opaque black overlay still leaves the backlight at full, so the
+// panel glows dark grey; screen-dark drops the laptop backlight or the
+// monitor's own DDC/CI brightness to zero. It is spawned, never waited on:
+// a DDC conversation takes a second or two and the overlay must be instant.
+// A DisplayLink screen answers neither, so there it is a no-op and the black
+// pixels are the floor.
+const SCREEN_DARK = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'screen-dark']);
+
+function screenDark(args) {
+    try {
+        if (!GLib.file_test(SCREEN_DARK, GLib.FileTest.IS_EXECUTABLE))
+            return;
+        Gio.Subprocess.new([SCREEN_DARK, ...args], Gio.SubprocessFlags.NONE);
+    } catch (e) {
+        logError(e, 'Blackout Screen: screen-dark failed');
+    }
+}
 
 // Toggle an opaque black overlay over the monitor the pointer is currently on.
 // On Wayland (GNOME/Mutter) a normal app cannot pin itself on top of a chosen
@@ -60,6 +81,9 @@ export default class BlackoutScreen extends Extension {
             if (global.display.get_monitor_in_fullscreen(idx)) {
                 this._overlays.get(idx).destroy();
                 this._overlays.delete(idx);
+                const m = Main.layoutManager.monitors[idx];
+                if (m)
+                    screenDark(['--at', `${m.x},${m.y}`, 'off']);
             }
         }
         this._syncUnredirect();
@@ -110,6 +134,9 @@ export default class BlackoutScreen extends Extension {
             this._overlays.delete(idx);
             if (existing.get_parent()) {
                 existing.destroy();
+                const m = Main.layoutManager.monitors[idx];
+                if (m)
+                    screenDark(['--at', `${m.x},${m.y}`, 'off']);
                 this._syncUnredirect();
                 return;
             }
@@ -141,13 +168,19 @@ export default class BlackoutScreen extends Extension {
         Main.layoutManager.uiGroup.set_child_above_sibling(overlay, null);
 
         this._overlays.set(idx, overlay);
+        screenDark(['--at', `${monitor.x},${monitor.y}`, 'on']);
         this._syncUnredirect();
     }
 
     _clearAll() {
+        const had = this._overlays.size > 0;
         for (const overlay of this._overlays.values())
             overlay.destroy();
         this._overlays.clear();
+        // The monitor layout may already have changed under us, so a position
+        // would no longer resolve: restore by what was actually dimmed.
+        if (had)
+            screenDark(['restore-all']);
         this._syncUnredirect();
     }
 }
