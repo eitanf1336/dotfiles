@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Software brightness (dim) control for all monitors via the
-# DisplayLink Night Light overlay extension. Works on DisplayLink/EVDI
-# screens that have no hardware brightness. Cannot go brighter than the
-# panel's own maximum — it only dims.
+# Brightness for every screen, using whatever each one actually has.
+#
+# A screen with a real backlight or DDC/CI brightness is turned down for real:
+# better blacks, less light in the room, and the pixels stay untouched. A
+# DisplayLink screen has neither, so it keeps the software dimming overlay.
+# Those two must never both apply to one monitor or it darkens twice and stops
+# matching the others, so the hardware-driven screens are listed in the
+# overlay's `no-dim-at` key and the overlay skips them.
 #
 # Usage: brightness {low|med|high|full|up|down|<10-100>|status}
 
@@ -11,6 +15,7 @@ export GSETTINGS_SCHEMA_DIR="$HOME/.local/share/gnome-shell/extensions/displayli
 KEY="brightness"
 MIN=0.10
 STEP=0.10
+SCREEN_DARK="$HOME/.local/bin/screen-dark"
 
 usage() {
     echo "Usage: brightness {low|med|high|full|up|down|<10-100>|status}"
@@ -18,15 +23,30 @@ usage() {
 }
 
 clamp() { awk -v v="$1" -v lo="$MIN" 'BEGIN{ if(v<lo)v=lo; if(v>1)v=1; printf "%.2f", v }'; }
+cur() { gsettings get "$SCHEMA" "$KEY"; }
+
+# Tell the overlay which monitors dim in hardware, so it leaves those alone.
+sync_exempt() {
+    [ -x "$SCREEN_DARK" ] || return 0
+    local pos list=""
+    pos=$("$SCREEN_DARK" positions 2>/dev/null) || return 0
+    for p in $pos; do list="$list'$p',"; done
+    gsettings set "$SCHEMA" no-dim-at "[${list%,}]" 2>/dev/null || true
+}
 
 set_val() {
     local v pct; v=$(clamp "$1")
-    gsettings set "$SCHEMA" "$KEY" "$v"
     pct=$(awk -v v="$v" 'BEGIN{printf "%d", v*100}')
+
+    sync_exempt
+    gsettings set "$SCHEMA" "$KEY" "$v"
+    # Detached: a DDC conversation takes a second or two and a keypress must not
+    # wait for it. screen-dark coalesces, so holding the key still ends up on
+    # the last value rather than crawling through every step.
+    [ -x "$SCREEN_DARK" ] && setsid -f "$SCREEN_DARK" level "$pct" >/dev/null 2>&1
+
     echo "Brightness: ${pct}%"
 }
-
-cur() { gsettings get "$SCHEMA" "$KEY"; }
 
 case "${1,,}" in
     low)   set_val 0.30 ;;
@@ -37,10 +57,13 @@ case "${1,,}" in
     down)  set_val "$(awk -v c="$(cur)" -v s="$STEP" 'BEGIN{printf "%.2f", c-s}')" ;;
     status)
         echo "brightness: $(awk -v v="$(cur)" 'BEGIN{printf "%d%%", v*100}')"
+        if [ -x "$SCREEN_DARK" ]; then
+            hw=$("$SCREEN_DARK" positions 2>/dev/null)
+            [ -n "$hw" ] && echo "in hardware at: $hw" || echo "in hardware at: none (overlay only)"
+        fi
         ;;
     ''|-h|--help) usage ;;
     *)
-        # numeric percentage 10-100
         if [[ "$1" =~ ^[0-9]+$ ]]; then
             set_val "$(awk -v p="$1" 'BEGIN{printf "%.2f", p/100}')"
         else

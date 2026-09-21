@@ -9,6 +9,10 @@ STATE="$HOME/.cache/displaylink-nightlight.present"
 
 g() { gsettings get "$SCHEMA" "$1"; }
 s() { gsettings set "$SCHEMA" "$1" "$2"; }
+# Route brightness through the brightness command, never straight at the key:
+# it is the thing that also drives the real backlight and DDC brightness, and
+# setting the key alone would leave the hardware wherever it was.
+b() { "$HOME/.local/bin/brightness" "$1" >/dev/null 2>&1; }
 
 enter() {
     # Save current state once (so repeated 'on' doesn't clobber the original).
@@ -20,8 +24,8 @@ enter() {
         } > "$STATE"
     fi
     s active false
-    s brightness 1.0
-    echo "Clean mode ON — tint off, brightness 100%"
+    b full
+    echo "Clean mode ON, tint off, brightness 100%"
 }
 
 leave() {
@@ -29,7 +33,7 @@ leave() {
         . "$STATE"
         s active "$active"
         s intensity "$intensity"
-        s brightness "$brightness"
+        b "$(awk -v v="$brightness" 'BEGIN{printf "%d", v*100}')"
         rm -f "$STATE"
         echo "Restored — tint=$active intensity=$intensity brightness=$brightness"
     else

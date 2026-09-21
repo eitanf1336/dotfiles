@@ -28,5 +28,10 @@
       <default><![CDATA[['<Super><Shift>n']]]></default>
       <summary>Keyboard shortcut to toggle the tint</summary>
     </key>
+    <key name="no-dim-at" type="as">
+      <default>[]</default>
+      <summary>Monitor origins ("x,y") whose brightness is driven in hardware, so the software dim must skip them</summary>
+      <description>A screen with a real backlight or DDC/CI brightness is dimmed for real. Applying the overlay dim to it as well would darken it twice and it would no longer match the screens that only have the overlay.</description>
+    </key>
   </schema>
 </schemalist>

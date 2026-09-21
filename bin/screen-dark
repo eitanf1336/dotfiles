@@ -25,6 +25,8 @@ CACHE = os.path.expanduser("~/.cache/screen-dark")
 BUSES = os.path.join(CACHE, "buses.json")
 BACKLIGHT_DIR = "/sys/class/backlight"
 DDC_TIMEOUT = 20
+TARGET = os.path.join(CACHE, "target")
+WORKER = os.path.join(CACHE, "worker.lock")
 
 
 def run(cmd, timeout=DDC_TIMEOUT):
@@ -86,9 +88,14 @@ def ddc_bus(connector):
     if connector in cache:
         return cache[connector]
 
+    # A miss must be recorded too. A DisplayLink screen answers no DDC, and
+    # without a negative entry every brightness keypress would pay for a fresh
+    # detect looking for an answer that never comes.
     rc, out, _ = run(["ddcutil", "detect", "--brief"], 90)
     if rc != 0:
         return None
+    for _x, _y, conn in logical_monitors():
+        cache.setdefault(conn, None)
     bus = cur = None
     for line in out.splitlines():
         line = line.strip()
@@ -101,6 +108,8 @@ def ddc_bus(connector):
             name = name.replace("HDMI-A-", "HDMI-").replace("DP-", "DP-")
             cache[name] = cur
             cur = None
+    for _x, _y, conn in logical_monitors():
+        cache.setdefault(conn, None)
     os.makedirs(CACHE, exist_ok=True)
     json.dump(cache, open(BUSES, "w"), indent=2)
     return cache.get(connector)
@@ -209,6 +218,87 @@ def lock():
     return fh
 
 
+# --- absolute level, for the brightness keys and the sunrise ramp -----------
+
+def hardware_monitors():
+    """[(connector, x, y)] for every screen whose real light this machine can
+    drive. A DisplayLink screen is absent from this list, which is what tells
+    the overlay it still has to dim that one in software."""
+    out = []
+    for x, y, conn in logical_monitors():
+        if backlight_device(conn) or ddc_bus(conn):
+            out.append((conn, x, y))
+    return out
+
+
+def apply_level(connector, pct):
+    pct = max(0, min(100, int(pct)))
+    # A screen blacked out by Super+B stays black: move the level it will be
+    # restored to instead of fighting the blackout.
+    st = load(connector)
+    if st:
+        dev_max = 100
+        if st["kind"] == "backlight":
+            dev_max = read_max(st["device"])
+        st["prior"] = int(round(dev_max * pct / 100.0))
+        save(connector, st)
+        return None
+
+    dev = backlight_device(connector)
+    if dev:
+        set_backlight(dev, int(round(read_max(dev) * pct / 100.0)))
+        return None
+    bus = ddc_bus(connector)
+    if bus:
+        rc, _out, err = run(["ddcutil", "--bus", bus, "setvcp", "10", str(pct)])
+        if rc != 0:
+            # A write that did not land must not be reported as one that did.
+            return "FAILED (%s)" % (err.strip().splitlines()[-1] if err.strip() else "rc %d" % rc)
+    return None
+
+
+def read_max(device):
+    try:
+        return int(open(os.path.join(BACKLIGHT_DIR, device, "max_brightness")).read().strip()) or 100
+    except OSError:
+        return 100
+
+
+def level(pct):
+    """Set every hardware-capable screen to pct.
+
+    Coalescing matters: holding Super+minus queues a keypress every few tens of
+    milliseconds while one DDC conversation takes a second or two. So the target
+    is written down and only one worker runs; later presses just move the target
+    and exit, and the worker picks up the newest value when it comes round. The
+    screen follows the last press instead of crawling through every one."""
+    os.makedirs(CACHE, exist_ok=True)
+    with open(TARGET, "w") as fh:
+        fh.write(str(int(pct)))
+
+    fh = open(WORKER, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return "queued (a worker already has it)"
+
+    applied = None
+    done = []
+    while True:
+        try:
+            target = int(open(TARGET).read().strip())
+        except Exception:
+            break
+        if target == applied:
+            break
+        applied = target
+        done = []
+        for conn, _x, _y in hardware_monitors():
+            problem = apply_level(conn, target)
+            done.append(conn if not problem else "%s %s" % (conn, problem))
+    return "set %s to %s%%" % (", ".join(done) or "nothing", applied)
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):
@@ -216,6 +306,13 @@ def main():
     if args[0] == "restore-all":
         _l = lock()
         print(restore_all()); return 0
+    if args[0] == "level":
+        if len(args) < 2:
+            print("usage: screen-dark level <0-100>", file=sys.stderr); return 1
+        print(level(args[1])); return 0
+    if args[0] == "positions":
+        # what the dimming overlay must skip, since these screens dim for real
+        print(" ".join("%d,%d" % (x, y) for _c, x, y in hardware_monitors())); return 0
     if args[0] == "status":
         for m in logical_monitors():
             st = load(m[2])

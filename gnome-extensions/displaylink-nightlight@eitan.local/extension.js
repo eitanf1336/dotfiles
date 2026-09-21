@@ -112,6 +112,8 @@ export default class DisplayLinkNightLight extends Extension {
         this._monitorsChangedId =
             Main.layoutManager.connect('monitors-changed', () => this._rebuild());
 
+        this._settings.connect('changed::no-dim-at', () => this._rebuild());
+
         for (const key of ['active', 'intensity', 'tint-color', 'brightness']) {
             this._signalIds.push(
                 this._settings.connect(`changed::${key}`, () => this._updateStyle()));
@@ -128,8 +130,11 @@ export default class DisplayLinkNightLight extends Extension {
                 if (!this._slider)
                     return;
                 const v = this._settings.get_double('intensity') / MAX_INTENSITY;
-                if (Math.abs(v - this._slider.value) > 0.001)
+                if (Math.abs(v - this._slider.value) > 0.001) {
+                    this._syncingTint = true;
                     this._slider.value = v;
+                    this._syncingTint = false;
+                }
             }));
 
         this._addIndicator();
@@ -176,12 +181,20 @@ export default class DisplayLinkNightLight extends Extension {
         const allMonitors = this._settings.get_boolean('all-monitors');
         const primaryIndex = Main.layoutManager.primaryIndex;
         const uiGroup = Main.layoutManager.uiGroup;
+        // Screens whose real brightness is being driven (a laptop backlight, a
+        // DDC/CI monitor). They are already dimmed in hardware, so adding the
+        // overlay dim on top would darken them twice and they would stop
+        // matching the DisplayLink screens, which have only the overlay.
+        // Matched by origin because a monitor index means nothing outside the
+        // shell, while Mutter and the shell agree on a logical position.
+        const noDimAt = new Set(this._settings.get_strv('no-dim-at'));
 
         Main.layoutManager.monitors.forEach((monitor, index) => {
             if (!allMonitors && index === primaryIndex)
                 return;
 
             const overlay = new OverlayActor({reactive: false});
+            overlay.noDim = noDimAt.has(`${monitor.x},${monitor.y}`);
             overlay.set_position(monitor.x, monitor.y);
             overlay.set_size(monitor.width, monitor.height);
             uiGroup.add_child(overlay);
@@ -208,8 +221,11 @@ export default class DisplayLinkNightLight extends Extension {
         const dimAlpha = Math.max(0, Math.min(0.9, 1 - brightness));
 
         this._overlays.forEach(o => {
-            o.setState(mr, mg, mb, tr, tg, tb, fa, tintOn, dimAlpha);
-            o.visible = tintOn || dimAlpha > 0.001;
+            // The warm tint still applies everywhere: no monitor can do that in
+            // hardware. Only the dim is skipped.
+            const a = o.noDim ? 0 : dimAlpha;
+            o.setState(mr, mg, mb, tr, tg, tb, fa, tintOn, a);
+            o.visible = tintOn || a > 0.001;
         });
     }
 
@@ -243,8 +259,17 @@ export default class DisplayLinkNightLight extends Extension {
         }));
         const tintSlider = new Slider(this._settings.get_double('intensity') / MAX_INTENSITY);
         tintSlider.x_expand = true;
-        tintSlider.connect('notify::value',
-            () => this._settings.set_double('intensity', tintSlider.value * MAX_INTENSITY));
+        // A slider updated FROM the setting must not write back TO it. The two
+        // handlers otherwise form a loop, and a value that does not survive the
+        // round trip exactly comes back changed: setting 40% was intermittently
+        // bouncing to 60% about a second later. Harmless when the overlay was
+        // the only dimming, and not harmless now that the same number also
+        // drives real backlights, which would then disagree with the overlay.
+        tintSlider.connect('notify::value', () => {
+            if (this._syncingTint)
+                return;
+            this._settings.set_double('intensity', tintSlider.value * MAX_INTENSITY);
+        });
         tintItem.add_child(tintSlider);
         indicator.menu.addMenuItem(tintItem);
         this._slider = tintSlider;
@@ -257,14 +282,20 @@ export default class DisplayLinkNightLight extends Extension {
         }));
         const dimSlider = new Slider((this._settings.get_double('brightness') - 0.1) / 0.9);
         dimSlider.x_expand = true;
-        dimSlider.connect('notify::value',
-            () => this._settings.set_double('brightness', 0.1 + dimSlider.value * 0.9));
+        dimSlider.connect('notify::value', () => {
+            if (this._syncingDim)
+                return;
+            this._settings.set_double('brightness', 0.1 + dimSlider.value * 0.9);
+        });
         dimItem.add_child(dimSlider);
         indicator.menu.addMenuItem(dimItem);
         this._signalIds.push(this._settings.connect('changed::brightness', () => {
             const v = (this._settings.get_double('brightness') - 0.1) / 0.9;
-            if (Math.abs(v - dimSlider.value) > 0.001)
+            if (Math.abs(v - dimSlider.value) > 0.001) {
+                this._syncingDim = true;
                 dimSlider.value = v;
+                this._syncingDim = false;
+            }
         }));
 
         indicator.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
