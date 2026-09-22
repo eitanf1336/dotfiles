@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# freshen - a soft restart: clear the junk that piles up when the laptop never reboots,
+# without closing anything you actually use.
+#
+# What it clears (each one is something that really accumulated on this machine):
+#   1. makefast -y     stuck CPU clock, desktop priority, abandoned dev servers,
+#                      crash-looping units, orphaned Claude spares.
+#   2. Idle Claude spares   warm "bg-spare" processes that sit at 0 CPU with nothing
+#                      attached, older than 20 min. The daemon spawns new ones when
+#                      it needs them; a parked chat is reopened from its transcript.
+#   3. Orphaned headless Chrome   invisible Chromes whose launcher is gone (parent is
+#                      systemd or init). One of these burned 7 cores for an hour.
+#   4. Orphaned chrome-devtools-mcp   automation servers whose Claude chat is gone.
+#   5. Orphaned timeout/sleep wrappers left by dead Claude shells.
+#   6. Desktop back into RAM   unswap gnome-shell and Xwayland, if there is room.
+#
+# What it never touches: your Chrome, Spotify, JetBrains, PolyArena or any other
+# systemd service, live Claude chats (busy or attached), WhatsApp bridge/bot, editors,
+# terminals, or anything it cannot positively classify as junk.
+#
+# Usage:  freshen        clean, then show the memory table
+#         freshen -n     dry run: say what it would kill, kill nothing
+set -uo pipefail
+DRY=0; [ "${1:-}" = "-n" ] && DRY=1
+MYPID=$$
+freed_before=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+swap_before=$(awk '/SwapFree/{print $2}' /proc/meminfo)
+
+say() { printf '  %s\n' "$*"; }
+hdr() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+zap() {  # zap <pid> <why>
+  local pid=$1 why=$2
+  [ "$pid" = "$MYPID" ] && return
+  if [ $DRY = 1 ]; then say "would kill $pid: $why"; return; fi
+  kill "$pid" 2>/dev/null && say "killed $pid: $why"
+}
+cmdline() { tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null; }
+ppid_of() { awk '/^PPid:/{print $2}' "/proc/$1/status" 2>/dev/null; }
+pcomm() { cat "/proc/$1/comm" 2>/dev/null; }
+age_s() { local st; st=$(stat -c %Y "/proc/$1" 2>/dev/null) || return 1; echo $(( $(date +%s) - st )); }
+orphaned() {  # parent is init or the user systemd
+  local pp; pp=$(ppid_of "$1"); [ "$pp" = "1" ] && return 0
+  [ "$(pcomm "$pp")" = "systemd" ]
+}
+cpu_ticks() { awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null; }
+
+hdr "1. makefast"
+if command -v makefast >/dev/null; then
+  if [ $DRY = 1 ]; then makefast -n | tail -n +2 | sed 's/^/  /' | tail -12; else makefast -y | tail -n +2 | sed 's/^/  /' | tail -12; fi
+else say "makefast not installed, skipped"; fi
+
+hdr "2. idle Claude spares"
+declare -A t0
+spares=()
+for p in $(pgrep -x claude); do
+  c=$(cmdline "$p"); case "$c" in *"--bg-spare"*) ;; *) continue;; esac
+  spares+=("$p"); t0[$p]=$(cpu_ticks "$p")
+done
+if [ ${#spares[@]} -gt 0 ]; then
+  sleep 3
+  n=0
+  for p in "${spares[@]}"; do
+    [ -d "/proc/$p" ] || continue
+    t1=$(cpu_ticks "$p"); a=$(age_s "$p" || echo 0)
+    kids=$(pgrep -P "$p" | wc -l)
+    if [ $((t1 - ${t0[$p]})) -le 1 ] && [ "$a" -gt 1200 ] && [ "$kids" -eq 0 ]; then
+      zap "$p" "idle Claude spare, $((a/60)) min old"; n=$((n+1))
+    fi
+  done
+  [ $n -eq 0 ] && say "none idle (${#spares[@]} spares, all busy or fresh)"
+else say "no spares running"; fi
+
+hdr "3. orphaned headless Chrome"
+n=0
+for p in $(pgrep -f -- '--headless' 2>/dev/null); do
+  [ "$(pcomm "$p")" = "chrome" ] || continue
+  c=$(cmdline "$p"); case "$c" in *"--type="*) continue;; esac     # only the browser process, children follow it
+  if orphaned "$p"; then zap "$p" "headless Chrome with no owner, $(( $(age_s "$p")/60 )) min old"; n=$((n+1)); fi
+done
+[ $n -eq 0 ] && say "none"
+
+hdr "4. orphaned chrome-devtools-mcp"
+n=0
+for p in $(pgrep -f 'chrome-devtools-mcp' 2>/dev/null); do
+  [ "$(pcomm "$p")" = "node" ] || continue
+  if orphaned "$p"; then zap "$p" "devtools MCP with no Claude chat"; n=$((n+1)); fi
+done
+[ $n -eq 0 ] && say "none"
+
+hdr "5. orphaned wrappers"
+n=0
+for p in $(pgrep -x timeout) $(pgrep -x sleep); do
+  if orphaned "$p" && [ "$(age_s "$p" || echo 0)" -gt 3600 ]; then zap "$p" "$(pcomm "$p") with no owner, $(( $(age_s "$p")/3600 )) h old"; n=$((n+1)); fi
+done
+[ $n -eq 0 ] && say "none"
+
+hdr "6. desktop back into RAM"
+avail=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+if command -v unswap >/dev/null && [ "$avail" -gt 2500000 ] && [ $DRY = 0 ]; then
+  for prog in gnome-shell Xwayland; do unswap "$prog" 2>/dev/null | tail -1 | sed 's/^/  /'; done
+else say "skipped ($(( avail/1024 )) MB available; needs 2.5 GB free, and not in dry run)"; fi
+
+hdr "result"
+sleep 2
+freed_after=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+swap_after=$(awk '/SwapFree/{print $2}' /proc/meminfo)
+printf '  RAM available %+d MB, swap free %+d MB\n' $(( (freed_after - freed_before)/1024 )) $(( (swap_after - swap_before)/1024 ))
+command -v memtop >/dev/null && memtop --text | head -10 | sed 's/^/  /'
