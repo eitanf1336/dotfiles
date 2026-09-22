@@ -11,6 +11,12 @@ can't be taken right now is shown from cache with its age instead of vanishing,
 and the reason it couldn't be taken is named rather than always blamed on a
 stale token.
 
+A saved account's token expires after ~8h, so reading any account he hasn't
+switched to today used to need `claude-account use <name>` by hand first. It no
+longer does: a parked token is refreshed in place (via `claude-account
+refresh`, which never touches the live login) and the read retried, so -a just
+shows the numbers.
+
 Usage:
   claude-limits            pretty summary of every limit
   claude-limits <account>  limits for an account saved by claude-account
@@ -28,6 +34,8 @@ import os
 import sys
 import json
 import time
+import shutil
+import subprocess
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -125,8 +133,13 @@ class UsageError(Exception):
             when = f", try again in {int(left // 60) + 1}m" if left > 0 else ""
             return f"usage endpoint is rate-limiting{when}"
         if self.kind == "auth":
-            who = account or "<account>"
-            return f"token rejected; run `claude-account use {who}` to refresh"
+            if not account:
+                return "token rejected; run `claude` once to refresh it"
+            # The saved token is refreshed automatically before it is used, so
+            # reaching here means even the refresh token is spent: only a real
+            # login helps.
+            return (f"login expired; `claude-account use {account}` "
+                    f"and sign in again")
         if self.kind == "network":
             return f"can't reach the endpoint ({self.detail})"
         return self.detail or "endpoint error"
@@ -157,7 +170,7 @@ def cache_read(account):
     return data, age, blob.get("retry_at")
 
 
-def cache_write(account, data=None, retry_at=None):
+def cache_write(account, data=None, retry_at=None, refresh_failed_at=None):
     """Record a good reading, a cooldown, or both. Never fatal."""
     try:
         os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
@@ -172,6 +185,8 @@ def cache_write(account, data=None, retry_at=None):
             prev["at"] = time.time()
         if retry_at is not None:
             prev["retry_at"] = retry_at
+        if refresh_failed_at is not None:
+            prev["refresh_failed_at"] = refresh_failed_at
         path = cache_path(account)
         tmp = f"{path}.tmp-{os.getpid()}"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -180,6 +195,63 @@ def cache_write(account, data=None, retry_at=None):
         os.replace(tmp, path)
     except OSError:
         pass
+
+
+# ------------------------------------------------------- parked-token repair
+# A parked account's saved token expires after ~8h, so any account he hasn't
+# switched to today answers 401 and its row went blank until he ran
+# `claude-account use <name>` by hand. There is no reason to make him: a parked
+# login is nobody's live session, so its refresh token can be spent right here.
+# `claude-account refresh` does exactly that (and refuses, returning "live",
+# when the token happens to be the one in use, so this can never race the open
+# chats over the live credentials).
+
+REFRESH_COOLDOWN = 900   # after a failed repair, stop trying for this long
+_refresh_tried = set()   # at most one attempt per account per run
+
+
+def refresh_failed_recently(account):
+    try:
+        with open(cache_path(account)) as fh:
+            at = (json.load(fh) or {}).get("refresh_failed_at")
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(at, (int, float)) and time.time() - at < REFRESH_COOLDOWN
+
+
+def repair_token(account):
+    """Refresh a parked account's saved token in place. True if it changed."""
+    if not account or account in _refresh_tried or refresh_failed_recently(account):
+        return False
+    _refresh_tried.add(account)
+    exe = shutil.which("claude-account") or os.path.expanduser(
+        "~/.local/bin/claude-account")
+    if not os.path.isfile(exe):
+        return False
+    before = None
+    try:
+        with open(cred_path(account)) as fh:
+            before = (json.load(fh).get("claudeAiOauth") or {}).get("accessToken")
+    except (OSError, KeyError, json.JSONDecodeError, SystemExit):
+        pass
+    try:
+        subprocess.run([exe, "refresh", account, "--quiet"], timeout=45,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        cache_write(account, refresh_failed_at=time.time())
+        return False
+    try:
+        with open(cred_path(account)) as fh:
+            after = (json.load(fh).get("claudeAiOauth") or {}).get("accessToken")
+    except (OSError, KeyError, json.JSONDecodeError, SystemExit):
+        after = None
+    if after and after != before:
+        cache_write(account, refresh_failed_at=0)
+        return True
+    # Only a browser login can help now: remember that, so a table of five
+    # accounts doesn't spend 45s each on the same hopeless refresh.
+    cache_write(account, refresh_failed_at=time.time())
+    return False
 
 
 def fetch(token):
@@ -225,12 +297,25 @@ def get_usage(account=None, ttl=None, fresh=False):
         err = UsageError("ratelimited", "cooling down", retry_at)
         return cached, age, err
 
-    token, _oauth, _expired = load_token(account)
+    token, _oauth, expired = load_token(account)
+    # A saved token that has already timed out will only earn a 401: repair it
+    # first rather than spending the round trip to be told so.
+    if account and (expired or not token) and repair_token(account):
+        token, _oauth, expired = load_token(account)
     if not token:
         return cached, age, UsageError("auth", "no access token")
     try:
         data = fetch(token)
     except UsageError as e:
+        if e.kind == "auth" and account and repair_token(account):
+            token = load_token(account)[0]
+            try:
+                data = fetch(token)
+            except UsageError as e2:
+                e = e2
+            else:
+                cache_write(account, data=data, retry_at=0)
+                return data, None, None
         if e.kind == "ratelimited":
             cache_write(account, retry_at=e.retry_at)
         return cached, age, e
@@ -427,8 +512,9 @@ def main():
         if err and err.kind == "auth":
             if account:
                 die(f"{RED}Token rejected{who}.{RST}\n"
-                    f"Its saved token has gone stale. Run "
-                    f"`claude-account use {account}` once to refresh it.")
+                    f"Refreshing its saved login didn't help either, so that "
+                    f"account needs a real sign-in: `claude-account use "
+                    f"{account}`, then log in.")
             die(f"{RED}Token rejected.{RST} "
                 "Refresh it by running `claude` once, then retry.")
         if err and err.kind == "ratelimited":
