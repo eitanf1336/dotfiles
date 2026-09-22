@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# orphan-reaper - kill the two things that keep burning this laptop when their owner is gone:
+#   1. headless Chromes (invisible browsers spawned by a script or a Claude chat) whose parent
+#      is init or the user systemd, i.e. the launcher died and left them running. One of these
+#      does software 3D rendering at 500 to 740 percent CPU. Older than 90 s only.
+#   2. chrome-devtools-mcp servers with no Claude chat above them.
+# Runs from the orphan-reaper.timer every minute; logs to the journal. `orphan-reaper -n` lists.
+set -u
+DRY=0; [ "${1:-}" = "-n" ] && DRY=1
+now=$(date +%s)
+age() { local st; st=$(stat -c %Y "/proc/$1" 2>/dev/null) || { echo 0; return; }; echo $(( now - st )); }
+orphaned() { local pp; pp=$(awk '/^PPid:/{print $2}' "/proc/$1/status" 2>/dev/null); [ "$pp" = "1" ] && return 0; [ "$(cat "/proc/$pp/comm" 2>/dev/null)" = "systemd" ]; }
+n=0
+for p in $(pgrep -x chrome); do
+  c=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+  case "$c" in *--headless*) ;; *) continue;; esac
+  case "$c" in *--type=*) continue;; esac            # only the browser process; its children die with it
+  orphaned "$p" || continue
+  [ "$(age "$p")" -gt 90 ] || continue
+  if [ $DRY = 1 ]; then echo "would kill headless chrome $p ($(( $(age "$p")/60 )) min, no owner)"; else kill "$p" && echo "killed orphaned headless chrome $p ($(( $(age "$p")/60 )) min old)"; fi
+  n=$((n+1))
+done
+for p in $(pgrep -x node); do
+  c=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+  case "$c" in *chrome-devtools-mcp*) ;; *) continue;; esac
+  orphaned "$p" || continue
+  if [ $DRY = 1 ]; then echo "would kill orphaned chrome-devtools-mcp $p"; else kill "$p" && echo "killed orphaned chrome-devtools-mcp $p"; fi
+  n=$((n+1))
+done
+[ $n -eq 0 ] && [ $DRY = 1 ] && echo "nothing orphaned"
+exit 0

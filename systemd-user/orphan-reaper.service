@@ -1,0 +1,6 @@
+[Unit]
+Description=Kill orphaned headless Chromes and devtools servers
+
+[Service]
+Type=oneshot
+ExecStart=/home/eitan/.local/bin/orphan-reaper
