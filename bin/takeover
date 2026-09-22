@@ -23,7 +23,7 @@ set -uo pipefail
 STATE_DIR="$HOME/.cache/takeover"; mkdir -p "$STATE_DIR"
 FROZEN="$STATE_DIR/frozen"; PROGRESS="$STATE_DIR/progress"; LABEL_F="$STATE_DIR/label"; PAUSED="$STATE_DIR/paused"
 JOB=takeover-job
-KEEP_RE='^(init\.scope|takeover|perimeter81|.*claude-keep-awake|.*claude-whatsapp.*|.*whatsapp.*|whatclaude|power-menu-rescue|power-profile-auto|ssh-agent|ydotool|snap\.snapd|flatpak-session-helper|language-path|dbus|gnome|org\.|xdg|pipewire|wireplumber|at-spi|gvfs|dconf|evolution|app-gnome-org\.gnome\.(Evolution|SettingsDaemon)|app-gnome-update|app-gnome-perimeter81)'
+KEEP_RE='^(init\.scope|takeover|cuteworld-render|perimeter81|.*claude-keep-awake|.*claude-whatsapp.*|.*whatsapp.*|whatclaude|power-menu-rescue|power-profile-auto|ssh-agent|ydotool|snap\.snapd|flatpak-session-helper|language-path|dbus|gnome|org\.|xdg|pipewire|wireplumber|at-spi|gvfs|dconf|evolution|app-gnome-org\.gnome\.(Evolution|SettingsDaemon)|app-gnome-update|app-gnome-perimeter81)'
 MY_SCOPE=$(grep -oE '[^/]+\.scope$' /proc/self/cgroup | head -1)
 
 units_to_freeze() {
