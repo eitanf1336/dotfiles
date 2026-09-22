@@ -12,6 +12,8 @@
 #   keep-chats (a Claude chat name substring per line): those are never frozen.
 #   takeover note "text"    a line for the notes area on the screen (white text, last 10 kept)
 #   takeover progress DONE TOTAL [label]   drive the progress bar by hand
+#   Other Claude chats are NOT frozen by default (their terminals keep running); pass
+#   --freeze-claudes to start or hold if you want them frozen too.
 #   takeover pause          pause or resume the job (Ctrl+Alt+P does this)
 #   takeover finish         thaw everything and close the window (runs by itself at the end)
 #   takeover status         what is frozen, what is running
@@ -56,8 +58,18 @@ for x in a:
 ' "$CONF/keep-chats" 2>/dev/null | sort -u
 }
 
+claude_scopes() {   # terminal scopes that hold a Claude chat: kept by default (--freeze-claudes overrides)
+  for d in /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/*/*.scope; do
+    [ -r "$d/cgroup.procs" ] || continue
+    for pid in $(cat "$d/cgroup.procs" 2>/dev/null); do
+      case "$(cat /proc/$pid/comm 2>/dev/null)" in claude) basename "$d"; break;; esac
+    done
+  done | sort -u
+}
+
 units_to_freeze() {
   local extra="__none__"
+  [ -e "$STATE_DIR/freeze-claudes" ] || claude_scopes >> "$KEEP_EXTRA"
   { [ -s "$KEEP_EXTRA" ] && cat "$KEEP_EXTRA"; [ -s "$CONF/keep-units" ] && cat "$CONF/keep-units"; chat_scopes_to_keep; } > "$STATE_DIR/keep.all" 2>/dev/null
   [ -s "$STATE_DIR/keep.all" ] && extra=$(grep -v '^$' "$STATE_DIR/keep.all" | sed 's/[][\.^$*+?(){}|]/\\&/g' | paste -sd'|')
   systemctl --user list-units --type=service,scope --state=running --no-pager --plain \
@@ -90,12 +102,16 @@ case "$cmd" in
     echo "would keep: the desktop, audio, VPN, keep-awake, WhatsApp bridge+bot, this terminal ($MY_SCOPE)"
     ;;
   start)
-    label="job"
-    if [ "${1:-}" = "-l" ]; then label=$2; shift 2; fi
-    [ "${1:-}" = "--" ] && shift
+    label="job"; rm -f "$STATE_DIR/freeze-claudes"; : > "$KEEP_EXTRA"
+    while [ $# -gt 0 ]; do case "$1" in
+      -l) label=$2; shift 2;;
+      --keep) echo "$2" >> "$KEEP_EXTRA"; shift 2;;
+      --freeze-claudes) touch "$STATE_DIR/freeze-claudes"; shift;;
+      --) shift; break;;
+      *) break;;
+    esac; done
     [ $# -gt 0 ] || { echo "takeover start [-l label] -- <command...>" >&2; exit 2; }
     if systemctl --user is-active --quiet "$JOB"; then echo "a takeover is already running (takeover status)" >&2; exit 1; fi
-    : > "$KEEP_EXTRA"
     freeze_all "$label"
     # the job: full priority, its own cgroup, thaws everything when it exits however it exits
     systemd-run --user --unit="$JOB" --collect -p OOMScoreAdjust=300 \
@@ -104,10 +120,11 @@ case "$cmd" in
     notify-send -i utilities-system-monitor "Takeover: $label" "Everything else is frozen. Ctrl+Alt+P pauses." 2>/dev/null
     ;;
   hold)
-    label="blackout"; : > "$KEEP_EXTRA"
+    label="blackout"; : > "$KEEP_EXTRA"; rm -f "$STATE_DIR/freeze-claudes"
     while [ $# -gt 0 ]; do case "$1" in
       -l) label=$2; shift 2;;
       --keep) echo "$2" >> "$KEEP_EXTRA"; shift 2;;
+      --freeze-claudes) touch "$STATE_DIR/freeze-claudes"; shift;;
       *) shift;;
     esac; done
     if systemctl --user is-active --quiet "$JOB"; then echo "a takeover is already running (takeover status)" >&2; exit 1; fi
