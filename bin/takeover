@@ -115,7 +115,7 @@ def activate(app):
     stop = Gtk.Button(label="Stop and give the laptop back"); stop.add_css_class("destructive-action")
     stop.connect("clicked", lambda _b: (subprocess.run(["systemctl", "--user", "stop", JOB]), subprocess.run(["takeover", "finish"])))
     row.append(stop)
-    state = {"done_at": None}
+    state = {"done_at": None, "samples": []}   # (time, done) pairs for the rate
     def tick():
         try: label = open(LABEL_F).read().strip()
         except OSError: label = "job"
@@ -137,9 +137,17 @@ def activate(app):
         if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
             done, total = int(parts[0]), int(parts[1]); frac = done / max(1, total)
             bar.set_fraction(frac); bar.set_text(f"{done} / {total}  " + " ".join(parts[2:]))
-            el = time.time() - t_start
-            eta = (el / done * (total - done)) if done else 0
-            info.set_text(f"elapsed {int(el//60)} min, about {int(eta//60)} min left. Everything else is frozen, nothing is lost.")
+            now = time.time(); samp = state["samples"]
+            if not samp or samp[-1][1] != done: samp.append((now, done))
+            samp[:] = [x for x in samp if now - x[0] <= 300] or samp[-1:]
+            el = now - t_start
+            if len(samp) >= 2 and samp[-1][1] > samp[0][1]:
+                rate = (samp[-1][1] - samp[0][1]) / max(1e-6, samp[-1][0] - samp[0][0])   # units per second, last 5 min
+                left = (total - done) / rate
+                finish = time.strftime("%H:%M", time.localtime(now + left))
+                info.set_text(f"{int(el//60)} min in. About {int(left//60)} min left at the current pace, done around {finish}.")
+            else:
+                info.set_text(f"{int(el//60)} min in. Measuring the pace...")
         else:
             bar.pulse(); bar.set_text("working"); info.set_text("Everything else is frozen, nothing is lost.")
         return True
