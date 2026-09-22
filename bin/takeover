@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# takeover - hand the whole laptop to one job until it is done.
+#
+#   takeover start [-l label] -- <command...>   freeze everything else, run the job at full
+#                                               priority, show a progress window, thaw when done
+#   takeover pause          pause or resume the job (Ctrl+Alt+P does this)
+#   takeover finish         thaw everything and close the window (runs by itself at the end)
+#   takeover status         what is frozen, what is running
+#   takeover plan           list what a takeover WOULD freeze, change nothing
+#
+# "Freeze" is the systemd cgroup freezer: every app scope (Chrome, Spotify, JetBrains, the
+# other terminals and their Claude chats) and every non-essential user service (PolyArena
+# and friends) is stopped in place, keeps its memory and state, and continues exactly where
+# it was when thawed. Nothing is killed, nothing loses work. Frozen programs can be swapped
+# out fully, which is what gives the job the RAM.
+#
+# Never frozen: the desktop itself, audio, the VPN client, the keep-awake service, the
+# WhatsApp bridge and bot (so the result can be sent), the terminal that ran `takeover`.
+#
+# Progress: the job writes "done total label" lines to $PROGRESS (render_range.sh does);
+# the window reads it every 2 s.
+set -uo pipefail
+STATE_DIR="$HOME/.cache/takeover"; mkdir -p "$STATE_DIR"
+FROZEN="$STATE_DIR/frozen"; PROGRESS="$STATE_DIR/progress"; LABEL_F="$STATE_DIR/label"; PAUSED="$STATE_DIR/paused"
+JOB=takeover-job
+KEEP_RE='^(init\.scope|takeover|perimeter81|.*claude-keep-awake|.*claude-whatsapp.*|.*whatsapp.*|flatpak-session-helper|language-path|dbus|gnome|org\.|xdg|pipewire|wireplumber|at-spi|gvfs|dconf|evolution|app-gnome-org\.gnome\.|app-gnome-update|app-gnome-perimeter81)'
+MY_SCOPE=$(grep -oE '[^/]+\.scope$' /proc/self/cgroup | head -1)
+
+units_to_freeze() {
+  systemctl --user list-units --type=service,scope --state=running --no-pager --plain \
+    | awk 'NR>1 && $1 ~ /\.(service|scope)$/ {print $1}' \
+    | grep -v -E "$KEEP_RE" | grep -v -F "${MY_SCOPE:-__none__}" | grep -v -E "^${JOB}\.service$"
+}
+
+cmd=${1:-status}; shift || true
+case "$cmd" in
+  plan)
+    echo "would freeze:"; units_to_freeze | sed 's/^/  /'
+    echo "would keep: the desktop, audio, VPN, keep-awake, WhatsApp bridge+bot, this terminal ($MY_SCOPE)"
+    ;;
+  start)
+    label="job"
+    if [ "${1:-}" = "-l" ]; then label=$2; shift 2; fi
+    [ "${1:-}" = "--" ] && shift
+    [ $# -gt 0 ] || { echo "takeover start [-l label] -- <command...>" >&2; exit 2; }
+    if systemctl --user is-active --quiet "$JOB"; then echo "a takeover is already running (takeover status)" >&2; exit 1; fi
+    echo "$label" > "$LABEL_F"; : > "$PROGRESS"; rm -f "$PAUSED"
+    : > "$FROZEN"
+    for u in $(units_to_freeze); do
+      systemctl --user freeze "$u" 2>/dev/null && echo "$u" >> "$FROZEN"
+    done
+    echo "frozen $(wc -l < "$FROZEN") units; starting $label"
+    # the job: full priority, its own cgroup, thaws everything when it exits however it exits
+    systemd-run --user --unit="$JOB" --collect -p OOMScoreAdjust=300 \
+      bash -c 'cd "$1"; shift; "$@"; rc=$?; takeover finish; exit $rc' _ "$PWD" "$@" >/dev/null
+    setsid -f "$0" gui >/dev/null 2>&1
+    notify-send -i utilities-system-monitor "Takeover: $label" "Everything else is frozen. Ctrl+Alt+P pauses." 2>/dev/null
+    ;;
+  pause)
+    if ! systemctl --user is-active --quiet "$JOB"; then echo "no takeover job running"; exit 1; fi
+    if [ -e "$PAUSED" ]; then
+      systemctl --user thaw "$JOB" && rm -f "$PAUSED" && notify-send "Takeover resumed" 2>/dev/null; echo resumed
+    else
+      systemctl --user freeze "$JOB" && touch "$PAUSED" && notify-send "Takeover paused" "Ctrl+Alt+P resumes." 2>/dev/null; echo paused
+    fi
+    ;;
+  finish)
+    n=0
+    if [ -s "$FROZEN" ]; then
+      while read -r u; do [ -n "$u" ] && systemctl --user thaw "$u" 2>/dev/null && n=$((n+1)); done < "$FROZEN"
+    fi
+    : > "$FROZEN"; rm -f "$PAUSED"
+    echo "done" >> "$PROGRESS"
+    notify-send -i emblem-ok-symbolic "Takeover finished: $(cat "$LABEL_F" 2>/dev/null)" "Thawed $n programs. The laptop is yours." 2>/dev/null
+    echo "thawed $n units"
+    ;;
+  status)
+    if systemctl --user is-active --quiet "$JOB"; then
+      echo "job: running ($(cat "$LABEL_F" 2>/dev/null))$( [ -e "$PAUSED" ] && echo ' [PAUSED]')"; tail -1 "$PROGRESS" 2>/dev/null | sed 's/^/progress: /'
+    else echo "job: none"; fi
+    if [ -s "$FROZEN" ]; then echo "frozen ($(wc -l < "$FROZEN")):"; sed 's/^/  /' "$FROZEN"; else echo "frozen: nothing"; fi
+    ;;
+  gui)
+    exec python3 - "$PROGRESS" "$LABEL_F" "$PAUSED" "$JOB" <<'PY'
+import sys, time, subprocess, os
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, GLib
+PROGRESS, LABEL_F, PAUSED, JOB = sys.argv[1:5]
+t_start = time.time()
+
+def running():
+    return subprocess.run(["systemctl", "--user", "is-active", "--quiet", JOB]).returncode == 0
+
+app = Gtk.Application(application_id="dev.eitan.takeover")
+def activate(app):
+    win = Gtk.ApplicationWindow(application=app, title="Takeover")
+    win.set_default_size(420, 150); win.set_resizable(False)
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    for side in ("top", "bottom", "start", "end"): getattr(box, f"set_margin_{side}")(14)
+    win.set_child(box)
+    title = Gtk.Label(xalign=0); title.add_css_class("title-3"); box.append(title)
+    bar = Gtk.ProgressBar(); bar.set_show_text(True); box.append(bar)
+    info = Gtk.Label(xalign=0); info.add_css_class("dim-label"); box.append(info)
+    row = Gtk.Box(spacing=8); box.append(row)
+    btn = Gtk.Button(label="Pause  (Ctrl+Alt+P)")
+    btn.connect("clicked", lambda _b: subprocess.run(["takeover", "pause"]))
+    row.append(btn)
+    stop = Gtk.Button(label="Stop and give the laptop back"); stop.add_css_class("destructive-action")
+    stop.connect("clicked", lambda _b: (subprocess.run(["systemctl", "--user", "stop", JOB]), subprocess.run(["takeover", "finish"])))
+    row.append(stop)
+    state = {"done_at": None}
+    def tick():
+        try: label = open(LABEL_F).read().strip()
+        except OSError: label = "job"
+        paused = os.path.exists(PAUSED)
+        title.set_text(("PAUSED: " if paused else "Rendering: ") + label)
+        btn.set_label(("Resume" if paused else "Pause") + "  (Ctrl+Alt+P)")
+        last = ""
+        try:
+            lines = [l for l in open(PROGRESS).read().splitlines() if l.strip()]
+            last = lines[-1] if lines else ""
+        except OSError: pass
+        if last == "done" or not running():
+            if state["done_at"] is None: state["done_at"] = time.time()
+            bar.set_fraction(1.0); bar.set_text("done"); title.set_text("Finished: " + label)
+            info.set_text("Everything is thawed. This window closes itself.")
+            if time.time() - state["done_at"] > 20: app.quit()
+            return True
+        parts = last.split()
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            done, total = int(parts[0]), int(parts[1]); frac = done / max(1, total)
+            bar.set_fraction(frac); bar.set_text(f"{done} / {total}  " + " ".join(parts[2:]))
+            el = time.time() - t_start
+            eta = (el / done * (total - done)) if done else 0
+            info.set_text(f"elapsed {int(el//60)} min, about {int(eta//60)} min left. Everything else is frozen, nothing is lost.")
+        else:
+            bar.pulse(); bar.set_text("working"); info.set_text("Everything else is frozen, nothing is lost.")
+        return True
+    tick(); GLib.timeout_add(2000, tick)
+    win.present()
+app.connect("activate", activate); app.run([])
+PY
+    ;;
+  *) sed -n '2,22p' "$0" | sed 's/^# \?//'; exit 2 ;;
+esac

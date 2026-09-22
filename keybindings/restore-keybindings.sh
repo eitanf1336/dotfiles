@@ -279,3 +279,9 @@ gsettings set "$k" name 'Memory task manager (memtop)'
 gsettings set "$k" binding '<Control><Shift>Escape'
 gsettings set "$k" command '/home/eitan/.local/bin/memtop'
 
+paths+=("/takeover-pause/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/takeover-pause/"
+gsettings set "$k" name 'Takeover: pause or resume the job'
+gsettings set "$k" binding '<Control><Alt>p'
+gsettings set "$k" command '/home/eitan/.local/bin/takeover pause'
+
