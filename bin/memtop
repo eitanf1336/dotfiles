@@ -44,6 +44,8 @@ def family(pid, cmd):
         return m.group(1).replace("\\x2d", "-")
     args = cmd.split("\0")
     exe = os.path.basename(args[0]) if args and args[0] else read(f"/proc/{pid}/comm").strip()
+    if " " in exe:                       # a wrapper passed a whole command line as one argument
+        exe = os.path.basename(exe.split()[0])
     if exe.startswith("python"):
         for a in args[1:]:
             if a.endswith(".py"):
@@ -63,12 +65,76 @@ def family(pid, cmd):
     if exe == "claude" or "claude/versions" in args[0]:
         return "claude" + (" (bg-spare)" if "--bg-spare" in args else "")
     if exe in ("chrome", "google-chrome"):
-        return "chrome"
+        return "chrome (headless automation)" if "--headless" in cmd else "chrome"
     if exe == "blender":
         return "blender"
     if exe == "bwrap":
         return "flatpak"
     return exe
+
+
+KNOWN = {
+    "claude": "Claude Code chat sessions (the live ones)",
+    "claude (bg-spare)": "Parked Claude chats, waiting in the background",
+    "claude bg-pty-host": "Terminal hosts for Claude chats",
+    "chrome": "Google Chrome (all tabs and extensions)",
+    "chrome-devtools-mcp": "Chrome automation used by a Claude chat",
+    "chrome (headless automation)": "Invisible Chrome driven by a Claude chat or a script",
+    "blender": "Blender 3D render (CuteWorld videos)",
+    "zapzap": "WhatsApp desktop app",
+    "spotify": "Spotify",
+    "fabric-server-launch.jar": "Minecraft server (MinecraftArena)",
+    "gnome-shell": "The GNOME desktop itself",
+    "Xwayland": "Compatibility layer for old X11 apps",
+    "jetbrains-toolbox": "JetBrains Toolbox (IDE launcher)",
+    "DisplayLinkManager": "DisplayLink dock driver (external screens)",
+    "whatsapp-bridge-bin": "WhatsApp bridge for Claude",
+    "flatpak": "A sandboxed flatpak app",
+    "polyarena": "PolyArena core (Polymarket sim service)",
+}
+_unit_desc = {}
+
+
+def unit_description(unit):
+    """A systemd unit's own Description line, cached."""
+    if unit in _unit_desc:
+        return _unit_desc[unit]
+    import subprocess
+    try:
+        out = subprocess.run(["systemctl", "--user", "show", "-p", "Description", "--value", unit + ".service"],
+                             capture_output=True, text=True, timeout=2).stdout.strip()
+    except Exception:
+        out = ""
+    bogus = (not out) or out == unit or out.endswith(".service") or out.endswith(".scope")
+    _unit_desc[unit] = "" if bogus else out
+    return _unit_desc[unit]
+
+
+def describe(name, top_pid):
+    """Plain words for a row: what it is and, if unknown, where it runs from."""
+    if name in KNOWN:
+        return KNOWN[name]
+    for key, label in sorted(KNOWN.items(), key=lambda kv: -len(kv[0])):
+        if name.startswith(key + " "):
+            return label
+    d = unit_description(name)
+    if d:
+        return d
+    try:
+        cwd = os.readlink(f"/proc/{top_pid}/cwd")
+    except OSError:
+        cwd = ""
+    home = os.path.expanduser("~")
+    where = cwd.replace(home, "~") if cwd else ""
+    if name.startswith("python -m "):
+        return f"Python program {name[10:]} running from {where}"
+    if name.endswith(".py"):
+        return f"Python script running from {where}"
+    if name.startswith("node "):
+        return f"Node program running from {where}"
+    if name.endswith(".jar"):
+        return f"Java program running from {where}"
+    return f"{name}, running from {where}" if where and where not in ("~", "/") else name
 
 
 def sample():
@@ -99,7 +165,10 @@ def sample():
         if not g["top"] or pss + swap > g.get("_max", 0):
             g["_max"] = pss + swap
             g["top"] = cmd.replace("\0", " ").strip()[:90]
+            g["top_pid"] = pid
     rows = sorted(groups.items(), key=lambda kv: kv[1]["ram"] + kv[1]["swap"], reverse=True)
+    for name, g in rows[:40]:
+        g["what"] = describe(name, g["top_pid"])
     return rows
 
 
@@ -126,9 +195,9 @@ def gb(kb):
 def text_table(limit=25):
     t = totals()
     out = [f"RAM {gb(t['ram_used']):.1f}/{gb(t['ram_total']):.1f} GB   swap {gb(t['swap_used']):.1f}/{gb(t['swap_total']):.1f} GB   pressure {t['pressure']:.0f}%",
-           f"{'program':32s} {'procs':>5s} {'RAM GB':>7s} {'swap GB':>8s} {'total':>7s}"]
+           f"{'program':26s} {'procs':>5s} {'RAM GB':>7s} {'swap GB':>8s} {'total':>7s}  what it is"]
     for name, g in sample()[:limit]:
-        out.append(f"{name[:32]:32s} {len(g['pids']):5d} {gb(g['ram']):7.2f} {gb(g['swap']):8.2f} {gb(g['ram'] + g['swap']):7.2f}")
+        out.append(f"{name[:26]:26s} {len(g['pids']):5d} {gb(g['ram']):7.2f} {gb(g['swap']):8.2f} {gb(g['ram'] + g['swap']):7.2f}  {g['what']}")
     return "\n".join(out)
 
 
@@ -158,7 +227,7 @@ def gui():
 
     def activate(app):
         win = Gtk.ApplicationWindow(application=app, title="Memory")
-        win.set_default_size(820, 640)
+        win.set_default_size(1180, 680)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.set_margin_top(10); box.set_margin_bottom(10); box.set_margin_start(12); box.set_margin_end(12)
         win.set_child(box)
@@ -186,13 +255,15 @@ def gui():
             child = grid.get_first_child()
             while child:
                 nxt = child.get_next_sibling(); grid.remove(child); child = nxt
-            for c, title in enumerate(("program", "procs", "RAM GB", "swap GB", "total GB", "", "biggest command")):
+            for c, title in enumerate(("program", "what it is", "procs", "RAM GB", "swap GB", "total GB", "", "biggest command")):
                 lab = Gtk.Label(label=title, xalign=0); lab.add_css_class("heading"); grid.attach(lab, c, 0, 1, 1)
             for r, (name, g) in enumerate(sample()[:30], start=1):
-                cells = (name, str(len(g["pids"])), f"{gb(g['ram']):.2f}", f"{gb(g['swap']):.2f}", f"{gb(g['ram'] + g['swap']):.2f}")
+                cells = (name, g["what"], str(len(g["pids"])), f"{gb(g['ram']):.2f}", f"{gb(g['swap']):.2f}", f"{gb(g['ram'] + g['swap']):.2f}")
                 for c, val in enumerate(cells):
-                    lab = Gtk.Label(label=val, xalign=0 if c == 0 else 1)
-                    if c == 4 and gb(g["ram"] + g["swap"]) > 1.0:
+                    lab = Gtk.Label(label=val, xalign=0 if c <= 1 else 1)
+                    if c == 1:
+                        lab.set_ellipsize(Pango.EllipsizeMode.END); lab.set_max_width_chars(44)
+                    if c == 5 and gb(g["ram"] + g["swap"]) > 1.0:
                         lab.add_css_class("error")
                     grid.attach(lab, c, r, 1, 1)
                 btn = Gtk.Button(label="Kill"); btn.add_css_class("destructive-action")
@@ -205,9 +276,9 @@ def gui():
                     state["last_kill"][nm] = now
                     foot.set_text(f"{'SIGKILL' if hard else 'SIGTERM'} sent to {n} process(es) of {nm}")
                 btn.connect("clicked", on_kill)
-                grid.attach(btn, 5, r, 1, 1)
+                grid.attach(btn, 6, r, 1, 1)
                 top = Gtk.Label(label=g["top"], xalign=0); top.set_ellipsize(Pango.EllipsizeMode.END)
-                top.set_max_width_chars(48); top.add_css_class("dim-label"); grid.attach(top, 6, r, 1, 1)
+                top.set_max_width_chars(36); top.add_css_class("dim-label"); grid.attach(top, 7, r, 1, 1)
             return True
 
         refresh()
