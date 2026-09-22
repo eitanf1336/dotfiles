@@ -82,78 +82,104 @@ case "$cmd" in
     ;;
   gui)
     exec python3 - "$PROGRESS" "$LABEL_F" "$PAUSED" "$JOB" <<'PY'
+"""Black window on every monitor, the progress on the primary one. Closes the moment the job
+is gone. GTK 3, because it can place a fullscreen window on a chosen monitor (kipur does
+the same)."""
 import sys, time, subprocess, os
 import gi
-gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk, GLib
+gi.require_version("Gtk", "3.0"); gi.require_version("Gdk", "3.0")
+from gi.repository import Gtk, Gdk, GLib, Pango
 PROGRESS, LABEL_F, PAUSED, JOB = sys.argv[1:5]
 t_start = time.time()
+state = {"samples": [], "wins": []}
 
 def running():
     return subprocess.run(["systemctl", "--user", "is-active", "--quiet", JOB]).returncode == 0
 
-app = Gtk.Application(application_id="dev.eitan.takeover")
-def activate(app):
-    win = Gtk.ApplicationWindow(application=app, title="Takeover")
-    css = Gtk.CssProvider()
-    css.load_from_string("window.takeover { background: #0b0b0d; } .takeover label { color: #e8e4d8; } "
-                         ".takeover .big { font-size: 34px; font-weight: 600; } .takeover .mid { font-size: 18px; } "
-                         ".takeover progressbar trough { min-height: 22px; } .takeover progressbar progress { min-height: 22px; }")
-    Gtk.StyleContext.add_provider_for_display(win.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-    win.add_css_class("takeover")
-    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER, spacing=18)
-    outer.add_css_class("takeover"); win.set_child(outer)
-    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14); box.set_size_request(760, -1); outer.append(box)
-    title = Gtk.Label(xalign=0); title.add_css_class("big"); box.append(title)
-    bar = Gtk.ProgressBar(); bar.set_show_text(True); box.append(bar)
-    info = Gtk.Label(xalign=0, wrap=True); info.add_css_class("mid"); box.append(info)
-    hint = Gtk.Label(xalign=0, label="The laptop belongs to this job. Everything else is frozen in place, nothing is closed, nothing is lost. Ctrl+Alt+P pauses and resumes."); hint.add_css_class("mid"); hint.set_wrap(True); box.append(hint)
-    row = Gtk.Box(spacing=12); box.append(row)
-    btn = Gtk.Button(label="Pause  (Ctrl+Alt+P)")
-    btn.connect("clicked", lambda _b: subprocess.run(["takeover", "pause"]))
-    row.append(btn)
-    stop = Gtk.Button(label="Stop and give the laptop back"); stop.add_css_class("destructive-action")
-    stop.connect("clicked", lambda _b: (subprocess.run(["systemctl", "--user", "stop", JOB]), subprocess.run(["takeover", "finish"])))
-    row.append(stop)
-    state = {"done_at": None, "samples": []}   # (time, done) pairs for the rate
-    def tick():
-        try: label = open(LABEL_F).read().strip()
-        except OSError: label = "job"
-        paused = os.path.exists(PAUSED)
-        title.set_text(("PAUSED: " if paused else "Rendering: ") + label)
-        btn.set_label(("Resume" if paused else "Pause") + "  (Ctrl+Alt+P)")
-        last = ""
-        try:
-            lines = [l for l in open(PROGRESS).read().splitlines() if l.strip()]
-            last = lines[-1] if lines else ""
-        except OSError: pass
-        if last == "done" or not running():
-            if state["done_at"] is None: state["done_at"] = time.time()
-            bar.set_fraction(1.0); bar.set_text("done"); title.set_text("Finished: " + label)
-            info.set_text("Everything is thawed. This window closes itself.")
-            if time.time() - state["done_at"] > 20: app.quit()
-            return True
-        parts = last.split()
-        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-            done, total = int(parts[0]), int(parts[1]); frac = done / max(1, total)
-            bar.set_fraction(frac); bar.set_text(f"{done} / {total}  " + " ".join(parts[2:]))
-            now = time.time(); samp = state["samples"]
-            if not samp or samp[-1][1] != done: samp.append((now, done))
-            samp[:] = [x for x in samp if now - x[0] <= 300] or samp[-1:]
-            el = now - t_start
-            if len(samp) >= 2 and samp[-1][1] > samp[0][1]:
-                rate = (samp[-1][1] - samp[0][1]) / max(1e-6, samp[-1][0] - samp[0][0])   # units per second, last 5 min
-                left = (total - done) / rate
-                finish = time.strftime("%H:%M", time.localtime(now + left))
-                info.set_text(f"{int(el//60)} min in. About {int(left//60)} min left at the current pace, done around {finish}.")
-            else:
-                info.set_text(f"{int(el//60)} min in. Measuring the pace...")
+css = Gtk.CssProvider()
+css.load_from_data(b"""
+window, .black { background-color: #07070a; }
+label { color: #ece7d9; }
+.big { font-size: 40px; font-weight: 600; }
+.mid { font-size: 20px; }
+.dim { font-size: 17px; color: #9a958a; }
+progressbar trough, progressbar progress { min-height: 26px; }
+button { font-size: 18px; padding: 10px 22px; }
+""")
+Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+display = Gdk.Display.get_default()
+n = display.get_n_monitors()
+primary = display.get_primary_monitor()
+prim_idx = 0
+for i in range(n):
+    if display.get_monitor(i) is primary:
+        prim_idx = i
+widgets = {}
+for i in range(n):
+    win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+    win.set_title("Takeover"); win.set_decorated(False); win.set_keep_above(True)
+    win.get_style_context().add_class("black")
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+    box.set_valign(Gtk.Align.CENTER); box.set_halign(Gtk.Align.CENTER)
+    win.add(box)
+    if i == prim_idx:
+        title = Gtk.Label(); title.get_style_context().add_class("big"); title.set_xalign(0); box.pack_start(title, False, False, 0)
+        bar = Gtk.ProgressBar(); bar.set_show_text(True); bar.set_size_request(820, -1); box.pack_start(bar, False, False, 0)
+        info = Gtk.Label(); info.get_style_context().add_class("mid"); info.set_xalign(0); info.set_line_wrap(True); info.set_max_width_chars(70); box.pack_start(info, False, False, 0)
+        hint = Gtk.Label(label="The laptop belongs to this job. Everything else is frozen in place: nothing is closed, nothing is lost.\nCtrl+Alt+P pauses and resumes.")
+        hint.get_style_context().add_class("dim"); hint.set_xalign(0); hint.set_line_wrap(True); hint.set_max_width_chars(70); box.pack_start(hint, False, False, 0)
+        row = Gtk.Box(spacing=14); box.pack_start(row, False, False, 8)
+        btn = Gtk.Button(label="Pause  (Ctrl+Alt+P)"); btn.connect("clicked", lambda _b: subprocess.run(["takeover", "pause"])); row.pack_start(btn, False, False, 0)
+        stop = Gtk.Button(label="Stop and give the laptop back"); stop.get_style_context().add_class("destructive-action")
+        def on_stop(_b):
+            subprocess.run(["systemctl", "--user", "stop", JOB]); subprocess.run(["takeover", "finish"]); Gtk.main_quit()
+        stop.connect("clicked", on_stop); row.pack_start(stop, False, False, 0)
+        widgets = {"title": title, "bar": bar, "info": info, "btn": btn}
+    else:
+        lab = Gtk.Label(label="working, see the main screen"); lab.get_style_context().add_class("dim"); box.pack_start(lab, False, False, 0)
+    win.connect("delete-event", lambda *_: True)
+    win.show_all()
+    win.fullscreen_on_monitor(Gdk.Screen.get_default(), i)
+    win.fullscreen()
+    state["wins"].append(win)
+
+def tick():
+    if not running():
+        Gtk.main_quit(); return False
+    try: label = open(LABEL_F).read().strip()
+    except OSError: label = "job"
+    paused = os.path.exists(PAUSED)
+    widgets["title"].set_text(("PAUSED: " if paused else "Working: ") + label)
+    widgets["btn"].set_label(("Resume" if paused else "Pause") + "  (Ctrl+Alt+P)")
+    last = ""
+    try:
+        lines = [l for l in open(PROGRESS).read().splitlines() if l.strip() and l.strip() != "done"]
+        last = lines[-1] if lines else ""
+    except OSError: pass
+    parts = last.split()
+    bar, info = widgets["bar"], widgets["info"]
+    el = time.time() - t_start
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        done, total = int(parts[0]), int(parts[1])
+        bar.set_fraction(done / max(1, total)); bar.set_text(f"{done} / {total}  " + " ".join(parts[2:]))
+        now = time.time(); samp = state["samples"]
+        if not samp or samp[-1][1] != done: samp.append((now, done))
+        samp[:] = [x for x in samp if now - x[0] <= 300] or samp[-1:]
+        if paused:
+            info.set_text(f"{int(el//60)} min in. Paused.")
+        elif len(samp) >= 2 and samp[-1][1] > samp[0][1]:
+            rate = (samp[-1][1] - samp[0][1]) / max(1e-6, samp[-1][0] - samp[0][0])
+            left = (total - done) / rate
+            info.set_text(f"{int(el//60)} min in. About {int(left//60)} min left at this pace, done around {time.strftime('%H:%M', time.localtime(now + left))}.")
         else:
-            bar.pulse(); bar.set_text("working"); info.set_text("Everything else is frozen, nothing is lost.")
-        return True
-    tick(); GLib.timeout_add(2000, tick)
-    win.present(); win.fullscreen()
-app.connect("activate", activate); app.run([])
+            info.set_text(f"{int(el//60)} min in. Measuring the pace...")
+    else:
+        bar.pulse(); bar.set_text("working"); info.set_text(f"{int(el//60)} min in. No progress numbers from this job yet.")
+    return True
+
+tick(); GLib.timeout_add(2000, tick)
+Gtk.main()
 PY
     ;;
   *) sed -n '2,22p' "$0" | sed 's/^# \?//'; exit 2 ;;
