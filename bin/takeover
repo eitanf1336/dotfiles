@@ -23,7 +23,7 @@ set -uo pipefail
 STATE_DIR="$HOME/.cache/takeover"; mkdir -p "$STATE_DIR"
 FROZEN="$STATE_DIR/frozen"; PROGRESS="$STATE_DIR/progress"; LABEL_F="$STATE_DIR/label"; PAUSED="$STATE_DIR/paused"
 JOB=takeover-job
-KEEP_RE='^(init\.scope|takeover|perimeter81|.*claude-keep-awake|.*claude-whatsapp.*|.*whatsapp.*|whatclaude|power-menu-rescue|power-profile-auto|ssh-agent|ydotool|snap\.snapd|flatpak-session-helper|language-path|dbus|gnome|org\.|xdg|pipewire|wireplumber|at-spi|gvfs|dconf|evolution|app-gnome-org\.gnome\.|app-gnome-update|app-gnome-perimeter81)'
+KEEP_RE='^(init\.scope|takeover|perimeter81|.*claude-keep-awake|.*claude-whatsapp.*|.*whatsapp.*|whatclaude|power-menu-rescue|power-profile-auto|ssh-agent|ydotool|snap\.snapd|flatpak-session-helper|language-path|dbus|gnome|org\.|xdg|pipewire|wireplumber|at-spi|gvfs|dconf|evolution|app-gnome-org\.gnome\.(Evolution|SettingsDaemon)|app-gnome-update|app-gnome-perimeter81)'
 MY_SCOPE=$(grep -oE '[^/]+\.scope$' /proc/self/cgroup | head -1)
 
 units_to_freeze() {
@@ -95,14 +95,20 @@ def running():
 app = Gtk.Application(application_id="dev.eitan.takeover")
 def activate(app):
     win = Gtk.ApplicationWindow(application=app, title="Takeover")
-    win.set_default_size(420, 150); win.set_resizable(False)
-    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-    for side in ("top", "bottom", "start", "end"): getattr(box, f"set_margin_{side}")(14)
-    win.set_child(box)
-    title = Gtk.Label(xalign=0); title.add_css_class("title-3"); box.append(title)
+    css = Gtk.CssProvider()
+    css.load_from_string("window.takeover { background: #0b0b0d; } .takeover label { color: #e8e4d8; } "
+                         ".takeover .big { font-size: 34px; font-weight: 600; } .takeover .mid { font-size: 18px; } "
+                         ".takeover progressbar trough { min-height: 22px; } .takeover progressbar progress { min-height: 22px; }")
+    Gtk.StyleContext.add_provider_for_display(win.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    win.add_css_class("takeover")
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER, spacing=18)
+    outer.add_css_class("takeover"); win.set_child(outer)
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14); box.set_size_request(760, -1); outer.append(box)
+    title = Gtk.Label(xalign=0); title.add_css_class("big"); box.append(title)
     bar = Gtk.ProgressBar(); bar.set_show_text(True); box.append(bar)
-    info = Gtk.Label(xalign=0); info.add_css_class("dim-label"); box.append(info)
-    row = Gtk.Box(spacing=8); box.append(row)
+    info = Gtk.Label(xalign=0, wrap=True); info.add_css_class("mid"); box.append(info)
+    hint = Gtk.Label(xalign=0, label="The laptop belongs to this job. Everything else is frozen in place, nothing is closed, nothing is lost. Ctrl+Alt+P pauses and resumes."); hint.add_css_class("mid"); hint.set_wrap(True); box.append(hint)
+    row = Gtk.Box(spacing=12); box.append(row)
     btn = Gtk.Button(label="Pause  (Ctrl+Alt+P)")
     btn.connect("clicked", lambda _b: subprocess.run(["takeover", "pause"]))
     row.append(btn)
@@ -138,7 +144,7 @@ def activate(app):
             bar.pulse(); bar.set_text("working"); info.set_text("Everything else is frozen, nothing is lost.")
         return True
     tick(); GLib.timeout_add(2000, tick)
-    win.present()
+    win.present(); win.fullscreen()
 app.connect("activate", activate); app.run([])
 PY
     ;;
