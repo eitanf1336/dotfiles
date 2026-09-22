@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# takeover-notice - tell a Claude chat that a blackout is freezing things, and
+# how to get its own server back.
+#
+# Wired as a UserPromptSubmit hook, so every chat learns about a takeover the
+# moment it is asked to do anything. Silent (and instant) when nothing is frozen.
+#
+# It exists because a frozen unit is invisible from inside a chat: it still
+# reports "active", `systemctl start` on it silently does nothing, and only
+# `restart`/`stop` admit anything is wrong. Without this note a chat sees a
+# hanging localhost and goes off debugging an app that is working fine.
+set -uo pipefail
+
+FROZEN="$HOME/.cache/takeover/frozen"
+LABEL_F="$HOME/.cache/takeover/label"
+[ -s "$FROZEN" ] || exit 0
+
+n=$(grep -c . "$FROZEN")
+label=$(cat "$LABEL_F" 2>/dev/null)
+units=$(grep . "$FROZEN" | head -14 | paste -sd'\n' | tr '\n' '@' | sed 's/@$//; s/@/, /g')
+(( n > 14 )) && units="$units, +$(( n - 14 )) more"
+
+cat <<EOF
+<system-note>
+A takeover/blackout is running on this laptop${label:+ (\"$label\")}. $n programs are FROZEN
+with the cgroup freezer, not stopped: $units
+
+A frozen unit still reports "active", and \`systemctl --user start\` on it succeeds
+while doing nothing at all; restart and stop fail with "Cannot perform operation on
+frozen unit". So if a localhost port, a testbed URL, \`dash\`, or the agent Chrome
+hangs or refuses, it is frozen, not broken.
+
+Take just what you need out of the freezer with \`takeover thaw <unit>\` (\`takeover
+status\` lists them) and carry on. Do not debug it, do not kill it, and do not run
+\`takeover finish\` unless you were asked to end the blackout.
+</system-note>
+EOF

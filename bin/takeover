@@ -16,6 +16,11 @@
 #   --freeze-claudes to start or hold if you want them frozen too.
 #   takeover pause          pause or resume the job (Ctrl+Alt+P does this)
 #   takeover finish         thaw everything and close the window (runs by itself at the end)
+#   takeover thaw UNIT...   un-freeze just those units mid-blackout and leave the rest frozen.
+#                           This is the escape hatch for a Claude chat whose server got frozen:
+#                           `systemctl start` on a frozen unit silently does NOTHING (it is
+#                           already 'active'), and `systemctl restart/stop` refuses with
+#                           "Cannot perform operation on frozen unit". Thaw is the only move.
 #   takeover status         what is frozen, what is running
 #   takeover plan           list what a takeover WOULD freeze, change nothing
 #
@@ -162,11 +167,35 @@ case "$cmd" in
     notify-send -i emblem-ok-symbolic "Takeover finished: $(cat "$LABEL_F" 2>/dev/null)" "Thawed $n programs. The laptop is yours." 2>/dev/null
     echo "thawed $n units"
     ;;
+  thaw)
+    # Hand a frozen unit back without ending the blackout: a chat that needs its
+    # testbed or the dashboard can take just that one out of the freezer.
+    [ $# -gt 0 ] || { echo "takeover thaw <unit-or-pattern> [...]   (takeover status lists what is frozen)" >&2; exit 2; }
+    [ -s "$FROZEN" ] || { echo "nothing is frozen"; exit 1; }
+    list=$(cat "$FROZEN"); n=0
+    for pat in "$@"; do
+      for u in $list; do
+        printf '%s\n' "$u" | grep -qE -- "$pat" || continue
+        if systemctl --user thaw "$u" 2>/dev/null; then
+          n=$((n+1)); echo "thawed $u"
+          printf '%s  thawed %s\n' "$(date +%H:%M)" "$u" >> "$NOTES"
+        fi
+        list=$(printf '%s\n' "$list" | grep -vxF "$u")
+      done
+    done
+    printf '%s\n' "$list" | grep -v '^$' > "$FROZEN.tmp" 2>/dev/null; mv "$FROZEN.tmp" "$FROZEN"
+    [ "$n" = 0 ] && { echo "nothing matched; takeover status lists what is frozen" >&2; exit 1; }
+    echo "still frozen: $(wc -l < "$FROZEN")"
+    ;;
   status)
     if systemctl --user is-active --quiet "$JOB"; then
       echo "job: running ($(cat "$LABEL_F" 2>/dev/null))$( [ -e "$PAUSED" ] && echo ' [PAUSED]')"; tail -1 "$PROGRESS" 2>/dev/null | sed 's/^/progress: /'
     else echo "job: none"; fi
     if [ -s "$FROZEN" ]; then echo "frozen ($(wc -l < "$FROZEN")):"; sed 's/^/  /' "$FROZEN"; else echo "frozen: nothing"; fi
+    if [ -s "$FROZEN" ]; then
+      echo "note: a frozen unit still reports 'active' and \`systemctl start\` on it does nothing."
+      echo "      need one back? takeover thaw <unit>   (leaves the rest frozen)"
+    fi
     ;;
   gui)
     exec python3 - "$PROGRESS" "$LABEL_F" "$PAUSED" "$JOB" "$NOTES" <<'PY'
