@@ -76,6 +76,9 @@ fi
 MODEL=$(echo "$input" | jq -r '.model.display_name // "Claude"')
 EFFORT=$(echo "$input" | jq -r '.effort.level // empty')
 CTX_REMAIN=$(echo "$input" | jq -r '.context_window.remaining_percentage // empty')
+CTX_TOKENS=$(echo "$input" | jq -r '.context_window.total_input_tokens // empty')
+SESSION_ID=$(echo "$input" | jq -r '.session_id // empty')
+SESSION_NAME=$(echo "$input" | jq -r '.session_name // empty')
 
 FIVE_USED=$(echo "$input"  | jq -r '.rate_limits.five_hour.used_percentage // empty')
 FIVE_RESET=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
@@ -111,11 +114,37 @@ if [ -n "$WEEK_USED" ]; then
   if [ -n "$ri" ]; then c_week="$c_week ${DIM}($ri)${RESET}"; p_week="$p_week ($ri)"; fi
 fi
 
-# ctx segment
+# ctx segment: a compact nudge that gets louder as the chat gets fat.
+# Every turn re-sends the whole context, so a bloated chat quietly bills the
+# same tokens over and over. Two signals, the worse one wins:
+#   * tokens actually carried per turn  - what costs quota on a 1M window
+#   * how full the window is            - what bites on a 200k one
+CTX_LVL=0
 if [ -n "$CTX_REMAIN" ]; then
   ctx=$(printf '%.0f' "$CTX_REMAIN")
-  c_ctx="${DIM}ctx ${ctx}%${RESET}"
-  p_ctx="ctx ${ctx}%"
+  tok=${CTX_TOKENS:-0}; tok=${tok%%.*}; [ -z "$tok" ] && tok=0
+  (( tok >= 150000 || ctx < 35 )) && CTX_LVL=1
+  (( tok >= 300000 || ctx < 20 )) && CTX_LVL=2
+  (( tok >= 600000 || ctx < 10 )) && CTX_LVL=3
+  if (( tok >= 1000 )); then tk="$(( tok / 1000 ))k"; else tk="$tok"; fi
+  case $CTX_LVL in
+    0) c_ctx="${DIM}ctx ${ctx}%${RESET}";                       p_ctx="ctx ${ctx}%" ;;
+    1) c_ctx="\033[33mctx ${tk} · compact soon${RESET}";        p_ctx="ctx ${tk} · compact soon" ;;
+    2) c_ctx="\033[1;33mctx ${tk} · /compact${RESET}";          p_ctx="ctx ${tk} · /compact" ;;
+    3) c_ctx="\033[1;31mctx ${tk} · /compact NOW${RESET}";      p_ctx="ctx ${tk} · /compact NOW" ;;
+  esac
+  # Leave a crumb so `fatchats` can see every open chat at once, not just this one.
+  if [ -n "$SESSION_ID" ]; then
+    CTXDIR="$HOME/.claude/state/ctx"
+    mkdir -p "$CTXDIR" 2>/dev/null
+    printf '{"session":"%s","name":%s,"tokens":%s,"pct":%s,"lvl":%s,"cwd":%s,"ts":%s}\n' \
+      "$SESSION_ID" \
+      "$(printf '%s' "$SESSION_NAME" | jq -R .)" \
+      "$tok" "$ctx" "$CTX_LVL" \
+      "$(echo "$input" | jq -c '.workspace.project_dir // .cwd // ""')" \
+      "$(date +%s)" > "$CTXDIR/$SESSION_ID.json.tmp" 2>/dev/null \
+      && mv -f "$CTXDIR/$SESSION_ID.json.tmp" "$CTXDIR/$SESSION_ID.json" 2>/dev/null
+  fi
 fi
 
 # No rate-limit data yet -> single hint line and exit.
@@ -135,9 +164,10 @@ fi
 # never be the segment that wraps off to a continuation row.
 seg_c=(); seg_p=()
 [ -n "$PROJ_C" ] && { seg_c+=("$PROJ_C"); seg_p+=("$PROJ_P"); }
+(( CTX_LVL >= 2 )) && [ -n "$c_ctx" ] && { seg_c+=("$c_ctx"); seg_p+=("$p_ctx"); }
 seg_c+=("$c_model"); seg_p+=("$p_model")
 [ -n "$c_5h" ]   && { seg_c+=("$c_5h");   seg_p+=("$p_5h");   }
-[ -n "$c_ctx" ]  && { seg_c+=("$c_ctx");  seg_p+=("$p_ctx");  }
+(( CTX_LVL < 2 ))  && [ -n "$c_ctx" ] && { seg_c+=("$c_ctx"); seg_p+=("$p_ctx"); }
 [ -n "$c_week" ] && { seg_c+=("$c_week"); seg_p+=("$p_week"); }
 
 out=""            # accumulated colored output (real newlines between rows)

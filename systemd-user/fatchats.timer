@@ -1,0 +1,11 @@
+[Unit]
+Description=Check open Claude chats for bloated context every 3 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=3min
+AccuracySec=30s
+Unit=fatchats.service
+
+[Install]
+WantedBy=timers.target

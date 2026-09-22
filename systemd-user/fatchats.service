@@ -1,0 +1,6 @@
+[Unit]
+Description=Nag when a Claude chat's context has grown fat enough to compact
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/fatchats --notify
