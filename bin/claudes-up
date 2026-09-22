@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# claudes-up - are all the Claude chats actually alive right now?
+#
+# Answers the question a blackout raises: not just "is the process there" but
+# "is it running or frozen, and is it still ticking". Three checks per chat:
+#   1. a claude process exists in that terminal scope
+#   2. its cgroup is thawed, not frozen  (a frozen unit still reports "active")
+#   3. its statusline wrote a heartbeat in the last minute, so it really is live
+#
+#   claudes-up            one line per chat, plus a verdict
+#   claudes-up --quiet    print nothing, exit 0 if all up, 1 if not
+set -uo pipefail
+
+CTXDIR="$HOME/.claude/state/ctx"
+QUIET=0; [ "${1:-}" = "--quiet" ] && QUIET=1
+now=$(date +%s)
+bad=0; total=0
+
+if [ -t 1 ] && [ $QUIET = 0 ]; then
+  RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; DIM=$'\033[2m'; RST=$'\033[0m'
+else
+  RED=; GRN=; YEL=; DIM=; RST=
+fi
+
+# scope -> the chat living in it
+declare -A SCOPE_PID
+for p in $(pgrep -x claude 2>/dev/null); do
+  cg=$(grep -oE '[^/]+\.(scope|service)$' "/proc/$p/cgroup" 2>/dev/null | head -1)
+  [ -n "$cg" ] && SCOPE_PID["$cg"]="${SCOPE_PID[$cg]:-}$p "
+done
+
+report() { [ $QUIET = 1 ] || printf '%s\n' "$*"; }
+
+for scope in $(printf '%s\n' "${!SCOPE_PID[@]}" | sort); do
+  total=$((total + 1))
+  frz=$(systemctl --user show -p FreezerState --value "$scope" 2>/dev/null)
+  npid=$(echo ${SCOPE_PID[$scope]} | wc -w)
+  if [ "$frz" = "frozen" ]; then
+    bad=$((bad + 1))
+    report "${RED}FROZEN${RST}   $scope  ($npid claude procs)  ${DIM}takeover thaw $scope${RST}"
+  else
+    report "${GRN}up${RST}       $scope  ($npid claude procs)"
+  fi
+done
+
+# heartbeats: the statusline of a live chat rewrites its crumb every few seconds
+stale=0; live=0
+for f in "$CTXDIR"/*.json; do
+  [ -e "$f" ] || continue
+  case "$f" in *notified.json) continue;; esac
+  age=$(( now - $(stat -c %Y "$f") ))
+  name=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('name') or '?')" "$f" 2>/dev/null)
+  if [ "$age" -gt 60 ]; then
+    stale=$((stale + 1))
+    report "${YEL}no tick${RST}  ${name:-?} ${DIM}(last heartbeat ${age}s ago)${RST}"
+  else
+    live=$((live + 1))
+  fi
+done
+
+report ""
+if [ "$bad" = 0 ]; then
+  report "${GRN}all $total chat terminals running${RST}, $live ticking"
+else
+  report "${RED}$bad of $total chat terminals are FROZEN${RST} (thaw them, or takeover finish)"
+fi
+[ "$bad" = 0 ] || exit 1
+exit 0
