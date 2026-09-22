@@ -72,6 +72,23 @@ claude_scopes() {   # terminal scopes that hold a Claude chat: kept by default (
   done | sort -u
 }
 
+chats_own_chromes() {   # $1 keep regex: headless Chromes a kept chat launched stay with that chat
+  # Chrome moves its browser process into its own app-com.google.Chrome-<pid>.scope but leaves the GPU
+  # and renderer processes in the chat's terminal scope. Freezing that scope froze half a Chrome: the
+  # chat's job hung, a timeout's SIGTERM waited on the freezer, and the unfrozen GPU process kept
+  # software-rendering on 12 cores until someone thawed it (2026-09-23).
+  local d pid pp cmd pscope
+  for d in /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/app-com.google.Chrome-*.scope; do
+    [ -r "$d/cgroup.procs" ] || continue
+    for pid in $(cat "$d/cgroup.procs" 2>/dev/null); do
+      cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null); [[ $cmd == *--headless* ]] || continue
+      pp=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null)
+      pscope=$(grep -oE '[^/]+\.scope$' "/proc/${pp:-0}/cgroup" 2>/dev/null)
+      [ -n "$pscope" ] && grep -qE "$1" <<< "$pscope" && { basename "$d"; break; }
+    done
+  done
+}
+
 units_to_freeze() {
   local extra="__none__"
   [ -e "$STATE_DIR/freeze-claudes" ] || claude_scopes >> "$KEEP_EXTRA"
@@ -79,7 +96,8 @@ units_to_freeze() {
   [ -s "$STATE_DIR/keep.all" ] && extra=$(grep -v '^$' "$STATE_DIR/keep.all" | sed 's/[][\.^$*+?(){}|]/\\&/g' | paste -sd'|')
   systemctl --user list-units --type=service,scope --state=running --no-pager --plain \
     | awk 'NR>1 && $1 ~ /\.(service|scope)$/ {print $1}' \
-    | grep -v -E "$KEEP_RE" | grep -v -F "${MY_SCOPE:-__none__}" | grep -v -E "^${JOB}\.service$" | grep -v -E "$extra"
+    | grep -v -E "$KEEP_RE" | grep -v -F "${MY_SCOPE:-__none__}" | grep -v -E "^${JOB}\.service$" | grep -v -E "$extra" \
+    | grep -v -x -F -f <(chats_own_chromes "$extra"; echo __none__)
 }
 
 freeze_all() {   # $1 label
