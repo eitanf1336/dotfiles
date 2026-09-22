@@ -126,6 +126,8 @@ for i in range(n):
     if i == prim_idx:
         title = Gtk.Label(); title.get_style_context().add_class("big"); title.set_xalign(0); box.pack_start(title, False, False, 0)
         bar = Gtk.ProgressBar(); bar.set_show_text(True); bar.set_size_request(820, -1); box.pack_start(bar, False, False, 0)
+        now_lab = Gtk.Label(); now_lab.get_style_context().add_class("mid"); now_lab.set_xalign(0); box.pack_start(now_lab, False, False, 0)
+        sub_bar = Gtk.ProgressBar(); sub_bar.set_show_text(True); sub_bar.set_size_request(820, -1); box.pack_start(sub_bar, False, False, 0)
         info = Gtk.Label(); info.get_style_context().add_class("mid"); info.set_xalign(0); info.set_line_wrap(True); info.set_max_width_chars(70); box.pack_start(info, False, False, 0)
         hint = Gtk.Label(label="The laptop belongs to this job. Everything else is frozen in place: nothing is closed, nothing is lost.\nCtrl+Alt+P pauses and resumes.")
         hint.get_style_context().add_class("dim"); hint.set_xalign(0); hint.set_line_wrap(True); hint.set_max_width_chars(70); box.pack_start(hint, False, False, 0)
@@ -135,7 +137,7 @@ for i in range(n):
         def on_stop(_b):
             subprocess.run(["systemctl", "--user", "stop", JOB]); subprocess.run(["takeover", "finish"]); Gtk.main_quit()
         stop.connect("clicked", on_stop); row.pack_start(stop, False, False, 0)
-        widgets = {"title": title, "bar": bar, "info": info, "btn": btn}
+        widgets = {"title": title, "bar": bar, "info": info, "btn": btn, "now": now_lab, "sub": sub_bar}
     else:
         lab = Gtk.Label(label="working, see the main screen"); lab.get_style_context().add_class("dim"); box.pack_start(lab, False, False, 0)
     win.connect("delete-event", lambda *_: True)
@@ -167,7 +169,11 @@ def tick():
             try:
                 a, b = parts[parts.index("sample") + 1].split("/"); sub = int(a) / max(1, int(b))
             except (ValueError, IndexError): sub = 0.0
-        bar.set_fraction(min(1.0, (done + sub) / max(1, total))); bar.set_text(f"{done} / {total}  " + " ".join(parts[2:]))
+        bar.set_fraction(min(1.0, (done + sub) / max(1, total))); bar.set_text(f"{done} of {total} {parts[2] if len(parts) > 2 else ''} finished")
+        rest = " ".join(parts[3:]).strip(", ")
+        widgets["now"].set_text("Now: " + (rest if rest else "starting the next frame"))
+        widgets["sub"].set_fraction(sub); widgets["sub"].set_text(f"this frame {int(sub * 100)}%" if "sample" in parts else "loading")
+        if "sample" not in parts: widgets["sub"].pulse()
         now = time.time(); samp = state["samples"]
         prog = done + sub
         if not samp or samp[-1][1] != prog: samp.append((now, prog))
@@ -182,6 +188,7 @@ def tick():
             info.set_text(f"{int(el//60)} min in. Measuring the pace...")
     else:
         bar.pulse(); bar.set_text("working"); info.set_text(f"{int(el//60)} min in. No progress numbers from this job yet.")
+        widgets["now"].set_text(""); widgets["sub"].pulse(); widgets["sub"].set_text("")
     return True
 
 tick(); GLib.timeout_add(2000, tick)
