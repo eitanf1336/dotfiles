@@ -162,15 +162,21 @@ def tick():
     el = time.time() - t_start
     if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
         done, total = int(parts[0]), int(parts[1])
-        bar.set_fraction(done / max(1, total)); bar.set_text(f"{done} / {total}  " + " ".join(parts[2:]))
+        sub = 0.0
+        if "sample" in parts:                       # "... sample 5/16": credit the part of the frame already rendered
+            try:
+                a, b = parts[parts.index("sample") + 1].split("/"); sub = int(a) / max(1, int(b))
+            except (ValueError, IndexError): sub = 0.0
+        bar.set_fraction(min(1.0, (done + sub) / max(1, total))); bar.set_text(f"{done} / {total}  " + " ".join(parts[2:]))
         now = time.time(); samp = state["samples"]
-        if not samp or samp[-1][1] != done: samp.append((now, done))
+        prog = done + sub
+        if not samp or samp[-1][1] != prog: samp.append((now, prog))
         samp[:] = [x for x in samp if now - x[0] <= 300] or samp[-1:]
         if paused:
             info.set_text(f"{int(el//60)} min in. Paused.")
         elif len(samp) >= 2 and samp[-1][1] > samp[0][1]:
             rate = (samp[-1][1] - samp[0][1]) / max(1e-6, samp[-1][0] - samp[0][0])
-            left = (total - done) / rate
+            left = (total - prog) / rate
             info.set_text(f"{int(el//60)} min in. About {int(left//60)} min left at this pace, done around {time.strftime('%H:%M', time.localtime(now + left))}.")
         else:
             info.set_text(f"{int(el//60)} min in. Measuring the pace...")
