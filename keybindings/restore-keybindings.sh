@@ -273,3 +273,9 @@ gsettings set "$k" name 'End Yom Kippur blackout'
 gsettings set "$k" binding '<Control><Alt><Shift>k'
 gsettings set "$k" command '/home/eitan/.local/bin/kipur off'
 
+paths+=("/memtop/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/memtop/"
+gsettings set "$k" name 'Memory task manager (memtop)'
+gsettings set "$k" binding '<Control><Shift>Escape'
+gsettings set "$k" command '/home/eitan/.local/bin/memtop'
+

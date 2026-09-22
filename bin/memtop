@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""memtop: a live task manager for memory, grouped by program, RAM plus swap.
+
+    memtop            GTK window, refreshes every 2 seconds, Kill buttons
+    memtop --text     one table on the terminal, then exit
+    memtop --watch    the table every 2 seconds on the terminal
+
+Why not gnome-system-monitor: it lists processes, not programs, and it hides swap. On a
+15 GB laptop with a full swap the question is always "which PROGRAM is holding it", so
+this groups every process by its app (flatpak id, GNOME app scope, or the command) and
+shows the group's real RAM (PSS, so shared pages are not counted twice) and its swap.
+
+Kill: first click sends SIGTERM to every process in the group; a second click on the same
+group within 6 seconds sends SIGKILL.
+"""
+import os
+import re
+import signal
+import sys
+import time
+
+PAGE = os.sysconf("SC_PAGE_SIZE")
+
+
+def read(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read().decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def family(pid, cmd):
+    """One name per program, so Chrome's 40 renderers are one row and so is a flatpak."""
+    cg = read(f"/proc/{pid}/cgroup").strip().rsplit("/", 1)[-1]
+    m = re.match(r"app-flatpak-([\w.\-]+?)-\d+\.scope", cg)
+    if m:
+        return m.group(1).split(".")[-1]
+    m = re.match(r"app-gnome-([\w.\-]+?)-\d+\.scope", cg)
+    if m:
+        return m.group(1).replace("\\x2d", "-")
+    m = re.match(r"([\w.\-@]+)\.service", cg)
+    if m and not m.group(1).startswith(("dbus", "gnome", "org.", "xdg", "pipewire", "wireplumber", "evolution", "tracker")):
+        return m.group(1).replace("\\x2d", "-")
+    args = cmd.split("\0")
+    exe = os.path.basename(args[0]) if args and args[0] else read(f"/proc/{pid}/comm").strip()
+    if exe.startswith("python"):
+        for a in args[1:]:
+            if a.endswith(".py"):
+                return os.path.basename(a)
+            if a == "-m" and len(args) > args.index(a) + 1:
+                return "python -m " + args[args.index(a) + 1]
+        return exe
+    if exe == "java":
+        for a in args:
+            if a.endswith(".jar"):
+                return os.path.basename(a)
+        return "java"
+    if exe == "node":
+        for a in args[1:]:
+            if not a.startswith("-"):
+                return "node " + os.path.basename(a)
+    if exe == "claude" or "claude/versions" in args[0]:
+        return "claude" + (" (bg-spare)" if "--bg-spare" in args else "")
+    if exe in ("chrome", "google-chrome"):
+        return "chrome"
+    if exe == "blender":
+        return "blender"
+    if exe == "bwrap":
+        return "flatpak"
+    return exe
+
+
+def sample():
+    groups = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        roll = read(f"/proc/{pid}/smaps_rollup")
+        if not roll:
+            continue
+        pss = swap = 0
+        for line in roll.splitlines():
+            if line.startswith("Pss:"):
+                pss = int(line.split()[1])
+            elif line.startswith("SwapPss:"):
+                swap = int(line.split()[1])
+        if pss + swap < 2048:
+            continue
+        cmd = read(f"/proc/{pid}/cmdline")
+        if not cmd:
+            continue
+        name = family(pid, cmd)
+        g = groups.setdefault(name, {"ram": 0, "swap": 0, "pids": [], "top": ""})
+        g["ram"] += pss
+        g["swap"] += swap
+        g["pids"].append(pid)
+        if not g["top"] or pss + swap > g.get("_max", 0):
+            g["_max"] = pss + swap
+            g["top"] = cmd.replace("\0", " ").strip()[:90]
+    rows = sorted(groups.items(), key=lambda kv: kv[1]["ram"] + kv[1]["swap"], reverse=True)
+    return rows
+
+
+def totals():
+    mem = {}
+    for line in read("/proc/meminfo").splitlines():
+        k, v = line.split(":")
+        mem[k] = int(v.split()[0])
+    pressure = read("/proc/pressure/memory").split("\n")[0]
+    m = re.search(r"avg10=([\d.]+)", pressure)
+    return {
+        "ram_used": mem["MemTotal"] - mem["MemAvailable"],
+        "ram_total": mem["MemTotal"],
+        "swap_used": mem["SwapTotal"] - mem["SwapFree"],
+        "swap_total": mem["SwapTotal"],
+        "pressure": float(m.group(1)) if m else 0.0,
+    }
+
+
+def gb(kb):
+    return kb / 1048576
+
+
+def text_table(limit=25):
+    t = totals()
+    out = [f"RAM {gb(t['ram_used']):.1f}/{gb(t['ram_total']):.1f} GB   swap {gb(t['swap_used']):.1f}/{gb(t['swap_total']):.1f} GB   pressure {t['pressure']:.0f}%",
+           f"{'program':32s} {'procs':>5s} {'RAM GB':>7s} {'swap GB':>8s} {'total':>7s}"]
+    for name, g in sample()[:limit]:
+        out.append(f"{name[:32]:32s} {len(g['pids']):5d} {gb(g['ram']):7.2f} {gb(g['swap']):8.2f} {gb(g['ram'] + g['swap']):7.2f}")
+    return "\n".join(out)
+
+
+def kill_group(pids, hard=False):
+    sig = signal.SIGKILL if hard else signal.SIGTERM
+    n = 0
+    for pid in pids:
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, sig)
+            n += 1
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+    return n
+
+
+def gui():
+    import gi
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import Gtk, GLib, Pango
+
+    app = Gtk.Application(application_id="dev.eitan.memtop")
+    state = {"last_kill": {}}
+
+    def activate(app):
+        win = Gtk.ApplicationWindow(application=app, title="Memory")
+        win.set_default_size(820, 640)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(10); box.set_margin_bottom(10); box.set_margin_start(12); box.set_margin_end(12)
+        win.set_child(box)
+        header = Gtk.Label(xalign=0)
+        header.add_css_class("title-3")
+        box.append(header)
+        bar_ram = Gtk.ProgressBar(); bar_ram.set_show_text(True)
+        bar_swap = Gtk.ProgressBar(); bar_swap.set_show_text(True)
+        box.append(bar_ram); box.append(bar_swap)
+        scroller = Gtk.ScrolledWindow(vexpand=True)
+        box.append(scroller)
+        grid = Gtk.Grid(column_spacing=14, row_spacing=4)
+        scroller.set_child(grid)
+        foot = Gtk.Label(xalign=0, label="Kill: SIGTERM the whole program. Click again within 6 s to SIGKILL.")
+        foot.add_css_class("dim-label")
+        box.append(foot)
+
+        def refresh():
+            t = totals()
+            header.set_text(f"RAM {gb(t['ram_used']):.1f} of {gb(t['ram_total']):.1f} GB    "
+                            f"swap {gb(t['swap_used']):.1f} of {gb(t['swap_total']):.1f} GB    "
+                            f"pressure {t['pressure']:.0f}%")
+            bar_ram.set_fraction(t["ram_used"] / t["ram_total"]); bar_ram.set_text("RAM")
+            bar_swap.set_fraction(t["swap_used"] / max(1, t["swap_total"])); bar_swap.set_text("swap")
+            child = grid.get_first_child()
+            while child:
+                nxt = child.get_next_sibling(); grid.remove(child); child = nxt
+            for c, title in enumerate(("program", "procs", "RAM GB", "swap GB", "total GB", "", "biggest command")):
+                lab = Gtk.Label(label=title, xalign=0); lab.add_css_class("heading"); grid.attach(lab, c, 0, 1, 1)
+            for r, (name, g) in enumerate(sample()[:30], start=1):
+                cells = (name, str(len(g["pids"])), f"{gb(g['ram']):.2f}", f"{gb(g['swap']):.2f}", f"{gb(g['ram'] + g['swap']):.2f}")
+                for c, val in enumerate(cells):
+                    lab = Gtk.Label(label=val, xalign=0 if c == 0 else 1)
+                    if c == 4 and gb(g["ram"] + g["swap"]) > 1.0:
+                        lab.add_css_class("error")
+                    grid.attach(lab, c, r, 1, 1)
+                btn = Gtk.Button(label="Kill"); btn.add_css_class("destructive-action")
+                pids = list(g["pids"])
+
+                def on_kill(_b, nm=name, ps=pids):
+                    now = time.time()
+                    hard = now - state["last_kill"].get(nm, 0) < 6
+                    n = kill_group(ps, hard=hard)
+                    state["last_kill"][nm] = now
+                    foot.set_text(f"{'SIGKILL' if hard else 'SIGTERM'} sent to {n} process(es) of {nm}")
+                btn.connect("clicked", on_kill)
+                grid.attach(btn, 5, r, 1, 1)
+                top = Gtk.Label(label=g["top"], xalign=0); top.set_ellipsize(Pango.EllipsizeMode.END)
+                top.set_max_width_chars(48); top.add_css_class("dim-label"); grid.attach(top, 6, r, 1, 1)
+            return True
+
+        refresh()
+        GLib.timeout_add(2000, refresh)
+        win.present()
+
+    app.connect("activate", activate)
+    app.run([])
+
+
+if __name__ == "__main__":
+    if "--text" in sys.argv:
+        print(text_table())
+    elif "--watch" in sys.argv:
+        try:
+            while True:
+                os.system("clear")
+                print(text_table())
+                time.sleep(2)
+        except KeyboardInterrupt:
+            pass
+    else:
+        gui()

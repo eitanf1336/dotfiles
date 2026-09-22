@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Memory (memtop)
+Comment=Live memory by program, RAM plus swap, with kill buttons
+Exec=/home/eitan/.local/bin/memtop
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
