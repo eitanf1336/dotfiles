@@ -3,6 +3,13 @@
 #
 #   takeover start [-l label] -- <command...>   freeze everything else, run the job at full
 #                                               priority, show a progress window, thaw when done
+#   takeover hold [-l label] [--keep PATTERN ...]   same freeze and screen, but no command:
+#                           the caller (a Claude chat) keeps working and ends it with
+#                           `takeover finish`. --keep protects extra units (a Minecraft bot's
+#                           service, a testbed) from the freeze; the caller's own scope is
+#                           always kept.
+#   takeover note "text"    a line for the notes area on the screen (white text, last 10 kept)
+#   takeover progress DONE TOTAL [label]   drive the progress bar by hand
 #   takeover pause          pause or resume the job (Ctrl+Alt+P does this)
 #   takeover finish         thaw everything and close the window (runs by itself at the end)
 #   takeover status         what is frozen, what is running
@@ -21,15 +28,35 @@
 # the window reads it every 2 s.
 set -uo pipefail
 STATE_DIR="$HOME/.cache/takeover"; mkdir -p "$STATE_DIR"
-FROZEN="$STATE_DIR/frozen"; PROGRESS="$STATE_DIR/progress"; LABEL_F="$STATE_DIR/label"; PAUSED="$STATE_DIR/paused"
+FROZEN="$STATE_DIR/frozen"; PROGRESS="$STATE_DIR/progress"; LABEL_F="$STATE_DIR/label"; PAUSED="$STATE_DIR/paused"; NOTES="$STATE_DIR/notes"; KEEP_EXTRA="$STATE_DIR/keep"
 JOB=takeover-job
 KEEP_RE='^(init\.scope|takeover|cuteworld-render|perimeter81|.*claude-keep-awake|.*claude-whatsapp.*|.*whatsapp.*|whatclaude|power-menu-rescue|power-profile-auto|ssh-agent|ydotool|snap\.snapd|flatpak-session-helper|language-path|dbus|gnome|org\.|xdg|pipewire|wireplumber|at-spi|gvfs|dconf|evolution|app-gnome-org\.gnome\.(Evolution|SettingsDaemon)|app-gnome-update|app-gnome-perimeter81)'
 MY_SCOPE=$(grep -oE '[^/]+\.scope$' /proc/self/cgroup | head -1)
 
 units_to_freeze() {
+  local extra="__none__"
+  [ -s "$KEEP_EXTRA" ] && extra=$(paste -sd'|' "$KEEP_EXTRA")
   systemctl --user list-units --type=service,scope --state=running --no-pager --plain \
     | awk 'NR>1 && $1 ~ /\.(service|scope)$/ {print $1}' \
-    | grep -v -E "$KEEP_RE" | grep -v -F "${MY_SCOPE:-__none__}" | grep -v -E "^${JOB}\.service$"
+    | grep -v -E "$KEEP_RE" | grep -v -F "${MY_SCOPE:-__none__}" | grep -v -E "^${JOB}\.service$" | grep -v -E "$extra"
+}
+
+freeze_all() {   # $1 label
+  echo "$1" > "$LABEL_F"; : > "$PROGRESS"; : > "$NOTES"; rm -f "$PAUSED"; : > "$FROZEN"
+  for u in $(units_to_freeze); do
+    systemctl --user freeze "$u" 2>/dev/null && echo "$u" >> "$FROZEN"
+  done
+  echo "frozen $(wc -l < "$FROZEN") units; starting $1"
+  # give the job the machine: performance profile, and the frozen programs' RAM pushed to swap
+  powerprofilesctl get > "$STATE_DIR/profile.prev" 2>/dev/null
+  powerprofilesctl set performance 2>/dev/null
+  reclaimed=0
+  while read -r u; do
+    cg=$(systemctl --user show -p ControlGroup --value "$u" 2>/dev/null); [ -n "$cg" ] || continue
+    f="/sys/fs/cgroup$cg/memory.reclaim"
+    [ -w "$f" ] && echo "4G" > "$f" 2>/dev/null && reclaimed=$((reclaimed+1))
+  done < "$FROZEN"
+  echo "performance profile on; asked $reclaimed frozen programs to give up their RAM"
 }
 
 cmd=${1:-status}; shift || true
@@ -44,17 +71,34 @@ case "$cmd" in
     [ "${1:-}" = "--" ] && shift
     [ $# -gt 0 ] || { echo "takeover start [-l label] -- <command...>" >&2; exit 2; }
     if systemctl --user is-active --quiet "$JOB"; then echo "a takeover is already running (takeover status)" >&2; exit 1; fi
-    echo "$label" > "$LABEL_F"; : > "$PROGRESS"; rm -f "$PAUSED"
-    : > "$FROZEN"
-    for u in $(units_to_freeze); do
-      systemctl --user freeze "$u" 2>/dev/null && echo "$u" >> "$FROZEN"
-    done
-    echo "frozen $(wc -l < "$FROZEN") units; starting $label"
+    : > "$KEEP_EXTRA"
+    freeze_all "$label"
     # the job: full priority, its own cgroup, thaws everything when it exits however it exits
     systemd-run --user --unit="$JOB" --collect -p OOMScoreAdjust=300 \
       bash -c 'cd "$1"; shift; "$@"; rc=$?; takeover finish; exit $rc' _ "$PWD" "$@" >/dev/null
     setsid -f "$0" gui >/dev/null 2>&1
     notify-send -i utilities-system-monitor "Takeover: $label" "Everything else is frozen. Ctrl+Alt+P pauses." 2>/dev/null
+    ;;
+  hold)
+    label="blackout"; : > "$KEEP_EXTRA"
+    while [ $# -gt 0 ]; do case "$1" in
+      -l) label=$2; shift 2;;
+      --keep) echo "$2" >> "$KEEP_EXTRA"; shift 2;;
+      *) shift;;
+    esac; done
+    if systemctl --user is-active --quiet "$JOB"; then echo "a takeover is already running (takeover status)" >&2; exit 1; fi
+    freeze_all "$label"
+    # the job is a placeholder that lives until `takeover finish`; the caller does the work
+    systemd-run --user --unit="$JOB" --collect -p OOMScoreAdjust=300 bash -c 'while :; do sleep 3600; done' >/dev/null
+    setsid -f "$0" gui >/dev/null 2>&1
+    notify-send -i utilities-system-monitor "Blackout: $label" "Everything else is frozen. Ctrl+Alt+P pauses, the screen's button gives the laptop back." 2>/dev/null
+    ;;
+  note)
+    printf '%s  %s\n' "$(date +%H:%M)" "$*" >> "$NOTES"; tail -n 10 "$NOTES" > "$NOTES.tmp" && mv "$NOTES.tmp" "$NOTES"
+    ;;
+  progress)
+    [ $# -ge 2 ] || { echo "takeover progress DONE TOTAL [label]" >&2; exit 2; }
+    echo "$*" >> "$PROGRESS"
     ;;
   pause)
     if ! systemctl --user is-active --quiet "$JOB"; then echo "no takeover job running"; exit 1; fi
@@ -69,7 +113,9 @@ case "$cmd" in
     if [ -s "$FROZEN" ]; then
       while read -r u; do [ -n "$u" ] && systemctl --user thaw "$u" 2>/dev/null && n=$((n+1)); done < "$FROZEN"
     fi
-    : > "$FROZEN"; rm -f "$PAUSED"
+    systemctl --user stop "$JOB" 2>/dev/null
+    prev=$(cat "$STATE_DIR/profile.prev" 2>/dev/null); [ -n "$prev" ] && powerprofilesctl set "$prev" 2>/dev/null
+    : > "$FROZEN"; rm -f "$PAUSED"; : > "$KEEP_EXTRA"
     echo "done" >> "$PROGRESS"
     notify-send -i emblem-ok-symbolic "Takeover finished: $(cat "$LABEL_F" 2>/dev/null)" "Thawed $n programs. The laptop is yours." 2>/dev/null
     echo "thawed $n units"
@@ -81,7 +127,7 @@ case "$cmd" in
     if [ -s "$FROZEN" ]; then echo "frozen ($(wc -l < "$FROZEN")):"; sed 's/^/  /' "$FROZEN"; else echo "frozen: nothing"; fi
     ;;
   gui)
-    exec python3 - "$PROGRESS" "$LABEL_F" "$PAUSED" "$JOB" <<'PY'
+    exec python3 - "$PROGRESS" "$LABEL_F" "$PAUSED" "$JOB" "$NOTES" <<'PY'
 """Black window on every monitor, the progress on the primary one. Closes the moment the job
 is gone. GTK 3, because it can place a fullscreen window on a chosen monitor (kipur does
 the same)."""
@@ -89,7 +135,7 @@ import sys, time, subprocess, os
 import gi
 gi.require_version("Gtk", "3.0"); gi.require_version("Gdk", "3.0")
 from gi.repository import Gtk, Gdk, GLib, Pango
-PROGRESS, LABEL_F, PAUSED, JOB = sys.argv[1:5]
+PROGRESS, LABEL_F, PAUSED, JOB, NOTES = sys.argv[1:6]
 t_start = time.time()
 state = {"samples": [], "wins": []}
 
@@ -131,13 +177,15 @@ for i in range(n):
         info = Gtk.Label(); info.get_style_context().add_class("mid"); info.set_xalign(0); info.set_line_wrap(True); info.set_max_width_chars(70); box.pack_start(info, False, False, 0)
         hint = Gtk.Label(label="The laptop belongs to this job. Everything else is frozen in place: nothing is closed, nothing is lost.\nCtrl+Alt+P pauses and resumes.")
         hint.get_style_context().add_class("dim"); hint.set_xalign(0); hint.set_line_wrap(True); hint.set_max_width_chars(70); box.pack_start(hint, False, False, 0)
+        notes = Gtk.Label(); notes.get_style_context().add_class("mid"); notes.set_xalign(0); notes.set_yalign(0)
+        notes.set_line_wrap(True); notes.set_max_width_chars(90); notes.set_size_request(820, 260); box.pack_start(notes, False, False, 6)
         row = Gtk.Box(spacing=14); box.pack_start(row, False, False, 8)
         btn = Gtk.Button(label="Pause  (Ctrl+Alt+P)"); btn.connect("clicked", lambda _b: subprocess.run(["takeover", "pause"])); row.pack_start(btn, False, False, 0)
         stop = Gtk.Button(label="Stop and give the laptop back"); stop.get_style_context().add_class("destructive-action")
         def on_stop(_b):
             subprocess.run(["systemctl", "--user", "stop", JOB]); subprocess.run(["takeover", "finish"]); Gtk.main_quit()
         stop.connect("clicked", on_stop); row.pack_start(stop, False, False, 0)
-        widgets = {"title": title, "bar": bar, "info": info, "btn": btn, "now": now_lab, "sub": sub_bar}
+        widgets = {"title": title, "bar": bar, "info": info, "btn": btn, "now": now_lab, "sub": sub_bar, "notes": notes}
     else:
         lab = Gtk.Label(label="working, see the main screen"); lab.get_style_context().add_class("dim"); box.pack_start(lab, False, False, 0)
     win.connect("delete-event", lambda *_: True)
@@ -159,6 +207,8 @@ def tick():
         lines = [l for l in open(PROGRESS).read().splitlines() if l.strip() and l.strip() != "done"]
         last = lines[-1] if lines else ""
     except OSError: pass
+    try: widgets["notes"].set_text(open(NOTES).read().rstrip())
+    except OSError: widgets["notes"].set_text("")
     parts = last.split()
     bar, info = widgets["bar"], widgets["info"]
     el = time.time() - t_start
