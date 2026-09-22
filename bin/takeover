@@ -99,7 +99,7 @@ case "$cmd" in
     freeze_all "$label"
     # the job: full priority, its own cgroup, thaws everything when it exits however it exits
     systemd-run --user --unit="$JOB" --collect -p OOMScoreAdjust=300 \
-      bash -c 'cd "$1"; shift; "$@"; rc=$?; takeover finish; exit $rc' _ "$PWD" "$@" >/dev/null
+      bash -c 'cd "$1"; shift; "$@"; rc=$?; TAKEOVER_INSIDE_JOB=1 takeover finish; exit $rc' _ "$PWD" "$@" >/dev/null
     setsid -f "$0" gui >/dev/null 2>&1
     notify-send -i utilities-system-monitor "Takeover: $label" "Everything else is frozen. Ctrl+Alt+P pauses." 2>/dev/null
     ;;
@@ -137,10 +137,11 @@ case "$cmd" in
     if [ -s "$FROZEN" ]; then
       while read -r u; do [ -n "$u" ] && systemctl --user thaw "$u" 2>/dev/null && n=$((n+1)); done < "$FROZEN"
     fi
-    systemctl --user stop "$JOB" 2>/dev/null
     prev=$(cat "$STATE_DIR/profile.prev" 2>/dev/null); [ -n "$prev" ] && powerprofilesctl set "$prev" 2>/dev/null
     : > "$FROZEN"; rm -f "$PAUSED"; : > "$KEEP_EXTRA"
     echo "done" >> "$PROGRESS"
+    # last, because when finish runs from inside the job this stops the caller too
+    [ "${TAKEOVER_INSIDE_JOB:-}" = 1 ] || systemctl --user stop "$JOB" 2>/dev/null
     notify-send -i emblem-ok-symbolic "Takeover finished: $(cat "$LABEL_F" 2>/dev/null)" "Thawed $n programs. The laptop is yours." 2>/dev/null
     echo "thawed $n units"
     ;;
