@@ -8,6 +8,8 @@
 #                           `takeover finish`. --keep protects extra units (a Minecraft bot's
 #                           service, a testbed) from the freeze; the caller's own scope is
 #                           always kept.
+#   Standing exclusions live in ~/.config/takeover/keep-units (unit name regex per line) and
+#   keep-chats (a Claude chat name substring per line): those are never frozen.
 #   takeover note "text"    a line for the notes area on the screen (white text, last 10 kept)
 #   takeover progress DONE TOTAL [label]   drive the progress bar by hand
 #   takeover pause          pause or resume the job (Ctrl+Alt+P does this)
@@ -33,9 +35,31 @@ JOB=takeover-job
 KEEP_RE='^(init\.scope|takeover|cuteworld-render|perimeter81|.*claude-keep-awake|.*claude-whatsapp.*|.*whatsapp.*|whatclaude|power-menu-rescue|power-profile-auto|ssh-agent|ydotool|snap\.snapd|flatpak-session-helper|language-path|dbus|gnome|org\.|xdg|pipewire|wireplumber|at-spi|gvfs|dconf|evolution|app-gnome-org\.gnome\.(Evolution|SettingsDaemon)|app-gnome-update|app-gnome-perimeter81)'
 MY_SCOPE=$(grep -oE '[^/]+\.scope$' /proc/self/cgroup | head -1)
 
+CONF="$HOME/.config/takeover"          # keep-units: regex per line; keep-chats: a Claude chat name substring per line
+
+chat_scopes_to_keep() {   # scopes of every Claude chat or agent whose name matches keep-chats
+  [ -s "$CONF/keep-chats" ] || return 0
+  timeout 15 claude agents --json 2>/dev/null | python3 -c '
+import json, sys, re
+pats = [l.strip().lower() for l in open(sys.argv[1]) if l.strip()]
+try: a = json.load(sys.stdin)
+except Exception: sys.exit(0)
+a = a if isinstance(a, list) else a.get("agents", a)
+for x in a:
+    n = (x.get("name") or "").lower(); pid = x.get("pid")
+    if pid and any(p in n for p in pats):
+        try:
+            cg = open(f"/proc/{pid}/cgroup").read().strip()
+            m = re.search(r"([^/]+\.scope)$", cg)
+            if m: print(m.group(1))
+        except OSError: pass
+' "$CONF/keep-chats" 2>/dev/null | sort -u
+}
+
 units_to_freeze() {
   local extra="__none__"
-  [ -s "$KEEP_EXTRA" ] && extra=$(paste -sd'|' "$KEEP_EXTRA")
+  { [ -s "$KEEP_EXTRA" ] && cat "$KEEP_EXTRA"; [ -s "$CONF/keep-units" ] && cat "$CONF/keep-units"; chat_scopes_to_keep; } > "$STATE_DIR/keep.all" 2>/dev/null
+  [ -s "$STATE_DIR/keep.all" ] && extra=$(grep -v '^$' "$STATE_DIR/keep.all" | sed 's/[][\.^$*+?(){}|]/\\&/g' | paste -sd'|')
   systemctl --user list-units --type=service,scope --state=running --no-pager --plain \
     | awk 'NR>1 && $1 ~ /\.(service|scope)$/ {print $1}' \
     | grep -v -E "$KEEP_RE" | grep -v -F "${MY_SCOPE:-__none__}" | grep -v -E "^${JOB}\.service$" | grep -v -E "$extra"
