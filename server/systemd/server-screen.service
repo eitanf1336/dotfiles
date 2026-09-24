@@ -1,0 +1,18 @@
+[Unit]
+Description=ServerScreen: motivation screen page + stats API on 127.0.0.1:7800
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/MyProjects/ServerScreen
+ExecStart=/usr/bin/python3 %h/code/MyProjects/ServerScreen/server.py
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+Nice=5
+MemoryHigh=150M
+MemoryMax=250M
+
+[Install]
+WantedBy=default.target

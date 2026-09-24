@@ -1,0 +1,10 @@
+[Unit]
+Description=Feed the server's motivation screen every 10 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

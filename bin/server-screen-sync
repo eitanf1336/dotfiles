@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""server-screen-sync: feed the server's motivation screen (ServerScreen, :7800) the
+facts that only exist on this laptop.
+
+Every run (user timer, every 10 min):
+  * CuteWorld: ~40 of the newest rendered frames, sampled across the newest shots,
+    downscaled to 960px JPG (cached, so unchanged frames are never re-encoded).
+  * laptop.json: latest MinecraftArena run, the `learning` study desk, Loorp, CuteWorld.
+  * ~/.config/portfolio/holdings.json and ~/.config/surf/config.json (the stock and
+    surf math on the server reads them).
+Then rsyncs it all to the server's ~/.cache/server-screen/ and ~/.config/.
+Read-only on every source. Safe to run any time; one run takes a few seconds.
+"""
+import json, os, re, sqlite3, subprocess, sys, time, datetime as dt
+
+HOME = os.path.expanduser('~')
+STAGE = f'{HOME}/.cache/server-screen-stage'
+FRAMES = f'{STAGE}/frames'
+CUTE = f'{HOME}/code/MyProjects/CuteWorld/out/storyboard'
+MC_RUNS = f'{HOME}/code/MyProjects/MinecraftArena/runs'
+LEARNING_DB = f'{HOME}/code/learning/data/learning.db'
+LOORP = f'{HOME}/code/MyProjects/Loorp'
+N_FRAMES = 40
+PER_SHOT = 6
+HOST = os.environ.get('SERVER_SCREEN_HOST', 'server')
+
+
+def cuteworld():
+    shots = []                       # (newest mtime, shot dir, [frames])
+    for story in sorted(os.listdir(CUTE)) if os.path.isdir(CUTE) else []:
+        p1 = f'{CUTE}/{story}/p1'
+        if not os.path.isdir(p1):
+            continue
+        for shot in os.listdir(p1):
+            fd = f'{p1}/{shot}/frames'
+            if not os.path.isdir(fd):
+                continue
+            fr = sorted(f for f in os.listdir(fd) if f.endswith('.png'))
+            if fr:
+                shots.append((os.path.getmtime(f'{fd}/{fr[-1]}'), story, shot, fd, fr))
+    shots.sort(reverse=True)
+    picks = []
+    for _, story, shot, fd, fr in shots:
+        k = min(PER_SHOT, len(fr), N_FRAMES - len(picks))
+        if k <= 0:
+            break
+        idx = sorted({round(i * (len(fr) - 1) / max(1, k - 1)) for i in range(k)}) if k > 1 else [len(fr) // 2]
+        for i in idx:
+            picks.append((story, shot, f'{fd}/{fr[i]}'))
+    os.makedirs(FRAMES, exist_ok=True)
+    want = set()
+    for n, (story, shot, src) in enumerate(picks):
+        # name sorts newest-shot-first and changes when the source changes
+        stamp = int(os.path.getmtime(src))
+        name = f'{n:02d}_{story}_{shot}_{os.path.basename(src)[:-4]}_{stamp}.jpg'
+        want.add(name)
+        dst = f'{FRAMES}/{name}'
+        if not os.path.exists(dst):
+            subprocess.run(['ffmpeg', '-loglevel', 'error', '-y', '-i', src, '-vf',
+                            'scale=960:-2', '-q:v', '4', dst], check=False)
+    for f in os.listdir(FRAMES):
+        if f not in want:
+            os.remove(f'{FRAMES}/{f}')
+    total = sum(len(s[4]) for s in shots)
+    newest = shots[0] if shots else None
+    return {'frames_total': total, 'shots': len(shots),
+            'stories': sorted({s[1] for s in shots}),
+            'newest_shot': f'{newest[1]} {newest[2]}' if newest else None,
+            'newest_at': newest[0] if newest else None}
+
+
+def minecraft():
+    runs = sorted(d for d in os.listdir(MC_RUNS) if os.path.isdir(f'{MC_RUNS}/{d}')) if os.path.isdir(MC_RUNS) else []
+    for r in reversed(runs):
+        base = f'{MC_RUNS}/{r}'
+        try:
+            carry = json.load(open(f'{base}/carry.json'))
+        except Exception:  # noqa: BLE001
+            continue
+        bot = next(iter(carry.values()))
+        plan = (bot.get('notes') or {}).get('plan') or ''
+        doing = None
+        if '[in progress]' in plan:
+            tail = plan.split('[in progress]', 1)[1].strip()
+            doing = re.split(r'(?<=[.!])\s', tail, maxsplit=1)[0].strip()
+        try:
+            stopped = open(f'{base}/stopped-because.txt').read().strip()
+        except Exception:  # noqa: BLE001
+            stopped = None
+        run = {}
+        try:
+            run = json.load(open(f'{base}/run.json'))
+        except Exception:  # noqa: BLE001
+            pass
+        return {'run': r, 'model': r.split('_')[-1], 'goal': run.get('goal'),
+                'game_seconds': bot.get('elapsed'), 'steps': bot.get('steps'),
+                'deaths': bot.get('deaths'), 'doing': doing, 'stopped': stopped,
+                'runs_total': len(runs), 'started': run.get('started')}
+    return None
+
+
+def learning():
+    if not os.path.exists(LEARNING_DB):
+        return None
+    c = sqlite3.connect(f'file:{LEARNING_DB}?mode=ro', uri=True, timeout=5)
+    now = dt.datetime.now().isoformat(timespec='minutes')
+    ex = c.execute("""SELECT e.title, e.start, COALESCE(c.name, c.short) FROM events e
+                      LEFT JOIN courses c ON c.id = e.course_id
+                      WHERE e.kind = 'exam' AND e.start >= ? ORDER BY e.start LIMIT 1""", (now,)).fetchone()
+    items = c.execute('SELECT COUNT(*) FROM items').fetchone()[0]
+    courses = c.execute('SELECT COUNT(*) FROM courses WHERE active = 1').fetchone()[0]
+    quizzes = c.execute("SELECT COUNT(*) FROM quizzes WHERE status = 'ready'").fetchone()[0]
+    attempts = c.execute('SELECT COUNT(*) FROM attempts').fetchone()[0]
+    return {'items': items, 'courses': courses, 'quizzes': quizzes, 'attempts': attempts,
+            'next_exam': {'title': ex[0], 'start': ex[1], 'course': ex[2]} if ex else None}
+
+
+def git_facts(repo):
+    if not os.path.isdir(f'{repo}/.git'):
+        return None
+    def g(*a):
+        return subprocess.run(['git', '-C', repo, *a], capture_output=True, text=True, timeout=10).stdout.strip()
+    since = (dt.date.today() - dt.timedelta(days=7)).isoformat()
+    return {'commits': int(g('rev-list', '--count', 'HEAD') or 0),
+            'commits_7d': int(g('rev-list', '--count', f'--since={since}', 'HEAD') or 0),
+            'last_subject': g('log', '-1', '--format=%s'), 'last_at': g('log', '-1', '--format=%cI')}
+
+
+def main():
+    os.makedirs(STAGE, exist_ok=True)
+    facts = {'at': time.time()}
+    for name, fn in (('cuteworld', cuteworld), ('minecraft', minecraft), ('learning', learning),
+                     ('loorp', lambda: git_facts(LOORP))):
+        try:
+            facts[name] = fn()
+        except Exception as e:  # noqa: BLE001
+            facts[name] = None
+            print(f'{name}: {e}', file=sys.stderr)
+    tmp = f'{STAGE}/laptop.json.tmp'
+    json.dump(facts, open(tmp, 'w'), ensure_ascii=False)
+    os.replace(tmp, f'{STAGE}/laptop.json')
+    rs = ['rsync', '-a', '--timeout=30']
+    subprocess.run(['ssh', HOST, 'mkdir -p ~/.cache/server-screen ~/.config/portfolio ~/.config/surf'], check=True, timeout=30)
+    subprocess.run([*rs, '--delete', f'{FRAMES}/', f'{HOST}:.cache/server-screen/frames/'], check=True)
+    subprocess.run([*rs, f'{STAGE}/laptop.json', f'{HOST}:.cache/server-screen/laptop.json'], check=True)
+    for src, dst in ((f'{HOME}/.config/portfolio/holdings.json', '.config/portfolio/holdings.json'),
+                     (f'{HOME}/.config/surf/config.json', '.config/surf/config.json')):
+        if os.path.exists(src):
+            subprocess.run([*rs, src, f'{HOST}:{dst}'], check=True)
+    print(f"synced {len(os.listdir(FRAMES))} frames + laptop.json")
+
+
+if __name__ == '__main__':
+    main()

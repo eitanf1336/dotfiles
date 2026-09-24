@@ -1,0 +1,11 @@
+[Unit]
+Description=Feed the server's motivation screen: CuteWorld frames, run stats, holdings
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/code/linux-setup/bin/server-screen-sync
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=300
