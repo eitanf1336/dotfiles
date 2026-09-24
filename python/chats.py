@@ -93,6 +93,7 @@ import struct
 import subprocess
 import sys
 import termios
+import datetime
 import time
 import tty
 import unicodedata
@@ -980,6 +981,48 @@ STARRED_STORE = HOME / ".claude" / "chats" / "starred.json"
 SPECIAL_STORE = HOME / ".claude" / "chats" / "special.json"
 
 
+# sessionId -> epoch seconds when /pause was run in that chat. The loudest mark
+# on the board: a red bar reading PAUSED, so a parked chat can't be mistaken
+# for one that is still working. It clears itself the moment you type a new
+# message into that chat (see _typed_since), or with `claude-c-file unpause`.
+PAUSED_STORE = HOME / ".claude" / "chats" / "paused.json"
+
+
+def load_paused():
+    return _load_json(PAUSED_STORE)
+
+
+def _typed_since(path, since):
+    """True when the transcript has a message YOU typed after `since` (epoch s).
+    Reads only the tail; slash commands, reminders and agent notifications do
+    not count, so the /pause itself never un-pauses the chat."""
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 262144))
+            chunk = fh.read().decode(errors="replace")
+    except OSError:
+        return False
+    for line in reversed(chunk.split("\n")):
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(d, dict) or d.get("type") != "user" or d.get("isMeta"):
+            continue
+        txt = _text_from_content(d.get("message", {}).get("content")).strip()
+        if _is_noise(txt) or txt.startswith(("<task-notification", "[SYSTEM", "Another Claude session", "<agent-message")):
+            continue
+        ts = d.get("timestamp")
+        try:
+            when = datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        return when > since + 5
+    return False
+
+
 def load_names():
     return _load_json(NAMES_STORE)
 
@@ -1023,6 +1066,7 @@ def setup_colors():
     curses.init_pair(8, curses.COLOR_WHITE, -1)    # dim/help
     curses.init_pair(9, curses.COLOR_BLUE, -1)     # In Progress / running
     curses.init_pair(10, curses.COLOR_BLACK, curses.COLOR_YELLOW)  # starred row
+    curses.init_pair(11, curses.COLOR_YELLOW, curses.COLOR_RED)    # paused row
     _PROJ_PAIRS.clear()          # pair numbers don't survive a new curses screen
     _NEXT_PROJ_PAIR[0] = _PROJ_PAIR_BASE
 
@@ -1148,6 +1192,7 @@ class App:
         self.names = load_names()  # sessionId -> user's custom name
         self.starred = load_starred()  # sessionId -> True (highlighted row)
         self.special = load_special()  # sessionId -> True (quiet ♡ keepsake mark)
+        self.paused = load_paused()    # sessionId -> paused-at (loud red PAUSED bar)
         # Ctrl+S: show only ★/♡ chats. Session-only on purpose (NOT persisted
         # like show_hidden): a filter that survives a restart would reopen the
         # board looking like most of the chats had vanished.
@@ -1402,6 +1447,18 @@ class App:
             self.superseded_map = _json_set(
                 SUPERSEDED_STORE, parent["id"], child["id"])
             smap = self.superseded_map
+
+    def _settle_paused(self):
+        """Reload the PAUSED marks and drop any whose chat you have typed into
+        since it was paused."""
+        paused = load_paused()
+        if paused:
+            by_id = {c["id"]: c for c in self.all_chats}
+            for sid, when in list(paused.items()):
+                c = by_id.get(sid)
+                if c and isinstance(when, (int, float)) and _typed_since(c["path"], when):
+                    paused = _json_set(PAUSED_STORE, sid, None)
+        return paused
 
     def rescan(self):
         """Re-scan ~/.claude/projects for chat files and refresh self.all_chats.
@@ -2127,6 +2184,7 @@ class App:
                 self.names = load_names()
                 self.starred = load_starred()
                 self.special = load_special()
+                self.paused = self._settle_paused()
                 self.moved = load_moved()
                 self.tags = load_project_tags()
                 self.superseded_map = load_superseded()  # rescan() resolves & sets self.superseded
@@ -2249,6 +2307,14 @@ class App:
             if c:
                 self.resume_target, self.resume_action = c, "fork"
                 return False
+        elif ch == ord("B"):
+            # Reopen the selected chat with EVERY permission check off
+            # (`--dangerously-skip-permissions`). His explicit choice, so it
+            # always asks first; a live agent is stopped and reopened.
+            c = self.selected_chat(nav)
+            if c and self.confirm_bypass(c):
+                self.resume_target, self.resume_action = c, "bypass"
+                return False
         elif ch in (ord("x"), ord("X")):
             c = self.selected_chat(nav)
             if c and c["id"] in self.live_ids:
@@ -2286,6 +2352,19 @@ class App:
         self.stdscr.clrtoeol()
         self.stdscr.refresh()
         return self._blocking_getch() in (ord("y"), ord("Y"))
+
+    def confirm_bypass(self, chat):
+        h, w = self.stdscr.getmaxyx()
+        live = " It is live: it gets stopped and reopened." if chat["id"] in self.live_ids else ""
+        prompt = (f"Reopen with ALL permission checks OFF?{live}  (y/N)  "
+                  f"{_bidi(chat['title'][:35])}")
+        self.stdscr.addstr(h - 1, 0, _clamp(prompt, w - 1), curses.color_pair(4) | curses.A_BOLD)
+        self.stdscr.clrtoeol()
+        self.stdscr.refresh()
+        if self._blocking_getch() in (ord("y"), ord("Y")):
+            return True
+        self.message = "Bypass cancelled"
+        return False
 
     def confirm_stop(self, chat):
         h, w = self.stdscr.getmaxyx()
@@ -2356,7 +2435,7 @@ class App:
             except curses.error:
                 pass
         help1 = ("Enter open   / find   Space fold   n new   r rename   m move   "
-                 "o mode   f fork   x stop   s mark ★♡   ^S marked   1-6 file   u undo   "
+                 "o mode   f fork   B bypass   x stop   s mark ★♡   ^S marked   1-6 file   u undo   "
                  "d delete   P projects   ^R reload   q quit")
         self.stdscr.addstr(1, 0, help1[: w - 1], curses.color_pair(8) | curses.A_DIM)
         legend = "  ".join(f"{i+1}:{CATEGORIES[i]}" for i in range(6))
@@ -2453,7 +2532,12 @@ class App:
                 # from ★ to ♡), but guard anyway so a hand-edited store can't
                 # draw two marks on one row.
                 special = (not starred) and c["id"] in self.special
-                if starred:
+                paused = c["id"] in getattr(self, "paused", {})
+                if paused:
+                    # Wins over ★ and ♡: the whole row becomes a red bar.
+                    starred = special = False
+                    t = "⏸ PAUSED  " + t
+                elif starred:
                     t = "★ " + t
                 elif special:
                     t = "♡ " + t
@@ -2476,13 +2560,14 @@ class App:
                                        curses.color_pair(7))
                     self._draw_indicator(line_y, status, sel=True)
                 else:
-                    attr = ((curses.color_pair(10) | curses.A_BOLD)
+                    attr = ((curses.color_pair(11) | curses.A_BOLD) if paused
+                            else (curses.color_pair(10) | curses.A_BOLD)
                             if starred else curses.A_NORMAL)
                     # The [project] tag is written in that project's own color —
                     # the whole point in the "all projects" view, where rows from
                     # different projects sit side by side. A starred row keeps its
                     # solid yellow bar (a colored tag would punch a hole in it).
-                    tag_color = None if starred else self.project_color(pkey)
+                    tag_color = None if (starred or paused) else self.project_color(pkey)
                     if tag_color:
                         head = _clamp(_bidi(t) + pad, w - 1 - len(prefix))
                         self.stdscr.addstr(line_y, len(prefix), head, attr)
@@ -3331,6 +3416,21 @@ def main():
                 else:
                     continue
 
+        # 'bypass': reopen with --dangerously-skip-permissions. A live agent
+        # can't change mode, so stop it, wait for the daemon to drop it, resume.
+        bypass = (action == "bypass")
+        if bypass:
+            live_now = agents_active()
+            if c["id"] in live_now or c["id"] in app.live_ids:
+                print(f"\n■ Stopping the live agent to reopen it with checks off: "
+                      f"{app.display_title(c)[:45]} …")
+                stop_agent(short_id(c["id"], live_now or app._agents))
+                for _ in range(15):
+                    if c["id"] not in agents_active():
+                        break
+                    time.sleep(1.0)
+            action = "resume"
+
         # 'stop' just ends a live agent, then returns to the board.
         if action == "stop":
             print(f"\n■ Stopping background agent: {c['title'][:55]} …")
@@ -3368,8 +3468,11 @@ def main():
             fork = (action == "fork")
             print(f"\n▶ {'Forking' if fork else 'Resuming'} in the background: {title[:55]}")
             tok_flags = [] if fork else chat_token_launch_flags(c["id"])
+            bypass_flags = ["--dangerously-skip-permissions"] if bypass else []
+            if bypass:
+                print("  ALL permission checks OFF for this chat.")
             new_short = create_bg_resume(c["id"], fork=fork, cwd=run_cwd,
-                                         extra=tok_flags)
+                                         extra=tok_flags + bypass_flags)
             new_full = None
             if new_short:
                 new_full = next((s for s, r in agents_active().items()
@@ -3415,7 +3518,7 @@ def main():
                 # the chat still opens. Here Ctrl+Z ends the current step (there's
                 # no daemon behind a foreground session to keep it running).
                 cmd = ["claude", "--resume", c["id"]] + (
-                    ["--fork-session"] if fork else chat_token_flags(c["id"]))
+                    ["--fork-session"] if fork else chat_token_flags(c["id"])) + bypass_flags
                 runner = run_child_relay
                 print("  (couldn't background it; opening in the foreground — "
                       "Ctrl+Z / Ctrl-D / quit to come back)\n")
