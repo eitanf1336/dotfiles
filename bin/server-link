@@ -5,5 +5,8 @@ PORTS=$(grep -oE '^[0-9]+' ~/.config/server-link/ports 2>/dev/null)
 ARGS=()
 for p in $PORTS; do ARGS+=(-L "127.0.0.1:$p:127.0.0.1:$p"); done
 if [ ${#ARGS[@]} -eq 0 ]; then echo "server-link: no ports yet"; exec sleep infinity; fi
-exec ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 \
+# ControlMaster=no: ~/.ssh/config multiplexes "server", and a mux client hands its -L to the
+# shared master and exits at once, so systemd restarts it forever while the forward lives in
+# someone else's master (and dies with it). This connection must own its forwards.
+exec ssh -N -o ControlMaster=no -o ControlPath=none -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 \
     -o ServerAliveCountMax=3 "${ARGS[@]}" server

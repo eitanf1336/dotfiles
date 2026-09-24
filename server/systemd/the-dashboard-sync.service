@@ -1,0 +1,12 @@
+[Unit]
+Description=Pull every connected source into The Dashboard (devstats are pushed from the laptop)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/MyProjects/TheDashboard
+ExecStart=/usr/bin/python3 -m dashboard sync
+TimeoutStartSec=30min
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=DASHBOARD_CHROME=%h/.cache/ms-playwright/chromium-1228/chrome-linux64/chrome
+Environment=DASHBOARD_PLAYWRIGHT_NODE_PATH=%h/.local/share/playwright-runtime/node_modules

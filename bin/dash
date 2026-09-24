@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# dash (laptop side): The Dashboard runs on the server, so this runs the real `dash` there
+# over ssh. Everything in WIRING.md works unchanged:
+#   - "project from the directory" still works: this directory travels as DASH_CWD and the
+#     server resolves it against the same /home/eitan/... repo paths.
+#   - `dash ingest -` still reads stdin.
+#   - if the server cannot be reached, write commands are spooled in ~/.local/share/dash-spool
+#     and replayed on the next dash call or by dashboard-laptop-push (hourly). Writes are
+#     idempotent, so a replay can never double a number.
+#   - `dash devstats` runs the laptop collector (the transcripts live here).
+# Remote host: first line of ~/.config/the-dashboard/remote-host. Without that file this is
+# the original local CLI again (rollback). The original stays reachable as `dash-local`.
+set -uo pipefail
+
+LOCAL="$HOME/code/MyProjects/TheDashboard/bin/dash"
+REMOTE_DASH='~/code/MyProjects/TheDashboard/bin/dash'
+SPOOL="$HOME/.local/share/dash-spool"
+HOST="$(head -1 "$HOME/.config/the-dashboard/remote-host" 2>/dev/null || true)"
+[ -z "$HOST" ] && exec "$LOCAL" "$@"
+
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST")
+
+remote_cmd() {  # remote_cmd <cwd> <args...> -> a shell-quoted command line for the server
+  local cwd="$1"; shift
+  printf 'DASH_CWD=%q %s' "$cwd" "$REMOTE_DASH"
+  [ $# -gt 0 ] && printf ' %q' "$@"
+}
+
+is_write() {
+  case "${1:-}" in
+    metric|revenue|expense|event|milestone|task|ingest) return 0 ;;
+    user|users) [ "${2:-}" = add ] ;;
+    project) case "${2:-}" in add|set|update|archive|hide|unarchive|restore|merge) return 0 ;; esac; return 1 ;;
+    recurring) [ "${2:-}" = add ] ;;
+    *) return 1 ;;
+  esac
+}
+
+spool() {  # spool <stdin-file-or-empty> <args...>
+  local input="$1"; shift
+  local d; d="$SPOOL/$(date +%Y%m%d-%H%M%S)-$$-$RANDOM"
+  mkdir -p "$d" || return 1
+  printf '%s' "$PWD" > "$d/cwd"
+  printf '%s\0' "$@" > "$d/args"
+  [ -n "$input" ] && cp "$input" "$d/stdin"
+  echo "dash: the server ($HOST) is unreachable; saved this write and it will be sent later ($d)" >&2
+}
+
+replay_spool() {  # send everything spooled, oldest first; stop at the first connection failure
+  [ -d "$SPOOL" ] || return 0
+  local d args rc
+  for d in $(ls -1d "$SPOOL"/*/ 2>/dev/null | sort); do
+    d="${d%/}"
+    mapfile -d '' args < "$d/args"
+    if [ -f "$d/stdin" ]; then
+      "${SSH[@]}" "$(remote_cmd "$(cat "$d/cwd")" "${args[@]}")" < "$d/stdin" >/dev/null
+    else
+      "${SSH[@]}" -n "$(remote_cmd "$(cat "$d/cwd")" "${args[@]}")" >/dev/null
+    fi
+    rc=$?
+    [ $rc -eq 255 ] && return 1          # still unreachable: keep it
+    [ $rc -ne 0 ] && { mkdir -p "$SPOOL/failed"; mv "$d" "$SPOOL/failed/"; continue; }
+    rm -rf "$d"
+  done
+}
+
+case "${1:-}" in
+  --replay-spool) replay_spool; exit ;;
+  devstats) exec "$HOME/code/linux-setup/bin/dashboard-laptop-push" devstats ;;
+  open)
+    p="${2:-}"; p="${p#/}"; p="${p#\#}"; p="${p#/}"
+    exec "$HOME/bin/dashboard" ${p:+"$p"} ;;
+  serve)
+    echo "dash: The Dashboard is served by $HOST (the-dashboard.service there); localhost:7777 is a tunnel to it." >&2
+    exit 1 ;;
+esac
+
+# anything left over from an offline spell goes first, so the order is kept
+[ -d "$SPOOL" ] && ls -1d "$SPOOL"/2* >/dev/null 2>&1 && replay_spool
+
+input=""
+if [ "${1:-}" = ingest ] && { [ $# -lt 2 ] || [ "${2:-}" = - ]; }; then
+  input="$(mktemp)"; trap 'rm -f "$input"' EXIT
+  cat > "$input"
+  "${SSH[@]}" "$(remote_cmd "$PWD" "$@")" < "$input"
+else
+  "${SSH[@]}" -n "$(remote_cmd "$PWD" "$@")"
+fi
+rc=$?
+if [ $rc -eq 255 ] && is_write "$@"; then
+  spool "$input" "$@" && exit 0
+fi
+[ $rc -eq 255 ] && echo "dash: could not reach the server ($HOST) where The Dashboard runs" >&2
+exit $rc

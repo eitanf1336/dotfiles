@@ -1,0 +1,12 @@
+[Unit]
+Description=Write the marketing drafts that are due today (claude -p on the server)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/MyProjects/TheDashboard
+ExecStart=/usr/bin/python3 -c "from dashboard.marketing import generator; print(generator.run_due())"
+TimeoutStartSec=1h
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=DASHBOARD_CHROME=%h/.cache/ms-playwright/chromium-1228/chrome-linux64/chrome
+Environment=DASHBOARD_PLAYWRIGHT_NODE_PATH=%h/.local/share/playwright-runtime/node_modules

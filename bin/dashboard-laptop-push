@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""dashboard-laptop-push: the laptop's half of The Dashboard, which runs on the server.
+
+Some of what The Dashboard knows can only be read on the laptop, so this pushes it over
+(hourly, dashboard-laptop-push.timer):
+
+  devstats    reads ~/.claude/projects and the git repos here (the "effort" numbers),
+              pushes the per-project-per-day totals to the server's dev_stats table
+  cloudflare  refreshes this laptop's wrangler login when it is close to expiring (the
+              laptop is the ONLY machine that refreshes it, so the two never rotate each
+              other's token away), pushes the access token, then runs the server's
+              Cloudflare sync while it is fresh
+  files       copies new Ko-fi CSV exports and credential files (Google service-account
+              JSONs, App Store AuthKey_*.p8) from ~/Downloads and ~/Desktop into the
+              server's ~/Downloads, where The Dashboard picks them up by itself
+  spool       replays `dash` writes that were saved while the server was unreachable
+
+Usage: dashboard-laptop-push [all|devstats|cloudflare|files|spool] ...
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+HOME = pathlib.Path.home()
+APP = HOME / "code/MyProjects/TheDashboard"
+REMOTE_APP = "~/code/MyProjects/TheDashboard"
+REMOTE_DATA = "~/.local/share/the-dashboard"
+FILE_MAX_AGE_DAYS = 30
+sys.path.insert(0, str(APP))
+
+
+def host() -> str:
+    try:
+        return (HOME / ".config/the-dashboard/remote-host").read_text().split()[0]
+    except (OSError, IndexError):
+        sys.exit("dashboard-laptop-push: no ~/.config/the-dashboard/remote-host, "
+                 "so The Dashboard runs here and there is nothing to push")
+
+
+def ssh(cmd: str, data: bytes | None = None, timeout: int = 600) -> str:
+    proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host(), cmd],
+                          input=data, capture_output=True, timeout=timeout,
+                          stdin=None if data is not None else subprocess.DEVNULL)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ssh `{cmd[:60]}` failed ({proc.returncode}): "
+                           f"{proc.stderr.decode(errors='replace').strip()[-300:]}")
+    return proc.stdout.decode(errors="replace")
+
+
+def push_devstats() -> str:
+    from dashboard.collectors import devstats
+    projects = json.loads(ssh(f"cd {REMOTE_APP} && python3 -m dashboard.collectors.devstats projects"))
+    started = time.time()
+    payload = devstats.compute(projects)
+    payload["host"] = os.uname().nodename
+    res = json.loads(ssh(f"cd {REMOTE_APP} && python3 -m dashboard.collectors.devstats apply",
+                         json.dumps(payload).encode()))
+    return (f"{payload['scanned']} transcripts re-read, {res['rows']} project-days, "
+            f"{res['tokens']:,} tokens ({time.time() - started:.0f}s)")
+
+
+def push_cloudflare() -> str:
+    from dashboard.connectors import cloudflare as cf
+    token = cf.wrangler_token(min_left_minutes=25)   # refreshes (and writes back) if due
+    if not token:
+        raise RuntimeError("wrangler is not logged in on this laptop")
+    expires = cf._read_wrangler().get("expiration_time")
+    blob = json.dumps({"access_token": token, "expires": expires,
+                       "pushed_from": os.uname().nodename,
+                       "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}).encode()
+    ssh(f"umask 077 && cat > {REMOTE_DATA}/cloudflare-token.json.tmp"
+        f" && mv {REMOTE_DATA}/cloudflare-token.json.tmp {REMOTE_DATA}/cloudflare-token.json",
+        blob)
+    out = ssh(f"cd {REMOTE_APP} && python3 -m dashboard sync cloudflare", timeout=900)
+    return f"token valid until {expires}; server sync: {out.strip()[:200]}"
+
+
+def _is_service_account(path: pathlib.Path) -> bool:
+    try:
+        if path.stat().st_size > 20000:
+            return False
+        data = json.loads(path.read_text())
+        return data.get("type") == "service_account" and bool(data.get("private_key"))
+    except Exception:
+        return False
+
+
+def push_files() -> str:
+    cutoff = time.time() - FILE_MAX_AGE_DAYS * 86400
+    picked = []
+    for folder in (HOME / "Downloads", HOME / "Desktop"):
+        if not folder.is_dir():
+            continue
+        for pattern in ("*ko-fi*.csv", "*kofi*.csv", "AuthKey_*.p8", "*.json"):
+            for path in folder.glob(pattern):
+                try:
+                    if not path.is_file() or path.stat().st_mtime < cutoff:
+                        continue
+                except OSError:
+                    continue
+                if pattern == "*.json" and not _is_service_account(path):
+                    continue
+                if path not in picked:
+                    picked.append(path)
+    if not picked:
+        return "nothing new in ~/Downloads or ~/Desktop"
+    ssh("mkdir -p ~/Downloads")
+    proc = subprocess.run(["rsync", "-a", "--chmod=F600", *map(str, picked),
+                           f"{host()}:Downloads/"], capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0:
+        raise RuntimeError(f"rsync failed: {proc.stderr.strip()[-300:]}")
+    return f"{len(picked)} file(s): " + ", ".join(p.name for p in picked)
+
+
+def push_spool() -> str:
+    proc = subprocess.run([str(HOME / "code/linux-setup/bin/dash"), "--replay-spool"],
+                          capture_output=True, text=True, timeout=600)
+    left = len([d for d in (HOME / ".local/share/dash-spool").glob("2*")]) \
+        if (HOME / ".local/share/dash-spool").is_dir() else 0
+    return f"{left} write(s) still waiting" if left else "nothing waiting"
+
+
+STEPS = {"devstats": push_devstats, "cloudflare": push_cloudflare,
+         "files": push_files, "spool": push_spool}
+
+
+def main(argv: list) -> int:
+    wanted = [a for a in argv if a != "all"] or ["spool", "files", "devstats", "cloudflare"]
+    failed = 0
+    for name in wanted:
+        step = STEPS.get(name)
+        if not step:
+            print(__doc__)
+            return 2
+        try:
+            print(f"ok  {name:<10} {step()}", flush=True)
+        except Exception as exc:
+            failed += 1
+            print(f"!!  {name:<10} {exc}", flush=True)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh upvotes and comments of posted Reddit posts into The Dashboard
+After=the-dashboard.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/MyProjects/Advertising
+ExecStart=/usr/bin/python3 %h/code/MyProjects/Advertising/bin/post-stats
+Nice=10
+TimeoutStartSec=20min
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PLAYWRIGHT_MODULE=%h/.local/share/playwright-runtime/node_modules/playwright
+Environment=PLAYWRIGHT_SHELL=%h/.cache/ms-playwright/chromium_headless_shell-1243/chrome-headless-shell-linux64/chrome-headless-shell
