@@ -1,0 +1,11 @@
+[Unit]
+Description=Guard the Claude logins
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

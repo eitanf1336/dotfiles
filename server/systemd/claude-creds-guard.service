@@ -1,0 +1,10 @@
+[Unit]
+Description=Park the deed Claude login as it rotates, and restore it if Claude blanks it (server copy)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/bin/claude-creds-guard
+Nice=10
+# Exit 1 means "a browser login is needed", not a failure worth alerting on.
+SuccessExitStatus=0 1

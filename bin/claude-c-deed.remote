@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# claude-c-deed - the deed board, which now runs on the server.
+#
+# The deed chat, its watcher and the deed Claude login moved to
+# eitan-vivobook-server (fleet Phase 4), so the board has to run there too:
+# the chat's wake socket, its transcript and its login all live on that box.
+# This just opens the server's claude-c-deed in this terminal; Ctrl+Z inside
+# detaches from a chat exactly as before, and quitting the board closes ssh.
+#
+# Rollback: ~/fleet-staging/deed-rollback.sh puts ~/bin/claude-c-deed.local back.
+args=""
+for a in "$@"; do args+=" $(printf '%q' "$a")"; done
+exec ssh -t server "cd ~ && exec claude-c-deed$args"

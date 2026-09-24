@@ -1,0 +1,10 @@
+[Unit]
+Description=Push the deed account's Claude usage limits to the deed portal (server copy)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Read the DEED account explicitly, never the machine's main login.
+Environment=CLAUDE_CONFIG_DIR=%h/.claude-deed
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/bin/deed-push-limits

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# claude-deed - open the deed chat, which now runs on the server.
+#
+# The deed session (1c976435) and the deed Claude login moved to
+# eitan-vivobook-server in fleet Phase 4. The laptop has no deed login any
+# more, so opening it here would fail; this runs the server's claude-deed.
+#
+# Rollback: ~/fleet-staging/deed-rollback.sh puts ~/bin/claude-deed.local back.
+args=""
+for a in "$@"; do args+=" $(printf '%q' "$a")"; done
+exec ssh -t server "cd ~ && exec claude-deed$args"

@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh the usage counter on the deed portal
+
+[Timer]
+# The usage endpoint rate-limits hard and claude-limits caches, so asking more
+# often than this buys nothing and risks an hour of refusals.
+OnBootSec=2min
+OnUnitActiveSec=10min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

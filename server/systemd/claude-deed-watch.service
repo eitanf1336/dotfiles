@@ -1,0 +1,16 @@
+[Unit]
+Description=Watch the deed portal for client activity and wake the deed chat (server copy)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/MyLittleProjects/DeedPortal
+EnvironmentFile=%h/.config/deed-portal/credentials
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/code/MyLittleProjects/DeedPortal/pipeline/venv/bin/python \
+  %h/code/MyLittleProjects/DeedPortal/pipeline/watch_daemon.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
