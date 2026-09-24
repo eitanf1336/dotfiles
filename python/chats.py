@@ -84,6 +84,7 @@ import contextlib
 import curses
 import fcntl
 import json
+import shlex
 import locale
 import os
 import re
@@ -210,6 +211,42 @@ locale.setlocale(locale.LC_ALL, "")
 
 HOME = Path.home()
 PROJECTS_DIR = HOME / ".claude" / "projects"
+# Chats that live on another machine (eitan-vivobook-server). server-chats-sync
+# mirrors each host's transcripts (read-only) into REMOTE_DIR/<host>/projects and
+# its live agents into REMOTE_DIR/<host>/agents.json. The <host> dir name is the
+# ssh alias used to open them.
+REMOTE_DIR = HOME / ".claude" / "remote"
+REMOTE_STALE_S = 120  # ignore an agents.json older than this (host offline)
+
+
+def remote_project_roots():
+    """[(host, projects_dir)] for every mirrored host."""
+    if not REMOTE_DIR.is_dir():
+        return []
+    return [(h.name, h / "projects") for h in sorted(REMOTE_DIR.iterdir())
+            if (h / "projects").is_dir()]
+
+
+def remote_agents():
+    """sessionId -> record for live agents on every mirrored host. Each record
+    gets 'host' and 'config' (the remote CLAUDE_CONFIG_DIR, '' = default)."""
+    out = {}
+    for host, _ in remote_project_roots():
+        f = REMOTE_DIR / host / "agents.json"
+        try:
+            if time.time() - f.stat().st_mtime > REMOTE_STALE_S:
+                continue
+            groups = json.loads(f.read_text() or "[]")
+        except Exception:
+            continue
+        for g in groups:
+            for x in g.get("agents") or []:
+                if isinstance(x, dict) and x.get("sessionId"):
+                    rec = dict(x)
+                    rec["host"] = host
+                    rec["config"] = g.get("config") or ""
+                    out[x["sessionId"]] = rec
+    return out
 STORE = HOME / ".claude" / "chats" / "categories.json"
 
 # Category order shown on the board. "Uncategorized" is the landing bucket for
@@ -607,6 +644,18 @@ def scan_chats():
             c = parse_chat(f)
             if c:
                 chats.append(c)
+    remote_ids = set()
+    for host, root in remote_project_roots():
+        for proj in root.iterdir():
+            if not proj.is_dir():
+                continue
+            for f in proj.glob("*.jsonl"):
+                c = parse_chat(f)
+                if c:
+                    c["host"] = host
+                    remote_ids.add(c["id"])
+                    chats.append(c)
+    chats = [c for c in chats if c.get("host") or c["id"] not in remote_ids]
     chats.sort(key=lambda c: c["mtime"], reverse=True)
     return chats
 
@@ -652,8 +701,11 @@ def agents_active():
         data = json.loads(out.stdout or "[]")
     except Exception:
         return {}
-    return {x["sessionId"]: x for x in data
+    live = {x["sessionId"]: x for x in data
             if isinstance(x, dict) and x.get("sessionId")}
+    for sid, rec in remote_agents().items():
+        live.setdefault(sid, rec)
+    return live
 
 
 def session_file(full_id):
@@ -664,6 +716,9 @@ def session_file(full_id):
         return None
     for f in PROJECTS_DIR.glob(f"*/{full_id}.jsonl"):
         return f
+    for _, root in remote_project_roots():
+        for f in root.glob(f"*/{full_id}.jsonl"):
+            return f
     return None
 
 
@@ -826,7 +881,7 @@ def headless_holder(full_id, active):
     record carries no attachable `id`, and the process behind it has -p/--print
     on its command line (a terminal session he is sitting in has neither)."""
     rec = active.get(full_id)
-    if not rec or rec.get("id"):
+    if not rec or rec.get("id") or rec.get("host"):
         return None
     pid = rec.get("pid")
     if not pid:
@@ -1489,6 +1544,26 @@ class App:
                     if c:
                         cache[p] = c
                         new_ids.add(c["id"])
+        for host, root in remote_project_roots():
+            for proj in root.iterdir():
+                if not proj.is_dir():
+                    continue
+                for f in proj.glob("*.jsonl"):
+                    p = str(f)
+                    seen.add(p)
+                    try:
+                        mtime = f.stat().st_mtime
+                    except OSError:
+                        continue
+                    cached = cache.get(p)
+                    if cached is not None:
+                        cached["mtime"] = mtime
+                        continue
+                    c = parse_chat(f)
+                    if c:
+                        c["host"] = host
+                        cache[p] = c
+                        new_ids.add(c["id"])
         for p in list(cache):  # drop files that were deleted on disk
             if p not in seen:
                 del cache[p]
@@ -1562,8 +1637,12 @@ class App:
                 SUPERSEDED_STORE, lambda d: [d.pop(k, None) for k in dead])
         self.superseded = hidden
         self.kept_superseded = kept
+        # A chat that moved to a server shows once: the server copy wins over the
+        # stale laptop transcript it was moved from.
+        remote_ids = {c["id"] for c in cache.values() if c.get("host")}
         self.all_chats = sorted(
-            (c for c in cache.values() if c["id"] not in hidden),
+            (c for c in cache.values() if c["id"] not in hidden
+             and (c.get("host") or c["id"] not in remote_ids)),
             key=lambda c: c["mtime"], reverse=True)
         return new_ids
 
@@ -2379,6 +2458,10 @@ class App:
             self.message = "Stop cancelled"
 
     def confirm_delete(self, chat):
+        if chat.get("host"):
+            self.message = (f"That chat lives on {chat['host']}: delete it there "
+                            f"(this is only a mirror copy)")
+            return
         h, w = self.stdscr.getmaxyx()
         live = "  (NOTE: this chat is running live)" if chat["id"] in self.live_ids else ""
         prompt = f"Delete this chat permanently? (y/N)  {_bidi(chat['title'][:40])}{live}"
@@ -2527,6 +2610,8 @@ class App:
                 tail = f"  [{proj}]"
                 avail = w - 1 - _dwidth(tail) - len(prefix)
                 t = self.display_title(c)
+                if c.get("host"):  # runs on another machine (opens over ssh)
+                    t = "[srv] " + t
                 starred = c["id"] in self.starred
                 # A chat is one or the other, never both (the 's' cycle moves it
                 # from ★ to ♡), but guard anyway so a hand-edited store can't
@@ -2771,6 +2856,132 @@ def create_bg_resume(full_id, fork=False, cwd=None, extra=None):
     txt = _ANSI_RE.sub("", out.stdout + out.stderr)
     mt = re.search(r"backgrounded\W+([0-9a-f]{8})", txt)
     return mt.group(1) if mt else None
+
+
+def _remote_cfg_prefix(cfg):
+    """Shell prefix selecting a remote CLAUDE_CONFIG_DIR ('' = the default)."""
+    if not cfg:
+        return ""
+    if cfg.startswith("~"):
+        cfg = "$HOME" + cfg[1:]
+    return f'CLAUDE_CONFIG_DIR="{cfg}" '
+
+
+def remote_run(host, cmd, timeout=60):
+    try:
+        return subprocess.run(["ssh", host, cmd], capture_output=True, text=True,
+                              timeout=timeout)
+    except Exception as e:
+        return subprocess.CompletedProcess(cmd, 255, "", str(e))
+
+
+def remote_agents_now(host, env):
+    """Fresh sessionId -> record from the host (not the mirror, which lags)."""
+    r = remote_run(host, f"{env}claude agents --json", 20)
+    try:
+        return {x["sessionId"]: x for x in json.loads(r.stdout or "[]")
+                if isinstance(x, dict) and x.get("sessionId")}
+    except Exception:
+        return {}
+
+
+_REMOTE_TRUST_PY = r"""
+import json, os, sys
+cwd = sys.argv[1]
+for f in (os.path.expanduser("~/.claude.json"), os.path.expanduser("~/.claude-deed/.claude.json")):
+    if not os.path.exists(f):
+        continue
+    d = json.load(open(f))
+    e = d.setdefault("projects", {}).setdefault(cwd, {})
+    if e.get("hasTrustDialogAccepted") is not True:
+        e["hasTrustDialogAccepted"] = True
+        tmp = f + ".trust.tmp"
+        json.dump(d, open(tmp, "w"), indent=2)
+        os.replace(tmp, f)
+"""
+
+
+def remote_trust(host, cwd):
+    """Mark cwd trusted on the host (both config dirs), like ensure_trusted()."""
+    if cwd and cwd != "(unknown)":
+        remote_run(host, f"python3 -c {shlex.quote(_REMOTE_TRUST_PY)} {shlex.quote(cwd)}", 20)
+
+
+def open_remote_chat(app, c, action):
+    """Open / resume / fork / stop a chat that lives on another machine. Same
+    behaviour as the local paths, over ssh: attach is `ssh -t host claude attach`,
+    so Ctrl+Z detaches and the agent keeps running on the host."""
+    host = c["host"]
+    rec = app._agents.get(c["id"]) or {}
+    cfg = rec.get("config") or _load_json(PROJECT_CONFIG_DIRS_STORE).get(
+        app.tags.get(c["id"]) or "") or ""
+    env = _remote_cfg_prefix(cfg)
+    title = app.display_title(c)
+    short = short_id(c["id"], app._agents)
+    live = c["id"] in app.live_ids
+    if action == "stop":
+        print(f"\n■ Stopping on {host}: {title[:55]} …")
+        r = remote_run(host, f"{env}claude stop {short}", 30)
+        print("  stopped." if r.returncode == 0 else f"  couldn't confirm: {(r.stderr or r.stdout).strip()[:120]}")
+        time.sleep(0.7)
+        return
+    bypass = action == "bypass"
+    if bypass and live:
+        print(f"\n■ Stopping it on {host} to reopen it with checks off …")
+        remote_run(host, f"{env}claude stop {short}", 30)
+        for _ in range(15):
+            if c["id"] not in remote_agents_now(host, env):
+                break
+            time.sleep(1.0)
+        live = False
+    if not live:
+        fork = action == "fork"
+        flags = (" --fork-session" if fork else "") + (
+            " --dangerously-skip-permissions" if bypass else "")
+        cwd = c.get("cwd") or "~"
+        remote_trust(host, cwd)
+        print(f"\n▶ {'Forking' if fork else 'Resuming'} on {host}: {title[:55]}")
+        if bypass:
+            print("  ALL permission checks OFF for this chat.")
+        r = remote_run(host, f"cd {shlex.quote(cwd)} 2>/dev/null || cd; "
+                             f"{env}claude --bg --resume {c['id']}{flags}", 90)
+        m = re.search(r"backgrounded\W+([0-9a-f]{8})", _ANSI_RE.sub("", r.stdout + r.stderr))
+        if not m:
+            print(f"  couldn't start it on {host}: {(r.stderr or r.stdout).strip()[:200]}")
+            input("  Press Enter to return to the board …")
+            return
+        short = m.group(1)
+        new_full = next((sid for sid, x in remote_agents_now(host, env).items()
+                         if x.get("id") == short), None)
+        if new_full:
+            _json_set(STORE, new_full, app.store.get(c["id"]) or "In Progress")
+            if app.tags.get(c["id"]):
+                _json_set(PROJECT_TAGS_STORE, new_full, app.tags[c["id"]])
+            if not fork:
+                if app.names.get(c["id"]):
+                    _json_set(NAMES_STORE, new_full, app.names[c["id"]])
+                _json_set(SUPERSEDED_STORE, c["id"], new_full)
+    print(f"  Attaching on {host}: press Ctrl+Z to leave it running and come back.\n")
+    set_window_title(short)
+    run_child(["ssh", "-t", host, f"{env}claude attach {short}"])
+
+
+def create_remote_agent(host, cwd, env, effort=None, model=None):
+    """New background chat on another machine; returns (short, full) or (None, None)."""
+    flags = ""
+    if model and model_id(model):
+        flags += f" --model {model_id(model)}"
+    if effort:
+        flags += f" --effort {effort}"
+    remote_trust(host, cwd or "/home/eitan")
+    r = remote_run(host, f"cd {shlex.quote(cwd or '~')} 2>/dev/null || cd; "
+                         f"{env}claude --bg{flags}", 60)
+    m = re.search(r"backgrounded\W+([0-9a-f]{8})", _ANSI_RE.sub("", r.stdout + r.stderr))
+    if not m:
+        return None, None
+    full = next((sid for sid, x in remote_agents_now(host, env).items()
+                 if x.get("id") == m.group(1)), None)
+    return m.group(1), full
 
 
 # /token pins ONE chat to another Claude login (see ~/bin/claude-token). The
@@ -3291,6 +3502,30 @@ def main():
             model = prompt_model()
             if model == "fable" and effort in ("low", "medium"):
                 print("  ! fable on a light thinking level: opus is usually enough for that.")
+            hosts = [h for h, _ in remote_project_roots()]
+            where = ""
+            if hosts:
+                where = input(f"  Run it on [l]aptop or [s]erver ({hosts[0]})?"
+                              "  Enter = laptop: ").strip().lower()
+            if where.startswith("s") and hosts:
+                host = hosts[0]
+                env = _remote_cfg_prefix(_load_json(PROJECT_CONFIG_DIRS_STORE).get(
+                    app.active_project or "") or "")
+                print(f"\n▶ Creating a new background chat on {host}"
+                      f"{f' in {new_cwd}' if new_cwd else ''} (model: {model}, thinking: {effort}) …")
+                short, full = create_remote_agent(host, new_cwd, env, effort, model)
+                if not short:
+                    print(f"  Couldn't create the chat on {host}.")
+                    input("  Press Enter to return to the menu …")
+                    continue
+                if full:
+                    _json_set(STORE, full, "In Progress")
+                    if app.active_project:
+                        _json_set(PROJECT_TAGS_STORE, full, app.active_project)
+                print("  Attaching: press Ctrl+Z to leave it running and come back.\n")
+                set_window_title(short)
+                run_child(["ssh", "-t", host, f"{env}claude attach {short}"])
+                continue
             print(f"\n▶ Creating a new background chat"
                   f"{f' in {run_cwd}' if run_cwd else ''}"
                   f" (model: {model}, thinking: {effort}) …")
@@ -3327,6 +3562,17 @@ def main():
         cwd = c["cwd"]
         run_cwd = cwd if (cwd and cwd != "(unknown)" and os.path.isdir(cwd)) else None
         short = short_id(c["id"], app._agents)
+
+        # A chat living on another machine (eitan-vivobook-server): everything
+        # happens over ssh there, including its account, so none of the local
+        # account/resume logic below applies.
+        if c.get("host"):
+            try:
+                open_remote_chat(app, c, action)
+            except FileNotFoundError:
+                print("Could not find `ssh` on PATH.")
+                input("Press Enter to return to the menu …")
+            continue
 
         # Account-bound project (the deed job): this chat belongs to a different
         # Claude login, and opening it from a board running on the default one

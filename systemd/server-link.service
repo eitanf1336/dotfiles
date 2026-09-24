@@ -1,0 +1,12 @@
+[Unit]
+Description=Forward localhost ports of services that moved to eitan-vivobook-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/code/linux-setup/bin/server-link
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

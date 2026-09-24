@@ -1,0 +1,11 @@
+[Unit]
+Description=Mirror eitan-vivobook-server's chats and live agents for claude-c
+After=network-online.target
+
+[Service]
+ExecStart=%h/code/linux-setup/bin/server-chats-sync
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

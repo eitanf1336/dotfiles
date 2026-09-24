@@ -1,0 +1,20 @@
+#!/bin/bash
+# Mirror the server's chat list for claude-c: transcripts (top-level *.jsonl only, read-only copy)
+# and the live background agents of every Claude config dir there. Loop run by server-chats-sync.service.
+DEST=~/.claude/remote/server
+mkdir -p "$DEST/projects"
+while true; do
+  rsync -a --timeout=20 --include='/*/' --include='/*/*.jsonl' --exclude='*' \
+      server:.claude/projects/ "$DEST/projects/" 2>/dev/null
+  if out=$(ssh -o ConnectTimeout=8 server '
+      printf "[" ; sep=""
+      for cfg in "" "$HOME/.claude-deed"; do
+        [ -n "$cfg" ] && [ ! -d "$cfg" ] && continue
+        j=$( ( [ -n "$cfg" ] && export CLAUDE_CONFIG_DIR="$cfg"; claude agents --json 2>/dev/null ) )
+        [ -z "$j" ] && j="[]"
+        printf "%s{\"config\":\"%s\",\"agents\":%s}" "$sep" "${cfg/#$HOME/\~}" "$j"; sep=","
+      done; printf "]"' 2>/dev/null) && python3 -c 'import json,sys; json.loads(sys.argv[1])' "$out" 2>/dev/null; then
+    printf '%s' "$out" > "$DEST/agents.json.tmp" && mv "$DEST/agents.json.tmp" "$DEST/agents.json"
+  fi
+  sleep 15
+done

@@ -1,0 +1,28 @@
+#!/bin/bash
+# One door to eitan-vivobook-server.
+#   server              status overview (default)
+#   server ssh          shell on the server
+#   server logs UNIT    last 60 journal lines of a user unit on the server
+#   server restart UNIT restart a user unit on the server
+#   server link         laptop port forwards (server-link) state
+#   server run CMD...   run a command on the server
+set -u
+S=server
+case "${1:-status}" in
+  ssh) exec ssh "$S" ;;
+  logs) exec ssh "$S" "journalctl --user -u '$2' -n ${3:-60} --no-pager" ;;
+  restart) exec ssh "$S" "systemctl --user restart '$2' && systemctl --user --no-pager status '$2' | head -5" ;;
+  link) systemctl --user --no-pager status server-link.service | head -6; echo; grep -oE '^[0-9]+' ~/.config/server-link/ports | sed 's/^/forwarded: /' ;;
+  run) shift; exec ssh "$S" "$@" ;;
+  status|*) ssh -o ConnectTimeout=6 "$S" '
+    printf "%s  up %s\n" "$(hostname)" "$(uptime -p | sed s/up\ //)"
+    free -m | awk "/Mem:/{printf \"RAM   %d / %d MB used\n\", \$3, \$2}"
+    df -h / | awk "NR==2{print \"disk  \" \$3 \" / \" \$2 \" used\"}"
+    printf "load  %s\n" "$(awk "{print \$1, \$2, \$3}" /proc/loadavg)"
+    printf "temp  %s°C\n" "$(( $(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -n | tail -1) / 1000 ))"
+    echo; echo "services:"
+    systemctl --user list-units --type=service --state=running --no-legend | awk "{print \"  ● \" \$1}" | grep -vE "dbus|pipewire|wireplumber|xdg|gpg|ssh-agent|at-spi"
+    failed=$(systemctl --user --failed --no-legend | awk "{print \$2}"); [ -n "$failed" ] && echo "FAILED: $failed"
+    echo; echo "timers:"; systemctl --user list-timers --no-legend | awk "{print \"  ◷ \" \$NF}"
+  ' || echo "server unreachable (is it on? tailscale up?)" ;;
+esac

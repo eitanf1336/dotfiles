@@ -1,0 +1,9 @@
+#!/bin/bash
+# Keep laptop localhost:PORT pointing at the server for every service that moved there.
+# Ports come from ~/.config/server-link/ports (one per line). Run by server-link.service.
+PORTS=$(grep -oE '^[0-9]+' ~/.config/server-link/ports 2>/dev/null)
+ARGS=()
+for p in $PORTS; do ARGS+=(-L "127.0.0.1:$p:127.0.0.1:$p"); done
+if [ ${#ARGS[@]} -eq 0 ]; then echo "server-link: no ports yet"; exec sleep infinity; fi
+exec ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=3 "${ARGS[@]}" server
