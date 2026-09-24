@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# farm - the CuteWorld render farm (queue on the server, workers on both machines).
+#
+#   farm day                 he is awake: the server worker takes chunks
+#   farm night               server idle again (only tasks queued with --night run on it)
+#   farm status              mode, queue counts, claims, workers
+#   farm queue [--night] <ep> <shot|all> [a b]
+#                            push the code to the server, then queue the frames MISSING on the
+#                            laptop as 24-frame chunks (the laptop takes them from the start,
+#                            the server from the end)
+#   farm results             pull finished server frames the laptop has not got yet
+#   farm laptop              start the laptop worker (only inside a blackout HE started)
+#
+# Day starts with `farm day` or the end of his blackout (takeover finish calls farm day).
+# The laptop worker (cuteworld-farm-laptop) is never started by a timer: only by a Claude inside
+# his blackout, and it stops itself when the blackout ends. Encode stays on the laptop
+# (encode_p1.sh). Details: CuteWorld/LESSONS.md, "The render farm".
+set -uo pipefail
+CWD=$HOME/code/MyProjects/CuteWorld
+CHUNK=${CHUNK:-24}
+if [ "$(hostname)" = eitan-vivobook-server ]; then RUN() { bash -c "$1"; }
+else RUN() { ssh -o BatchMode=yes -o ConnectTimeout=10 server "$1"; }; fi
+RUN 'mkdir -p ~/cwfarm/{tasks,claimed,done,failed,logs}; [ -s ~/cwfarm/mode ] || echo night > ~/cwfarm/mode' || { echo "server unreachable" >&2; exit 1; }
+
+cmd=${1:-status}; shift || true
+case "$cmd" in
+  day|night)
+    RUN "echo $cmd > ~/cwfarm/mode; echo \"\$(date '+%F %T') mode $cmd\" >> ~/cwfarm/logs/farm.log"
+    echo "farm: $cmd mode" ;;
+  status)
+    RUN 'cd ~/cwfarm; echo "mode: $(cat mode)"
+      for d in tasks claimed done failed; do printf "%-8s %s\n" "$d:" "$(ls $d | grep -c .)"; done
+      for f in claimed/*; do [ -e "$f" ] && echo "  claim $(basename $f), heartbeat $(( ($(date +%s) - $(stat -c %Y $f)) ))s ago"; done
+      grep -l "^synced=0" done/* 2>/dev/null | sed "s|^|  not on the laptop yet: |"
+      echo "server worker: $(systemctl --user is-active cuteworld-farm)"; tail -n 4 logs/farm.log 2>/dev/null | sed "s/^/  /"'
+    [ "$(hostname)" = eitan-vivobook-server ] || echo "laptop worker: $(systemctl --user is-active cuteworld-farm-laptop)" ;;
+  queue)
+    night=0; [ "${1:-}" = --night ] && { night=1; shift; }
+    [ $# -ge 2 ] || { echo "farm queue [--night] <ep> <shot|all> [a b]" >&2; exit 2; }
+    ep=$1; want=$2; ra=${3:-}; rb=${4:-}
+    cd "$CWD" || exit 1
+    rsync -a --exclude=out/ --exclude=__pycache__/ --exclude=.git/ ./ server:code/MyProjects/CuteWorld/ || { echo "code push failed" >&2; exit 1; }
+    # a new batch when nothing is pending: the old done list is archived so progress counts this batch
+    RUN 'cd ~/cwfarm; [ -z "$(ls tasks claimed)" ] && [ -n "$(ls done)" ] && mkdir -p archive && mv done/* archive/ ; true'
+    seq=$(RUN 'cd ~/cwfarm; ls tasks claimed done failed archive 2>/dev/null | grep -oE "^[0-9]+" | sort -n | tail -1'); seq=$((10#${seq:-0}))
+    new=()
+    while read -r sh _c f0 f1; do
+      [ "$want" = all ] || [ "$sh" = "$want" ] || continue
+      [ -n "$ra" ] && { [ "$ra" -gt "$f0" ] && f0=$ra; [ "$rb" -lt "$f1" ] && f1=$rb; }
+      miss=(); for ((f=f0; f<=f1; f++)); do [ -s "$(printf 'out/storyboard/%s/p1/%s/frames/%04d.png' "$ep" "$sh" "$f")" ] || miss+=("$f"); done
+      # contiguous runs of missing frames, cut into CHUNK-frame tasks
+      i=0; while [ $i -lt ${#miss[@]} ]; do
+        a=${miss[$i]}; b=$a; n=1
+        while [ $((i+n)) -lt ${#miss[@]} ] && [ "${miss[$((i+n))]}" -eq $((b+1)) ] && [ $n -lt "$CHUNK" ]; do b=$((b+1)); n=$((n+1)); done
+        seq=$((seq+1)); new+=("$(printf '%05d_%s_%s_%04d_%04d' $seq "$ep" "$sh" "$a" "$b")"); i=$((i+n))
+      done
+    done < <(python3 p1_shots.py shots "$ep")
+    [ ${#new[@]} -gt 0 ] || { echo "nothing missing for $ep $want"; exit 0; }
+    RUN "cd ~/cwfarm/tasks && for t in ${new[*]}; do echo night=$night > \$t; done"
+    echo "queued ${#new[@]} chunks (${new[0]} .. ${new[-1]})$( [ $night = 1 ] && echo ', allowed on the server at night')" ;;
+  results)
+    n=0
+    for t in $(RUN 'cd ~/cwfarm/done && grep -l "^synced=0" * 2>/dev/null'); do
+      IFS=_ read -r _ ep sh a b <<< "${t%.*}"; d="out/storyboard/$ep/p1/$sh/frames"
+      for ((f=10#$a; f<=10#$b; f++)); do printf '%04d.png\n' "$f"; done > /tmp/farm_pull.$$
+      rsync -a --mkpath --files-from=/tmp/farm_pull.$$ "server:code/MyProjects/CuteWorld/$d/" "$CWD/$d/" \
+        && RUN "sed -i 's/^synced=0/synced=1/' ~/cwfarm/done/$t" && n=$((n+1))
+    done; rm -f /tmp/farm_pull.$$
+    echo "pulled $n chunks from the server" ;;
+  laptop)
+    systemctl --user is-active --quiet takeover-job || { echo "no blackout running: the laptop only renders inside one he started" >&2; exit 3; }
+    systemctl --user start cuteworld-farm-laptop && echo "laptop worker started" ;;
+  *) sed -n '2,20p' "$0"; exit 2 ;;
+esac

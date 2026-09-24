@@ -1,0 +1,10 @@
+# Never enabled, never on a timer: a Claude starts it (farm laptop) only inside a blackout he
+# started. The worker exits by itself, and stops its Blender, when takeover-job ends.
+[Unit]
+Description=CuteWorld render farm worker (laptop, only inside his blackout)
+
+[Service]
+Environment=FARM_HOST=laptop
+ExecStart=%h/code/MyProjects/CuteWorld/farm_worker.sh
+Restart=on-failure
+RestartSec=30

@@ -180,6 +180,8 @@ case "$cmd" in
     prev=$(cat "$STATE_DIR/profile.prev" 2>/dev/null); [ -n "$prev" ] && powerprofilesctl set "$prev" 2>/dev/null
     : > "$FROZEN"; rm -f "$PAUSED"; : > "$KEEP_EXTRA"
     echo "done" >> "$PROGRESS"
+    # his blackout ending means he is up: the render farm's server worker switches to day mode
+    [ "${TAKEOVER_INSIDE_JOB:-}" = 1 ] || { command -v farm >/dev/null && setsid -f farm day >/dev/null 2>&1; }
     # last, because when finish runs from inside the job this stops the caller too
     [ "${TAKEOVER_INSIDE_JOB:-}" = 1 ] || systemctl --user stop "$JOB" 2>/dev/null
     notify-send -i emblem-ok-symbolic "Takeover finished: $(cat "$LABEL_F" 2>/dev/null)" "Thawed $n programs. The laptop is yours." 2>/dev/null

@@ -1,0 +1,16 @@
+[Unit]
+Description=CuteWorld render farm worker (server: renders in day mode, or tasks queued with --night)
+After=network-online.target
+
+[Service]
+Environment=FARM_HOST=server
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/code/MyProjects/CuteWorld/farm_worker.sh
+Nice=15
+CPUWeight=20
+IOSchedulingClass=idle
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
