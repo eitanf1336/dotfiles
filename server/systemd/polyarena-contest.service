@@ -1,0 +1,8 @@
+[Unit]
+Description=PolyArena: log real-money gains to the Money War contest (high-water mark)
+After=network-online.target polyarena.service
+
+[Service]
+Type=oneshot
+Environment=PATH=/home/eitan/bin:/home/eitan/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/eitan/code/MyProjects/PolyArena/bin/arena-contest-daily

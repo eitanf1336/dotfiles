@@ -1,0 +1,23 @@
+[Unit]
+Description=PolyArena core: Polymarket recorder, shadow exchange, agent API, dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/home/eitan/code/MyProjects/PolyArena
+ExecStart=/home/eitan/code/MyProjects/PolyArena/.venv/bin/python -m arena.main
+Restart=always
+RestartSec=5
+# Memory limits folded in from the laptop's set-property drop-ins (user.control/polyarena.service.d).
+# The cgroup counts the sqlite page cache, so MemoryLow keeps the hot index pages resident.
+MemoryLow=1500M
+MemoryHigh=2G
+MemoryMax=2500M
+MemorySwapMax=0
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/eitan/bin:/home/eitan/.local/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=append:/home/eitan/code/MyProjects/PolyArena/data/logs/service.log
+StandardError=append:/home/eitan/code/MyProjects/PolyArena/data/logs/service.log
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=PolyArena bot %i
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/eitan/code/MyProjects/PolyArena/agents/%i
+ExecStart=/home/eitan/code/MyProjects/PolyArena/agents/%i/run.sh
+Restart=always
+RestartSec=10
+MemoryMax=600M
+CPUQuota=60%
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/eitan/code/MyProjects/PolyArena/agents/%i/.env
+StandardOutput=append:/home/eitan/code/MyProjects/PolyArena/agents/%i/logs/bot.log
+StandardError=append:/home/eitan/code/MyProjects/PolyArena/agents/%i/logs/bot.log
+
+[Install]
+WantedBy=default.target
