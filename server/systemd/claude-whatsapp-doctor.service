@@ -1,0 +1,8 @@
+[Unit]
+Description=Health check and self-repair for the Claude WhatsApp bot (headless: alerts via WhatsApp and the laptop)
+After=whatsapp-bridge.service
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/code/linux-setup/bin/claude-whatsapp-doctor

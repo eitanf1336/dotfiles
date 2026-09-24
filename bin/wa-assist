@@ -30,6 +30,15 @@ import sqlite3
 import subprocess
 import sys
 
+# 2026-09-25: the WhatsApp stack (bridge, registries, daemons) runs on the
+# server. Where the REMOTE marker exists, manage it there instead of editing a
+# local copy nothing reads.
+if os.path.exists(os.path.expanduser("~/.config/whatsapp-claude/REMOTE")):
+    import shlex
+    os.execvp("ssh", ["ssh", "-o", "BatchMode=yes"] + (["-t"] if sys.stdin.isatty() else [])
+              + [os.environ.get("WA_REMOTE_HOST", "server"),
+                 " ".join([".local/bin/wa-assist"] + [shlex.quote(a) for a in sys.argv[1:]])])
+
 HOME        = os.path.expanduser("~")
 MESSAGES_DB = os.path.join(HOME, "code/whatsapp-mcp/whatsapp-bridge/store/messages.db")
 CFG_DIR     = os.path.join(HOME, ".config/claude-whatsapp")

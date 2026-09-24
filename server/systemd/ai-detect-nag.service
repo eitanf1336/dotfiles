@@ -1,0 +1,9 @@
+[Unit]
+Description=Re-alert until the AI-detection hit is acknowledged
+
+[Service]
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Type=oneshot
+KillMode=process
+ExecStart=%h/bin/ai-detect-watch nag
+TimeoutStartSec=120

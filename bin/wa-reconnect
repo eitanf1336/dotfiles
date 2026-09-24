@@ -18,6 +18,12 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 export PATH="$HERE:$PATH"
 
+# The bridge moved to another machine (the server): link it there. The server
+# side pushes the QR window back onto this screen and prints it in the terminal.
+if [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/whatsapp-claude/REMOTE" ]; then
+  exec ssh -o BatchMode=yes "${WA_REMOTE_HOST:-server}" ".local/bin/wa-reconnect${*:+ $(printf '%q ' "$@")}"
+fi
+
 CFG="${XDG_CONFIG_HOME:-$HOME/.config}/whatsapp-claude/config"
 [ -f "$CFG" ] && . "$CFG"
 WA_REPO="${WA_REPO:-$HOME/code/whatsapp-mcp}"
@@ -74,7 +80,37 @@ fi
 # QR path: render, pop the window, and supervise until linked.
 wa-render-qr "$QR_TXT" "$QR_PNG"
 note "Scan the QR window to link WhatsApp."
-( wa-qr-popup --image "$QR_PNG" --status "$STATUS" ) &
+if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+  ( wa-qr-popup --image "$QR_PNG" --status "$STATUS" ) &
+else
+  # Headless (the server): print the QR in this terminal, keep it in
+  # $STATE/qr.ansi, and relay the popup to the laptop's screen over ssh. The
+  # laptop window's "cancel" comes back the same way.
+  LAPTOP="${WA_LAPTOP_HOST:-laptop}"
+  RQR=".local/state/whatsapp-claude/qr-server.png"
+  RST=".local/state/whatsapp-claude/popup-server.status"
+  (
+    lsh() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$LAPTOP" "$@" </dev/null 2>/dev/null; }
+    started=0; last=""
+    while :; do
+      st="$(cat "$STATUS" 2>/dev/null)"
+      if [ "$st" = connected ]; then lsh "echo connected > $RST"; exit 0; fi
+      m="$(stat -c %Y "$QR_PNG" 2>/dev/null)"
+      if [ -n "$m" ] && [ "$m" != "$last" ]; then
+        last="$m"
+        qrencode -t ANSIUTF8 -r "$QR_TXT" 2>/dev/null | tee "$STATE/qr.ansi"
+        echo "[wa-reconnect] scan this with WhatsApp > Linked devices (also on the laptop screen)"
+        if lsh "mkdir -p .local/state/whatsapp-claude" && \
+           scp -q -o BatchMode=yes -o ConnectTimeout=5 "$QR_PNG" "$LAPTOP:$RQR" 2>/dev/null && \
+           [ "$started" = 0 ]; then
+          lsh "echo waiting > $RST; systemd-run --user --collect --quiet --unit wa-qr-popup-server-\$(date +%s) \$HOME/.local/bin/wa-qr-popup --image \$HOME/$RQR --status \$HOME/$RST" && started=1
+        fi
+      fi
+      if [ "$started" = 1 ] && [ "$(lsh "cat $RST")" = cancel ]; then echo cancel > "$STATUS"; exit 0; fi
+      sleep 2
+    done
+  ) &
+fi
 POPUP_PID=$!
 
 prev=""; overall=0

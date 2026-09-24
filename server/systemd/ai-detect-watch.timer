@@ -1,0 +1,12 @@
+[Unit]
+Description=Full AI-detection-API sweep, 3x a day
+
+[Timer]
+OnCalendar=*-*-* 08:17:00
+OnCalendar=*-*-* 14:17:00
+OnCalendar=*-*-* 21:17:00
+Persistent=true
+RandomizedDelaySec=180
+
+[Install]
+WantedBy=timers.target

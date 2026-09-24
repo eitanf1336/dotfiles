@@ -1,0 +1,22 @@
+[Unit]
+Description=WhatsApp Go bridge (whatsapp-mcp), on the server since 2026-09-25; backs the Claude WhatsApp bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/eitan/code/whatsapp-mcp/whatsapp-bridge
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# The REST API has no auth: loopback only. The laptop reaches it through server-link.
+Environment=BRIDGE_LISTEN=127.0.0.1:8080
+Environment=BRIDGE_MEDIA_LOG=/home/eitan/.config/claude-whatsapp/history.jsonl
+Environment=BRIDGE_MEDIA_LOG_JID=120363410856554324@g.us
+Environment=BRIDGE_MEDIA_KEEP_DIR=/home/eitan/.cache/whatclaude/sent
+Environment=BRIDGE_MEDIA_KEEP_BYTES=2147483648
+ExecStart=/home/eitan/code/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge-bin
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

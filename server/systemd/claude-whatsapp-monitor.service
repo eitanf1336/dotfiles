@@ -1,0 +1,19 @@
+[Unit]
+Description=Claude WhatsApp monitor: auto-replies as "Eitan's Claude" to explicitly armed chats (see wa-monitor)
+After=network-online.target whatsapp-bridge.service
+# Wants, not Requires: a bridge restart must not tear down a claude -p mid-reply.
+# The daemon rides out a bridge outage on its own and no-ops when nothing is armed.
+Wants=network-online.target whatsapp-bridge.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/eitan
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /home/eitan/code/claude-stuff/claude-whatsapp-bot/monitor.py
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

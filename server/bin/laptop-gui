@@ -1,0 +1,13 @@
+#!/bin/bash
+# laptop-gui: the server is headless, so desktop commands run on the laptop's
+# screen over ssh (Tailscale). Installed on the server as symlinks named
+# notify-send, zenity and canberra-gtk-play in ~/bin, so scripts that shout
+# with those (the WhatsApp doctor, ai-detect-watch) reach Eitan unchanged.
+# Best effort: if the laptop is asleep or off it fails fast (5 s) and quietly.
+#   laptop-gui <command> [args...]   or call it through one of the symlinks.
+name=$(basename "$0")
+if [ "$name" = laptop-gui ]; then name=${1:?command}; shift; fi
+case "$name" in notify-send|zenity|canberra-gtk-play) ;; *) echo "laptop-gui: $name not allowed" >&2; exit 2 ;; esac
+args=$(printf '%q ' "$@")
+exec ssh -o BatchMode=yes -o ConnectTimeout=5 laptop \
+  'eval "$(systemctl --user show-environment 2>/dev/null | grep -E "^(DISPLAY|WAYLAND_DISPLAY|XAUTHORITY|DBUS_SESSION_BUS_ADDRESS)=" | sed "s/^/export /")"; '"$name $args" </dev/null

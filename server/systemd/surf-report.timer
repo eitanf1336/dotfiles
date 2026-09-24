@@ -1,0 +1,18 @@
+[Unit]
+Description=Send the Poleg surf-forecast PDF once a day (with startup catch-up)
+
+[Timer]
+# Fire at 07:30 every day the machine is on...
+OnCalendar=*-*-* 07:30:00
+# ...again at 10:30, so an Open-Meteo outage that outlives the in-script retries
+# doesn't silently cost a day's report (2026-07-17: 07:30 died on a 503 and only
+# went out at 14:00, after a reboot happened to hit the catch-up rule below)...
+OnCalendar=*-*-* 10:30:00
+# ...and ~2 min after login/boot, so a day missed while the PC was off/disconnected
+# still goes out. The script's last-sent-date guard makes repeated triggers a no-op.
+OnStartupSec=2min
+Persistent=true
+Unit=surf-report.service
+
+[Install]
+WantedBy=timers.target

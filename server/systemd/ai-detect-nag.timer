@@ -1,0 +1,9 @@
+[Unit]
+Description=Nag every 10 minutes while a hit is unacked
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

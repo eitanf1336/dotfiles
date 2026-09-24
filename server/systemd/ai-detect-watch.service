@@ -1,0 +1,9 @@
+[Unit]
+Description=Full sweep for a shipped AI-text-detection API (Anthropic/OpenAI/Google)
+
+[Service]
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Type=oneshot
+KillMode=process
+ExecStart=%h/bin/ai-detect-watch check
+TimeoutStartSec=1200

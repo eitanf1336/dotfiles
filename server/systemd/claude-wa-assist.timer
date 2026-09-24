@@ -1,0 +1,13 @@
+[Unit]
+Description=Check armed chats for new messages every 5 minutes (claude-wa-assist)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+# Fire relative to the last run finishing, not a wall clock, so a long run that
+# overruns its slot doesn't come back to a queued backlog of ticks.
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

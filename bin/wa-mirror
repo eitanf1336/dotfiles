@@ -1,0 +1,20 @@
+#!/bin/bash
+# wa-mirror: since 2026-09-25 the WhatsApp bridge runs on the server. Laptop
+# tools still read its DBs at the old path (MCP server, wa-history, wa-monitor,
+# kit-say, learning ingest, ben-watch-fallback...), so this keeps a READ-ONLY
+# copy there, refreshed by wa-mirror.timer. Consistent snapshots are taken on
+# the server with sqlite's backup API, then rsync swaps them in atomically.
+# The laptop bridge can never start while ~/.config/whatsapp-claude/REMOTE exists.
+set -uo pipefail
+[ -f "$HOME/.config/whatsapp-claude/REMOTE" ] || { echo "wa-mirror: no REMOTE marker, the bridge is local; nothing to mirror"; exit 0; }
+STORE="$HOME/code/whatsapp-mcp/whatsapp-bridge/store"
+mkdir -p "$STORE"
+ssh -o BatchMode=yes -o ConnectTimeout=10 server '
+  set -e; S=$HOME/.cache/wa-mirror; mkdir -p "$S"
+  cd "$HOME/code/whatsapp-mcp/whatsapp-bridge/store"
+  for d in messages whatsapp; do
+    sqlite3 -readonly -cmd ".timeout 10000" "$d.db" ".backup $S/$d.db.tmp"
+    mv -f "$S/$d.db.tmp" "$S/$d.db"
+  done' || { echo "wa-mirror: snapshot on the server failed"; exit 1; }
+exec rsync -tp --chmod=F444 --timeout=60 \
+  server:.cache/wa-mirror/messages.db server:.cache/wa-mirror/whatsapp.db "$STORE/"

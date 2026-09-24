@@ -1,0 +1,16 @@
+[Unit]
+Description=Whatclaude server (phone app front door onto the My Claude group)
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Token auth. All interfaces: the phone app reaches it over Tailscale
+# (100.85.207.11) or home WiFi (192.168.68.54); the laptop through server-link.
+Environment=WHATCLAUDE_BIND=0.0.0.0
+ExecStart=/usr/bin/python3 %h/code/MyProjects/Whatclaude/server/whatclaude-server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

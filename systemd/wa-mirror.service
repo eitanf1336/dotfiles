@@ -1,0 +1,8 @@
+[Unit]
+Description=Read-only laptop mirror of the server's WhatsApp DBs (wa-mirror)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/code/linux-setup/bin/wa-mirror
+TimeoutStartSec=120

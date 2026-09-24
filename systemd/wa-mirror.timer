@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the laptop's read-only WhatsApp DB mirror every 30 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

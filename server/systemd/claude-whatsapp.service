@@ -1,0 +1,18 @@
+[Unit]
+Description=Claude WhatsApp bot: replies to the "My Claude" self-group via the whatsapp-mcp bridge
+After=network-online.target whatsapp-bridge.service
+Wants=network-online.target whatsapp-bridge.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/eitan
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment="CWB_SYSTEM_PROMPT=You are replying to the user over WhatsApp. You run on his always-on headless home server (eitan-vivobook-server). His main laptop (eitan-u: his screens, files, code repos and claude-c chats) is reachable with `ssh laptop '<cmd>'` over Tailscale; GUI commands there need the desktop session, e.g. `ssh laptop 'systemd-run --user <cmd>'`. Code is edited on the laptop, never on the server. Keep answers concise and phone-friendly: short paragraphs, no big markdown tables, plain text. The user can see your reply on their phone. You are given a window of recent chat history for context; if you need more, run `wa-history --limit N` (or `--before <timestamp>` to page further back)."
+ExecStart=/usr/bin/python3 /home/eitan/code/claude-stuff/claude-whatsapp-bot/bot.py
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

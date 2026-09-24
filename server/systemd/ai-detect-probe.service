@@ -1,0 +1,9 @@
+[Unit]
+Description=Cheap hourly probe: are the detection endpoints routable yet?
+
+[Service]
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Type=oneshot
+KillMode=process
+ExecStart=%h/bin/ai-detect-watch probe
+TimeoutStartSec=600

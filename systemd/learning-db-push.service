@@ -1,0 +1,8 @@
+[Unit]
+Description=Push the learning app DB to the server for the WhatsApp monitor's schedule facts
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/code/linux-setup/bin/learning-db-push
+TimeoutStartSec=600

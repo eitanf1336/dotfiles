@@ -32,6 +32,14 @@ set -uo pipefail
 # PATH the service happens to inherit.
 export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 
+# 2026-09-25: the bridge and the bot moved to the server, which runs its own
+# doctor. On a machine marked REMOTE there is nothing to heal, and starting a
+# bridge here would put the WhatsApp session on two machines at once.
+if [[ -f "$HOME/.config/whatsapp-claude/REMOTE" ]]; then
+    echo "claude-whatsapp-doctor: the bridge runs on another machine (REMOTE marker); nothing to do here"
+    exit 0
+fi
+
 UNIT=claude-whatsapp.service
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT_PATH="$UNIT_DIR/$UNIT"
@@ -48,10 +56,24 @@ if [[ -f "$LOG" ]] && [[ $(stat -c%s "$LOG" 2>/dev/null || echo 0) -gt 1000000 ]
     tail -n 2000 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
 fi
 
+HEADLESS=0; [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && HEADLESS=1
 notify() {
     log "NOTIFY: $*"
+    # On the headless server notify-send is a shim that pops it on the laptop.
     command -v notify-send >/dev/null 2>&1 && \
         notify-send -u critical "Claude WhatsApp bot" "$*" 2>/dev/null
+    # Headless: nobody watches this screen, so also say it in My Claude while
+    # the bridge can still send (it cannot once unlinked; the laptop popup covers that).
+    if (( HEADLESS )); then
+        python3 - "$*" <<'PY2' 2>/dev/null || true
+import json, sys, urllib.request
+body = json.dumps({"recipient": "120363410856554324@g.us",
+                   "message": "🤖 WhatsApp doctor (server): " + sys.argv[1]}).encode()
+req = urllib.request.Request("http://localhost:8080/api/send", data=body,
+                             headers={"Content-Type": "application/json"})
+urllib.request.urlopen(req, timeout=10).read()
+PY2
+    fi
 }
 
 # --- 1. Find bot.py, wherever it lives now -----------------------------------
@@ -223,7 +245,11 @@ elif [[ "$paired" == "no" ]]; then
     [[ "$last" =~ ^[0-9]+$ ]] || last=0
     if (( now - last >= ALERT_EVERY )); then
         printf '%s' "$now" >"$LINK_ALERT"
-        notify "WhatsApp unlinked this device. The bot cannot see or send anything. Scan the QR window that just opened (WhatsApp → Linked devices)."
+        if (( HEADLESS )); then
+            notify "WhatsApp unlinked the server. The bot cannot see or send anything. Scan the QR window on the laptop screen, or run: ssh server cat ~/.local/state/whatsapp-claude/qr.ansi (WhatsApp → Linked devices)."
+        else
+            notify "WhatsApp unlinked this device. The bot cannot see or send anything. Scan the QR window that just opened (WhatsApp → Linked devices)."
+        fi
         log "UNLINKED: launching wa-reconnect for a QR scan"
         if command -v wa-reconnect >/dev/null 2>&1; then
             setsid -f nohup wa-reconnect >>"$WA_STATE/reconnect.log" 2>&1 </dev/null || \

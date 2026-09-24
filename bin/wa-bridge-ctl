@@ -16,6 +16,12 @@ set -euo pipefail
 CFG="${XDG_CONFIG_HOME:-$HOME/.config}/whatsapp-claude/config"
 [ -f "$CFG" ] && . "$CFG"
 
+# The bridge moved to another machine (the server): drive it there, never here.
+# A local start would put the one WhatsApp session on two machines at once.
+if [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/whatsapp-claude/REMOTE" ]; then
+  exec ssh -o BatchMode=yes "${WA_REMOTE_HOST:-server}" ".local/bin/wa-bridge-ctl${*:+ $(printf '%q ' "$@")}"
+fi
+
 WA_REPO="${WA_REPO:-$HOME/code/whatsapp-mcp}"
 BRIDGE_DIR="$WA_REPO/whatsapp-bridge"
 BIN="$BRIDGE_DIR/whatsapp-bridge-bin"
