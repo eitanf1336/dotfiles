@@ -2581,12 +2581,76 @@ def prompt_effort(default=None):
         return default
 
 
-def create_bg_agent(cwd=None, effort=None):
+# Model picker for new chats, shown right after the thinking-level one. Labels
+# are what you see; values go to `claude --model`. Full ids, not aliases, so a
+# new release never silently changes what "opus" means here.
+MODELS = [
+    ("opus",   "claude-opus-5-5",           "everyday default"),
+    ("sonnet", "claude-sonnet-5",           "cheaper, quick jobs"),
+    ("haiku",  "claude-haiku-4-5-20251001", "cheapest, trivial jobs"),
+    ("fable",  "claude-fable-5-1",          "most capable, burns tokens: hard problems only"),
+]
+_MODEL_NAMES = [m[0] for m in MODELS]
+
+
+def load_model_default():
+    """The persisted default model for new chats ('opus' when unset)."""
+    d = _load_json(SETTINGS_STORE).get("model_default")
+    return d if d in _MODEL_NAMES else "opus"
+
+
+def save_model_default(name):
+    _json_set(SETTINGS_STORE, "model_default", name)
+
+
+def model_id(name):
+    return next((m[1] for m in MODELS if m[0] == name), None)
+
+
+def prompt_model(default=None):
+    """Ask which model the new chat should run on. Same rules as
+    prompt_effort: Enter = the persisted default (initially 'opus'), a number
+    or name picks one, 'd<n>' also makes it the new default. Returns a label."""
+    if default is None:
+        default = load_model_default()
+    n = len(MODELS)
+    while True:
+        print("\n  Model for this chat:")
+        for i, (name, _mid, note) in enumerate(MODELS, 1):
+            mark = "   ← default" if name == default else ""
+            print(f"    {i}) {name:<7} {note}{mark}")
+        try:
+            raw = input(f"  Choose 1-{n} [Enter = {default}]"
+                        f", or d<n> to set the default: ").strip().lower()
+        except EOFError:
+            return default
+        if not raw:
+            return default
+        if raw.startswith("d"):
+            arg = raw[1:].strip()
+            new = (_MODEL_NAMES[int(arg) - 1] if arg.isdigit() and 1 <= int(arg) <= n
+                   else arg if arg in _MODEL_NAMES else None)
+            if new:
+                save_model_default(new)
+                print(f"  ✓ default is now '{new}'.")
+                return new
+            print(f"  ? use d1-d{n} or a model name (e.g. d1).")
+            continue
+        if raw.isdigit() and 1 <= int(raw) <= n:
+            return _MODEL_NAMES[int(raw) - 1]
+        if raw in _MODEL_NAMES:
+            return raw
+        return default
+
+
+def create_bg_agent(cwd=None, effort=None, model=None):
     """Create a new idle background agent and return its short id (or None).
     The agent keeps running in Claude's daemon; we then attach to it so the
     user can leave with Ctrl+Z and it stays alive. `effort`, if given, sets the
     session's thinking level via `claude --effort <level>`."""
     cmd = ["claude", "--bg"]
+    if model and model_id(model):
+        cmd += ["--model", model_id(model)]
     if effort:
         cmd += ["--effort", effort]
     try:
@@ -2599,7 +2663,7 @@ def create_bg_agent(cwd=None, effort=None):
     return mt.group(1) if mt else None
 
 
-def create_bg_resume(full_id, fork=False, cwd=None):
+def create_bg_resume(full_id, fork=False, cwd=None, extra=None):
     """Resume an existing (closed / settled-'done') session AS a background
     agent and return the new short id (or None). This is what makes Ctrl+Z safe
     for reopened chats: a foreground `claude --resume` hosts the work in its own
@@ -2609,10 +2673,11 @@ def create_bg_resume(full_id, fork=False, cwd=None):
     NEW session id (there is no 'background this same id' command), so the
     continuation is a fresh session seeded with the old conversation; the caller
     hides the old entry so it doesn't show up twice. `--fork-session` is passed
-    for an explicit fork."""
+    for an explicit fork. `extra` is appended as is (the /token account flag)."""
     cmd = ["claude", "--bg", "--resume", full_id]
     if fork:
         cmd.append("--fork-session")
+    cmd += list(extra or [])
     try:
         out = subprocess.run(cmd, cwd=cwd,
                              capture_output=True, text=True, timeout=60)
@@ -2621,6 +2686,64 @@ def create_bg_resume(full_id, fork=False, cwd=None):
     txt = _ANSI_RE.sub("", out.stdout + out.stderr)
     mt = re.search(r"backgrounded\W+([0-9a-f]{8})", txt)
     return mt.group(1) if mt else None
+
+
+# /token pins ONE chat to another Claude login (see ~/bin/claude-token). The
+# pin lives in ~/.claude/accounts/chat-tokens.json and travels as a per-chat
+# `--settings` file, so every way the board (re)opens a chat has to pass it on,
+# and a chat /token just restarted has to be reopened without a keypress.
+CHAT_TOKENS = HOME / ".claude" / "accounts" / "chat-tokens.json"
+CHAT_RELAUNCH = HOME / ".claude" / "accounts" / ".chat-relaunch"
+
+
+def chat_token_flags(sid):
+    """Launch flags that keep a pinned chat on its account (same session id)."""
+    try:
+        e = json.loads(CHAT_TOKENS.read_text()).get(sid) or {}
+    except Exception:
+        return []
+    f = e.get("settings")
+    if e.get("account") not in (None, "default") and f and os.path.isfile(f):
+        return ["--settings", f]
+    return []
+
+
+def chat_token_launch_flags(sid):
+    """Same, for a continuation under a NEW session id (bg reopen)."""
+    if not chat_token_flags(sid):
+        return []
+    try:
+        out = subprocess.run(["claude-token", "launch-flags", sid],
+                             capture_output=True, text=True, timeout=15)
+        flags = json.loads(out.stdout or "[]")
+        return flags if isinstance(flags, list) else []
+    except Exception:
+        return []
+
+
+def chat_token_carry(old_sid, new_sid, flags):
+    """The continuation keeps the reopened chat's /token account."""
+    if not flags:
+        return
+    try:
+        subprocess.run(["claude-token", "carry", old_sid, new_sid, flags[-1]],
+                       capture_output=True, text=True, timeout=15)
+    except Exception:
+        pass
+
+
+def chat_token_relaunch(sid):
+    """The relaunch claude-token asked for when it restarted this chat on
+    another account, if it is fresh: consumed on read."""
+    p = CHAT_RELAUNCH / f"{sid}.json"
+    try:
+        m = json.loads(p.read_text())
+        p.unlink()
+    except Exception:
+        return None
+    if time.time() - float(m.get("at") or 0) > 180:
+        return None
+    return m
 
 
 def start_new_chat(project_key=None, effort=None):
@@ -2641,9 +2764,11 @@ def start_new_chat(project_key=None, effort=None):
         run_cwd = os.environ.get("CHATS_LAUNCH_CWD") or os.getcwd()
     ensure_trusted(run_cwd)
     effort = effort or load_effort_default()
+    model = load_model_default()
     label = pj.get("list", {}).get(project_key) or project_key or run_cwd
-    print(f"\n▶ New background chat in {label} — {run_cwd} (thinking: {effort}) …")
-    short = create_bg_agent(run_cwd, effort)
+    print(f"\n▶ New background chat in {label} — {run_cwd}"
+          f" (model: {model}, thinking: {effort}) …")
+    short = create_bg_agent(run_cwd, effort, model)
     if not short:
         print("  Couldn't create the chat (is `claude` on PATH?) — opening the board.")
         time.sleep(1.5)
@@ -3078,10 +3203,13 @@ def main():
             run_cwd = new_cwd if (new_cwd and os.path.isdir(new_cwd)) else None
             ensure_trusted(run_cwd)
             effort = prompt_effort()
+            model = prompt_model()
+            if model == "fable" and effort in ("low", "medium"):
+                print("  ! fable on a light thinking level: opus is usually enough for that.")
             print(f"\n▶ Creating a new background chat"
                   f"{f' in {run_cwd}' if run_cwd else ''}"
-                  f" (thinking: {effort}) …")
-            short = create_bg_agent(run_cwd, effort)
+                  f" (model: {model}, thinking: {effort}) …")
+            short = create_bg_agent(run_cwd, effort, model)
             if not short:
                 print("  Couldn't create the chat (is `claude` on PATH?).")
                 input("  Press Enter to return to the menu …")
@@ -3239,7 +3367,9 @@ def main():
             # old entry (resume) so it doesn't show up twice.
             fork = (action == "fork")
             print(f"\n▶ {'Forking' if fork else 'Resuming'} in the background: {title[:55]}")
-            new_short = create_bg_resume(c["id"], fork=fork, cwd=run_cwd)
+            tok_flags = [] if fork else chat_token_launch_flags(c["id"])
+            new_short = create_bg_resume(c["id"], fork=fork, cwd=run_cwd,
+                                         extra=tok_flags)
             new_full = None
             if new_short:
                 new_full = next((s for s, r in agents_active().items()
@@ -3272,6 +3402,7 @@ def main():
                     # resume turned out empty.
                     _json_set(SUPERSEDED_STORE, c["id"], new_full)
                     pending_resume = (c["id"], new_full, new_short)
+                    chat_token_carry(c["id"], new_full, tok_flags)
                 run_id = new_full
                 last_id = new_full
                 short = new_short
@@ -3284,7 +3415,7 @@ def main():
                 # the chat still opens. Here Ctrl+Z ends the current step (there's
                 # no daemon behind a foreground session to keep it running).
                 cmd = ["claude", "--resume", c["id"]] + (
-                    ["--fork-session"] if fork else [])
+                    ["--fork-session"] if fork else chat_token_flags(c["id"]))
                 runner = run_child_relay
                 print("  (couldn't background it; opening in the foreground — "
                       "Ctrl+Z / Ctrl-D / quit to come back)\n")
@@ -3322,6 +3453,26 @@ def main():
         set_window_title(run_id)   # so `claude-session` can find this window
         try:
             runner(cmd, run_cwd)
+            # /token restarted this chat on another account: go straight back
+            # in (reattach the restarted agent, or reopen the terminal chat
+            # with its new flags) instead of dropping to the board.
+            nxt = chat_token_relaunch(run_id)
+            while nxt:
+                if nxt.get("attach"):
+                    for _ in range(40):
+                        if any(r.get("id") == nxt["attach"]
+                               for r in agents_active().values()):
+                            break
+                        time.sleep(0.5)
+                    print(f"\n▶ Back into the chat, now on {nxt.get('account')} …\n")
+                    run_child(["claude", "attach", nxt["attach"]], run_cwd)
+                else:
+                    print(f"\n▶ Reopening the chat on {nxt.get('account')} …\n")
+                    run_child_relay(["claude", "--resume", run_id]
+                                    + list(nxt.get("flags") or [])
+                                    + ([nxt["prompt"]] if nxt.get("prompt") else []),
+                                    run_cwd)
+                nxt = chat_token_relaunch(run_id)
         except FileNotFoundError:
             print("Could not find the `claude` command on PATH.")
             print(f"Run manually:  cd {cwd} && {' '.join(cmd)}")
