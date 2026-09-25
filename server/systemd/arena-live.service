@@ -1,0 +1,25 @@
+[Unit]
+Description=Minecraft Arena: Claude Opus lives on in his world until Eitan says stop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/MyProjects/MinecraftArena
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# pause (not stop) at 95% weekly, resume after the reset; a stuck bot is only logged;
+# every video part, the full video and the game-time replay are pushed to the laptop
+Environment=ARENA_ON_LINE=pause
+Environment=ARENA_ON_STUCK=report
+Environment=ARENA_PUSH_TO=laptop
+# a million game seconds is "until he says stop"; a reboot resumes from the last carry
+ExecStart=%h/code/MyProjects/MinecraftArena/bin/auto-continue 1000000 95
+# the server, the bot client, the daemon and the keeper are its children: the unit
+# lives as long as they do, not only as long as the watchdog script
+ExitType=cgroup
+TimeoutStopSec=120
+StandardOutput=append:%h/code/MyProjects/MinecraftArena/runs/night-run.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target
