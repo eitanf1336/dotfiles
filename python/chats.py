@@ -209,6 +209,21 @@ def _wrap(s, cols):
 
 locale.setlocale(locale.LC_ALL, "")
 
+_CODE_MTIME = os.stat(os.path.abspath(__file__)).st_mtime
+
+
+def _code_changed():
+    """True once this file on disk is newer than the code running now (and the
+    new file at least compiles, so a half-saved edit never kills the board)."""
+    try:
+        m = os.stat(os.path.abspath(__file__)).st_mtime
+        if m <= _CODE_MTIME or time.time() - m < 2:
+            return False
+        compile(open(os.path.abspath(__file__)).read(), __file__, "exec")
+        return True
+    except Exception:
+        return False
+
 HOME = Path.home()
 PROJECTS_DIR = HOME / ".claude" / "projects"
 # Chats that live on another machine (eitan-vivobook-server). server-chats-sync
@@ -2145,6 +2160,11 @@ class App:
                 self.sel = max(0, len(nav) - 1)
             self.draw(rows, nav)
             ch = self.stdscr.getch()
+            if ch == -1 and _code_changed():
+                # chats.py was edited (a new feature landed): reload on an idle
+                # tick, exactly like Ctrl+R, so old boards never run stale code.
+                self.reload = True
+                return
             if ch == curses.KEY_RESIZE:
                 self._on_resize()
                 continue
@@ -3489,7 +3509,19 @@ def main():
 
         # Ctrl+R — reload the script itself by re-executing (picks up code edits).
         if getattr(app, "reload", False):
-            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
+            # Keep the project the board was started on; drop one-shot flags.
+            keep, skip = [], False
+            for a in sys.argv[1:]:
+                if skip:
+                    skip = False
+                    continue
+                if a == "--open":
+                    skip = True
+                    continue
+                if a in ("--new", "-n", "--new-chat"):
+                    continue
+                keep.append(a)
+            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + keep)
 
         # 'n' — start a new chat as a BACKGROUND AGENT, then attach. This way the
         # user can leave with Ctrl+Z and the agent keeps running (just like the
