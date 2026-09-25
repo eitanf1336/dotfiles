@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch the server's internet; popup + WhatsApp to Eitan on outages (server-netwatch)
+
+[Service]
+ExecStart=%h/code/linux-setup/bin/server-netwatch
+Restart=always
+RestartSec=10
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

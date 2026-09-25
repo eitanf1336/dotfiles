@@ -41,6 +41,9 @@ Eitan has two Linux machines on one Tailscale network:
   `whatclaude` (:8090), doctor/assist timers, `surf-report.timer`, `ai-detect-*` timers.
   The laptop has a READ-ONLY mirror of messages.db (`wa-mirror.timer`, ~30 s lag) and a guard file
   `~/.config/whatsapp-claude/REMOTE` that stops any laptop bridge from starting. Never start a bridge on the laptop.
+- Internet watch: `server-netwatch.service` (bin/server-netwatch) probes ping, DNS and Polymarket HTTPS every 15 s;
+  after ~30 s down it pops a laptop notification, and on recovery says how long in My Claude (WhatsApp can't send mid-outage).
+  Log `~/.local/state/server-netwatch.log`, outages in `server-netwatch-outages.log`.
 - ServerScreen: `server-screen.service` (:7800) and the kiosk on the server's own display.
   Project stats reach it as: laptop `dashboard-laptop-push stats` (hourly; SurfStatus D1/KV via the laptop's wrangler, FocusRace Firebase; Eitan and tests dropped, rules in `TheDashboard/dashboard/collectors/projectstats.py`) -> `dash metric` on the server -> the screen reads The Dashboard (PolyArena money is the live P&L from :7790, never its Money War entries).
 - Render farm: `cuteworld-farm.service` + the `farm` CLI (`farm day|night|status|queue|results`).

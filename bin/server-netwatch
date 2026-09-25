@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# server-netwatch: watch the server's internet and tell Eitan the moment it drops.
+#
+# Every 15 s: ping two public IPs, resolve a name, and fetch Polymarket over HTTPS.
+# Two failed rounds in a row (~30 s) = OUTAGE. Alerts:
+#   - outage start: a popup on the laptop (notify-send shim over the LAN/Tailscale)
+#     and a WhatsApp try (fails while offline, the popup is the instant path)
+#   - recovery: WhatsApp to "My Claude" + popup, with how long it lasted
+#   - degraded (DNS or HTTPS dead while ping works, or heavy loss): same, once
+# Log: ~/.local/state/server-netwatch.log (outage lines are also kept in .../outages.log)
+set -u
+STATE="$HOME/.local/state"; mkdir -p "$STATE"
+LOG="$STATE/server-netwatch.log"; OUT="$STATE/server-netwatch-outages.log"
+INTERVAL=${NETWATCH_INTERVAL:-15}
+GROUP="120363410856554324@g.us"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+say() {   # popup on the laptop + WhatsApp to My Claude (best effort, never blocks long)
+    log "ALERT: $*"
+    timeout 8 notify-send -u critical "Server internet" "$*" 2>/dev/null || true
+    timeout 12 python3 - "$*" <<'PY' 2>/dev/null || true
+import json, sys, urllib.request
+body = json.dumps({"recipient": "120363410856554324@g.us",
+                   "message": "🤖🤖🤖\nServer internet: " + sys.argv[1] + "\n🤖🤖🤖"}).encode()
+req = urllib.request.Request("http://localhost:8080/api/send", data=body,
+                             headers={"Content-Type": "application/json"})
+urllib.request.urlopen(req, timeout=10).read()
+PY
+}
+
+probe() {  # prints "ping dns https" as 1/0 each
+    local p=0 d=0 h=0
+    ping -c2 -W2 -q 1.1.1.1 >/dev/null 2>&1 || ping -c2 -W2 -q 8.8.8.8 >/dev/null 2>&1 && p=1
+    timeout 5 getent hosts clob.polymarket.com >/dev/null 2>&1 && d=1
+    curl -s -o /dev/null -m 8 https://clob.polymarket.com/ && h=1
+    echo "$p $d $h"
+}
+
+fails=0; dfails=0; down_since=""; degraded=""
+log "start (every ${INTERVAL}s)"
+while true; do
+    read -r p d h < <(probe)
+    if (( p && d && h )); then
+        if [[ -n "$down_since" ]]; then
+            secs=$(( $(date +%s) - down_since ))
+            msg="BACK ONLINE after $((secs/60))m $((secs%60))s down (from $(date -d @"$down_since" +%H:%M:%S)). Bots rebuild from the API on their own."
+            echo "$(date '+%F %T') outage $(date -d @"$down_since" +%T) -> $(date +%T) (${secs}s)" >>"$OUT"
+            say "$msg"
+        elif [[ -n "$degraded" ]]; then
+            say "recovered (was: $degraded)"
+        fi
+        fails=0; dfails=0; down_since=""; degraded=""
+    elif (( ! p && ! h )); then
+        fails=$((fails+1)); dfails=0
+        if (( fails == 2 )); then
+            down_since=$(( $(date +%s) - INTERVAL ))
+            say "DOWN at $(date +%H:%M:%S). No ping, no Polymarket. I'll message again when it's back."
+        fi
+    else
+        what=""; (( p )) || what+="ping "; (( d )) || what+="DNS "; (( h )) || what+="Polymarket-HTTPS "
+        dfails=$((dfails+1)); fails=0
+        if (( dfails == 2 )) && [[ -z "$degraded$down_since" ]]; then
+            degraded="${what% } failing"
+            say "DEGRADED at $(date +%H:%M:%S): ${degraded}."
+        fi
+    fi
+    (( $(stat -c%s "$LOG" 2>/dev/null || echo 0) > 1000000 )) && tail -n 3000 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+    sleep "$INTERVAL"
+done
