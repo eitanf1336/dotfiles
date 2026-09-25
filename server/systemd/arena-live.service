@@ -2,6 +2,8 @@
 Description=Minecraft Arena: Claude Opus lives on in his world until Eitan says stop
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=6
 
 [Service]
 Type=simple
@@ -17,6 +19,15 @@ ExecStart=%h/code/MyProjects/MinecraftArena/bin/auto-continue 1000000 95
 # the server, the bot client, the daemon and the keeper are its children: the unit
 # lives as long as they do, not only as long as the watchdog script
 ExitType=cgroup
+# exit 75 = the watchdog ended a run whose client dropped out; start him again
+Restart=on-failure
+RestartSec=60
+# keep his JVMs out of swap (never swapped, others are reclaimed first) while the render farm and PolyArena share the RAM: a
+# swapped-out server stalled 36 s and timed the client out (2026-09-25)
+MemorySwapMax=0
+# a live world beats batch renders for the CPU: the farm still gets every idle cycle
+CPUWeight=1000
+IOWeight=1000
 TimeoutStopSec=120
 StandardOutput=append:%h/code/MyProjects/MinecraftArena/runs/night-run.log
 StandardError=inherit
