@@ -1,0 +1,6 @@
+[Unit]
+Description=Sync Claude instructions, skills, Kit and memory with eitan-vivobook-server
+
+[Service]
+Type=oneshot
+ExecStart=%h/code/linux-setup/bin/server-claude-sync

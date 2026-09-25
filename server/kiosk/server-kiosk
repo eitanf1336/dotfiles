@@ -1,0 +1,8 @@
+#!/bin/bash
+# Full-screen ServerScreen on this laptop's own display (tty1 autologin runs it from ~/.bash_profile).
+brightnessctl -q set 30% 2>/dev/null
+until curl -s -m 2 http://127.0.0.1:7800/ >/dev/null; do sleep 2; done
+exec cage -d -- chromium --kiosk --ozone-platform=wayland --noerrdialogs --disable-infobars \
+  --no-first-run --password-store=basic --disable-features=Translate,TranslateUI \
+  --disable-session-crashed-bubble --check-for-update-interval=31536000 \
+  --app=http://127.0.0.1:7800/

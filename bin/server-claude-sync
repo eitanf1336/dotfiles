@@ -1,0 +1,13 @@
+#!/bin/bash
+# Keep Claude on eitan-vivobook-server behaving like Claude here: same instructions, settings,
+# skills, commands, prompts, statusline and Kit (laptop -> server), and the shared memory in
+# both directions (newer file wins). Run every 5 min by server-claude-sync.timer.
+ssh -o ConnectTimeout=8 server true 2>/dev/null || exit 0
+R="rsync -a --timeout=60"
+$R ~/.claude/CLAUDE.md ~/.claude/statusline.sh ~/.claude/settings.json server:.claude/
+$R --delete ~/.claude/skills ~/.claude/commands ~/.claude/prompts server:.claude/
+$R --exclude .git ~/.claude/kit/ server:.claude/kit/
+M=.claude/projects/-home-eitan/memory/
+$R --update ~/"$M" server:"$M"
+$R --update server:"$M" ~/"$M"
+exit 0
