@@ -1,0 +1,9 @@
+[Unit]
+Description=PolyArena daily wakes at 13:00 (Eitan, 26 Sep)
+
+[Timer]
+OnCalendar=*-*-* 13:00:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

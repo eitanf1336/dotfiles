@@ -1,0 +1,24 @@
+[Unit]
+Description=PolyArena WhatsApp listener: a Claude that answers Eitan in the "PolyArena" group (bot.py, second instance)
+After=network-online.target whatsapp-bridge.service
+Wants=whatsapp-bridge.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/MyProjects/PolyArena
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CWB_GROUP_NAME=PolyArena
+Environment=CWB_CLAUDE_CWD=%h/code/MyProjects/PolyArena
+Environment=CWB_STATE_FILE=%h/.config/polyarena-whatsapp/state.json
+Environment=CWB_HISTORY_FILE=%h/.config/polyarena-whatsapp/history.jsonl
+Environment=CWB_HEARTBEAT_FILE=%h/.config/polyarena-whatsapp/heartbeat
+Environment=CWB_IGNORE_PREFIXES=📊
+EnvironmentFile=%h/.config/polyarena-whatsapp/env
+ExecStart=/usr/bin/python3 %h/code/claude-stuff/claude-whatsapp-bot/bot.py
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target
