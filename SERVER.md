@@ -99,8 +99,8 @@ dev testbeds, desktop tools, `server-link`, `server-chats-sync`, `server-claude-
 ## The server's screen
 
 tty1 autologins and runs `~/bin/server-kiosk` (cage + chromium kiosk on http://127.0.0.1:7800).
-Keys on the server's keyboard: `b` sleep/wake (backlight), arrows prev/next, space pause, 1-9 jump,
-`s` stocks, `r` reload. Ctrl+Alt+F2 gives a normal console. Disable the kiosk with
+Keys on the server's keyboard: `b` sleep/wake (backlight), `←` `→` previous/next slide, nothing else.
+Ctrl+Alt+F2 gives a normal console. Disable the kiosk with
 `touch ~/.config/server-kiosk-off` on the server.
 
 ## Plans, history, rollbacks
