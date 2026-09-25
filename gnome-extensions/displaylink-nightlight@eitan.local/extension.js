@@ -218,7 +218,14 @@ export default class DisplayLinkNightLight extends Extension {
         const fa = Math.min(intensity * 0.85, 0.85);
 
         const tintOn = active && intensity > 0;
-        const dimAlpha = Math.max(0, Math.min(0.9, 1 - brightness));
+        // Match the overlay to a hardware-dimmed screen. DDC/backlight
+        // brightness scales emitted light roughly linearly and never reaches
+        // true black (a floor near 10%), but a black overlay scales the
+        // gamma-encoded pixel values, so 1 - brightness made the DisplayLink
+        // screens far darker than the DDC one at the same number. Aim for the
+        // same light, then undo the 2.2 gamma to get the pixel multiplier.
+        const light = 0.1 + 0.9 * Math.max(0, Math.min(1, brightness));
+        const dimAlpha = Math.max(0, Math.min(0.9, 1 - Math.pow(light, 1 / 2.2)));
 
         this._overlays.forEach(o => {
             // The warm tint still applies everywhere: no monitor can do that in

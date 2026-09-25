@@ -1736,7 +1736,7 @@ class App:
 
     def choose_default_mode(self, key):
         """Bottom-line picker to set a project's starting permission mode.
-        Enter defaults to acceptEdits — the sane everyday choice."""
+        Enter defaults to auto, the same mode a new chat starts in."""
         if self.project_settings_path(key) is None:
             self.message = "No folder on disk for this project — can't set a mode"
             return
@@ -1750,7 +1750,7 @@ class App:
         header = f"Set start mode for “{_bidi(self.project_name(key))}” (now: {cur})"
         legend = "   ".join([
             "1 default", "2 acceptEdits", "3 plan",
-            "4 bypass", "5 auto", "0 clear", "Enter=acceptEdits", "Esc=cancel",
+            "4 bypass", "5 auto", "0 clear", "Enter=auto", "Esc=cancel",
         ])
         block = (_wrap(header, w - 1) + _wrap(legend, w - 1))[-(h - 1):] or [legend]
         start = max(0, h - len(block))
@@ -1773,8 +1773,8 @@ class App:
         modes = {ord("1"): "default", ord("2"): "acceptEdits",
                  ord("3"): "plan", ord("4"): "bypassPermissions",
                  ord("5"): "auto",
-                 10: "acceptEdits", 13: "acceptEdits",
-                 curses.KEY_ENTER: "acceptEdits"}
+                 10: "auto", 13: "auto",
+                 curses.KEY_ENTER: "auto"}
         mode = modes.get(k)
         if not mode:
             self.message = "Mode unchanged"
@@ -2839,6 +2839,12 @@ def create_bg_agent(cwd=None, effort=None, model=None):
     user can leave with Ctrl+Z and it stays alive. `effort`, if given, sets the
     session's thinking level via `claude --effort <level>`."""
     cmd = ["claude", "--bg"]
+    # New chats start in auto mode, unless the project picked its own start
+    # mode on the board ('o'), which lives in its settings.local.json.
+    perms = _load_json(Path(cwd or os.getcwd()) / ".claude" /
+                       "settings.local.json").get("permissions")
+    if not (isinstance(perms, dict) and perms.get("defaultMode")):
+        cmd += ["--permission-mode", "auto"]
     if model and model_id(model):
         cmd += ["--model", model_id(model)]
     if effort:
