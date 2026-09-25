@@ -1,5 +1,5 @@
 [Unit]
-Description=Push the laptop-only numbers (Claude effort, Cloudflare token, Ko-fi/credential files) to The Dashboard on the server
+Description=Push the laptop-only numbers (Claude effort, Cloudflare token, Ko-fi/credential files, real project stats) to The Dashboard on the server
 After=network-online.target server-link.service
 
 [Service]

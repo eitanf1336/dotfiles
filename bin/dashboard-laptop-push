@@ -13,9 +13,14 @@ Some of what The Dashboard knows can only be read on the laptop, so this pushes 
   files       copies new Ko-fi CSV exports and credential files (Google service-account
               JSONs, App Store AuthKey_*.p8) from ~/Downloads and ~/Desktop into the
               server's ~/Downloads, where The Dashboard picks them up by itself
+  stats       real per-project numbers only the laptop can read (SurfStatus D1/KV through
+              this laptop's wrangler login, FocusRace Firestore/Auth): registered users,
+              supporters, alert people, active users, groups, all minus Eitan and tests.
+              Recorded as `dash` metrics; the server's screen (ServerScreen) reads them
+              from The Dashboard. Rules in TheDashboard/dashboard/collectors/projectstats.py
   spool       replays `dash` writes that were saved while the server was unreachable
 
-Usage: dashboard-laptop-push [all|devstats|cloudflare|files|spool] ...
+Usage: dashboard-laptop-push [all|devstats|cloudflare|files|stats|spool] ...
 """
 from __future__ import annotations
 
@@ -117,6 +122,18 @@ def push_files() -> str:
     return f"{len(picked)} file(s): " + ", ".join(p.name for p in picked)
 
 
+def push_stats() -> str:
+    from dashboard.collectors import projectstats
+    payloads, errors = projectstats.compute()
+    if payloads:
+        ssh(f"{REMOTE_APP}/bin/dash ingest -", json.dumps(payloads).encode())
+    done = "; ".join(f"{p['project']}: " + ", ".join(f"{k}={v}" for k, v in p["metrics"].items())
+                     for p in payloads)
+    if errors:
+        raise RuntimeError((done + " | " if done else "") + "failed: " + "; ".join(errors))
+    return done
+
+
 def push_spool() -> str:
     proc = subprocess.run([str(HOME / "code/linux-setup/bin/dash"), "--replay-spool"],
                           capture_output=True, text=True, timeout=600)
@@ -126,11 +143,11 @@ def push_spool() -> str:
 
 
 STEPS = {"devstats": push_devstats, "cloudflare": push_cloudflare,
-         "files": push_files, "spool": push_spool}
+         "files": push_files, "stats": push_stats, "spool": push_spool}
 
 
 def main(argv: list) -> int:
-    wanted = [a for a in argv if a != "all"] or ["spool", "files", "devstats", "cloudflare"]
+    wanted = [a for a in argv if a != "all"] or ["spool", "files", "devstats", "cloudflare", "stats"]
     failed = 0
     for name in wanted:
         step = STEPS.get(name)

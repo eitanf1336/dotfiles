@@ -42,6 +42,7 @@ Eitan has two Linux machines on one Tailscale network:
   The laptop has a READ-ONLY mirror of messages.db (`wa-mirror.timer`, ~30 s lag) and a guard file
   `~/.config/whatsapp-claude/REMOTE` that stops any laptop bridge from starting. Never start a bridge on the laptop.
 - ServerScreen: `server-screen.service` (:7800) and the kiosk on the server's own display.
+  Project stats reach it as: laptop `dashboard-laptop-push stats` (hourly; SurfStatus D1/KV via the laptop's wrangler, FocusRace Firebase; Eitan and tests dropped, rules in `TheDashboard/dashboard/collectors/projectstats.py`) -> `dash metric` on the server -> the screen reads The Dashboard (PolyArena money is the live P&L from :7790, never its Money War entries).
 - Render farm: `cuteworld-farm.service` + the `farm` CLI (`farm day|night|status|queue|results`).
 - Deed job: see `~/fleet-staging/deed-cutover.sh` (moves the deed chat, watcher, canary, push-limits and the
   deed login to the server; after it, `claude-c-deed` opens the deed board ON the server over ssh).
