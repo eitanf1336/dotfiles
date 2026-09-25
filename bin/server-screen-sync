@@ -11,7 +11,7 @@ Every run (user timer, every 10 min):
 Then rsyncs it all to the server's ~/.cache/server-screen/ and ~/.config/.
 Read-only on every source. Safe to run any time; one run takes a few seconds.
 """
-import json, os, re, sqlite3, subprocess, sys, time, datetime as dt
+import glob, json, os, re, sqlite3, subprocess, sys, time, datetime as dt
 
 HOME = os.path.expanduser('~')
 STAGE = f'{HOME}/.cache/server-screen-stage'
@@ -32,12 +32,17 @@ def cuteworld():
         if not os.path.isdir(p1):
             continue
         for shot in os.listdir(p1):
-            fd = f'{p1}/{shot}/frames'
-            if not os.path.isdir(fd):
-                continue
-            fr = sorted(f for f in os.listdir(fd) if f.endswith('.png'))
-            if fr:
-                shots.append((os.path.getmtime(f'{fd}/{fr[-1]}'), story, shot, fd, fr))
+            best = None     # frames/, frames_v1/, ... : use the one with the newest render
+            for sub in os.listdir(f'{p1}/{shot}') if os.path.isdir(f'{p1}/{shot}') else []:
+                fd = f'{p1}/{shot}/{sub}'
+                if not sub.startswith('frames') or not os.path.isdir(fd):
+                    continue
+                fr = sorted(f for f in os.listdir(fd) if f.endswith('.png'))
+                if fr:
+                    cand = (os.path.getmtime(f'{fd}/{fr[-1]}'), story, shot, fd, fr)
+                    best = max(best, cand) if best else cand
+            if best:
+                shots.append(best)
     shots.sort(reverse=True)
     picks = []
     for _, story, shot, fd, fr in shots:
@@ -62,11 +67,31 @@ def cuteworld():
         if f not in want:
             os.remove(f'{FRAMES}/{f}')
     total = sum(len(s[4]) for s in shots)
+    out_dir = os.path.dirname(CUTE)
+    vids = set()
+    for pat in ('storyboard/*/*_part*.mp4', 'preview/*/*teaser*.mp4'):
+        for f in glob.glob(f'{out_dir}/{pat}'):
+            b = os.path.basename(f)[:-4]
+            vids.add(re.sub(r'(_v\d+|_final|_draft)$', '', b))   # theseus_teaser_v4 == theseus_teaser
     newest = shots[0] if shots else None
     return {'frames_total': total, 'shots': len(shots),
             'stories': sorted({s[1] for s in shots}),
             'newest_shot': f'{newest[1]} {newest[2]}' if newest else None,
-            'newest_at': newest[0] if newest else None}
+            'newest_at': newest[0] if newest else None,
+            'videos': sorted(vids), 'videos_made': len(vids)}
+
+
+MC_RUN = re.compile(r'^(\d{4}-\d\d-\d\d_\d{4}_[a-z0-9-]+?)(_part\d+|_cam|_full)*\.mp4$')
+
+
+def minecraft_videos():
+    out = f'{HOME}/code/MyProjects/MinecraftArena/out'
+    names = set()
+    for f in os.listdir(out) if os.path.isdir(out) else []:
+        m = MC_RUN.match(f)
+        if m and not re.search(r'random|mock|test', m.group(1)):
+            names.add(m.group(1))
+    return sorted(names)
 
 
 def minecraft():
@@ -95,7 +120,7 @@ def minecraft():
         return {'run': r, 'model': r.split('_')[-1], 'goal': run.get('goal'),
                 'game_seconds': bot.get('elapsed'), 'steps': bot.get('steps'),
                 'deaths': bot.get('deaths'), 'doing': doing, 'stopped': stopped,
-                'runs_total': len(runs), 'started': run.get('started')}
+                'runs_total': len(runs), 'started': run.get('started'), 'videos': minecraft_videos()}
     return None
 
 
