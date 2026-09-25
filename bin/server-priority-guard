@@ -41,8 +41,8 @@ while true; do
         echo 1000 >"/proc/$p/oom_score_adj" 2>/dev/null
         u=$(unit_of "$p"); [[ -z "$u" ]] && continue
         if [[ -z "${tuned[$u]:-}" ]]; then
-            systemctl --user set-property --runtime "$u" CPUWeight=10 MemoryHigh=4G 2>/dev/null \
-                && log "tuned $u (pid $p): CPUWeight=10 MemoryHigh=4G oom 1000"
+            systemctl --user set-property --runtime "$u" CPUWeight=10 MemoryHigh=5G 2>/dev/null \
+                && log "tuned $u (pid $p): CPUWeight=10 MemoryHigh=5G oom 1000"
             tuned[$u]=1
         fi
         [[ " ${frozen[*]} ${running[*]} " == *" $u "* ]] || running+=("$u")
@@ -54,7 +54,9 @@ while true; do
     done
 
     a=$(avail_mb); s=$(psi10)
-    if (( a < TIGHT_MB || s > TIGHT_PSI )) && (( ${#running[@]} )); then
+    # pressure only counts when memory is really getting low: MemoryHigh reclaim inside a render's
+    # own cgroup shows up as system-wide pressure too, and froze/thawed a render all night (25 Sep)
+    if (( a < TIGHT_MB || (s > TIGHT_PSI && a < 3000) )) && (( ${#running[@]} )); then
         u=${running[0]}
         if systemctl --user freeze "$u" 2>/dev/null; then
             frozen+=("$u"); frozen_at[$u]=$(date +%s); log "FROZE $u (avail ${a}MB, psi ${s}%)"
