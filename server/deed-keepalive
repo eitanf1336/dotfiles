@@ -1,0 +1,8 @@
+#!/bin/bash
+# Keep the deed chat alive as a background agent on this server. Claude retires idle
+# agents under memory pressure; a retired chat cannot be attached from claude-c-deed.
+export CLAUDE_CONFIG_DIR=$HOME/.claude-deed PATH=$HOME/bin:$HOME/.local/bin:/usr/bin:/bin
+SID=$(cat $HOME/code/MyLittleProjects/DeedPortal/work/session-id)
+claude agents --json 2>/dev/null | grep -q "\"sessionId\": *\"$SID\"" && exit 0
+cd $HOME && claude --bg --resume "$SID" >/dev/null 2>&1
+echo "$(date "+%F %T") deed chat was not running: resumed it" >> $HOME/.local/state/deed-keepalive.log

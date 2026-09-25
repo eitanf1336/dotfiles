@@ -1,0 +1,6 @@
+[Unit]
+Description=Keep the deed chat alive as a background agent
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/deed-keepalive
