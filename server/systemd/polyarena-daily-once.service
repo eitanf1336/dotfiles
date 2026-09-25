@@ -1,0 +1,11 @@
+[Unit]
+Description=PolyArena one-time daily run (26 Sep 11:00), then enables the 05:00 daily timer
+After=polyarena.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/MyProjects/PolyArena
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash -c 'exec %h/code/MyProjects/PolyArena/bin/arena-daily >> %h/code/MyProjects/PolyArena/data/logs/daily-$(date +%%Y%%m%%d).log 2>&1'
+CPUWeight=1000
+ExecStartPost=/usr/bin/systemctl --user enable --now polyarena-daily.timer

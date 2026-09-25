@@ -41,7 +41,7 @@ Eitan has two Linux machines on one Tailscale network:
   `whatclaude` (:8090), doctor/assist timers, `surf-report.timer`, `ai-detect-*` timers.
   The laptop has a READ-ONLY mirror of messages.db (`wa-mirror.timer`, ~30 s lag) and a guard file
   `~/.config/whatsapp-claude/REMOTE` that stops any laptop bridge from starting. Never start a bridge on the laptop.
-- PolyArena daily: `polyarena-daily.timer` runs `bin/arena-daily` at 13:00 (live bots first, sleeps through the Claude limit and
+- PolyArena daily: `polyarena-daily.timer` runs `bin/arena-daily` at 05:00 (first run: one-off polyarena-daily-once.timer, 26 Sep 11:00) (live bots first, sleeps through the Claude limit and
   retries the same day). After each session `bin/arena-inbox` posts numbered `📊 Message N` items (passages, money asks, questions)
   to the "PolyArena" WhatsApp group; `polyarena-whatsapp.service` (a second bot.py, cwd PolyArena, guide WHATSAPP-LISTENER.md)
   answers him there. Its env file is `~/.config/polyarena-whatsapp/env` (system prompt + CWB_GROUP_JID).
