@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# server-priority-guard: PolyArena's bots come first on the server, renders get what is left.
+# (Eitan, 25 Sep: 6 Blender renders froze the server for ~15 min and the live bots went blind.)
+#
+# Every 10 s:
+#   - every ffmpeg process: nice 15
+#   - every blender process: oom_score_adj 1000 (the kernel kills it first), and its unit gets
+#     CPUWeight=10 and MemoryHigh=4G (runtime only, whoever started it: farm or systemd-run)
+#   - memory tight (MemAvailable < 1.5 GB, or memory pressure avg10 > 25%): FREEZE the newest
+#     running render unit (systemctl --user freeze), one per round, until it eases
+#   - memory easy again for 60 s (MemAvailable > 3.5 GB and pressure < 5%): thaw one render
+# PolyArena units get CPUWeight=1000 + MemoryLow from their drop-ins (server/systemd/*.d).
+# Log: ~/.local/state/server-priority-guard.log
+set -u
+LOG="$HOME/.local/state/server-priority-guard.log"; mkdir -p "${LOG%/*}"
+TIGHT_MB=1500; EASY_MB=3500; TIGHT_PSI=25; EASY_PSI=5
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+avail_mb() { awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo; }
+psi10() { awk '/^some/{split($2,a,"="); print int(a[2])}' /proc/pressure/memory; }
+unit_of() { sed -n 's|.*/\([^/]*\.service\)$|\1|p' "/proc/$1/cgroup" 2>/dev/null | head -1; }
+
+declare -A tuned=()
+frozen=()          # stack of units we froze, newest last
+easy_since=0
+log "start"
+# adopt renders a previous run of this guard froze, so a restart never strands them frozen
+for p in $(ps -C blender -o pid= 2>/dev/null); do
+    u=$(unit_of "$p"); [[ -z "$u" ]] && continue
+    [[ $(systemctl --user show -p FreezerState --value "$u" 2>/dev/null) == frozen ]] \
+        && [[ " ${frozen[*]} " != *" $u "* ]] && frozen+=("$u") && log "adopted frozen $u"
+done
+while true; do
+    # newest first, so a freeze hits the render that started last
+    mapfile -t pids < <(ps -C blender -o pid=,etimes= --sort=etimes 2>/dev/null | awk '{print $1}')
+    running=()
+    for p in "${pids[@]}"; do
+        echo 1000 >"/proc/$p/oom_score_adj" 2>/dev/null
+        u=$(unit_of "$p"); [[ -z "$u" ]] && continue
+        if [[ -z "${tuned[$u]:-}" ]]; then
+            systemctl --user set-property --runtime "$u" CPUWeight=10 MemoryHigh=4G 2>/dev/null \
+                && log "tuned $u (pid $p): CPUWeight=10 MemoryHigh=4G oom 1000"
+            tuned[$u]=1
+        fi
+        [[ " ${frozen[*]} ${running[*]} " == *" $u "* ]] || running+=("$u")
+    done
+
+    # video encodes (MinecraftArena highlight renders, CuteWorld encodes) run at nice 15
+    for p in $(ps -C ffmpeg -o pid=,ni= 2>/dev/null | awk '$2<15{print $1}'); do
+        renice -n 15 -p "$p" >/dev/null 2>&1 && log "reniced ffmpeg $p to 15"
+    done
+
+    a=$(avail_mb); s=$(psi10)
+    if (( a < TIGHT_MB || s > TIGHT_PSI )) && (( ${#running[@]} )); then
+        u=${running[0]}
+        if systemctl --user freeze "$u" 2>/dev/null; then
+            frozen+=("$u"); log "FROZE $u (avail ${a}MB, psi ${s}%)"
+        fi
+        easy_since=0
+    elif (( ${#frozen[@]} )); then
+        # drop units that ended while frozen
+        keep=(); for u in "${frozen[@]}"; do systemctl --user is-active -q "$u" && keep+=("$u"); done
+        frozen=("${keep[@]}")
+        if (( a > EASY_MB && s < EASY_PSI )); then
+            (( easy_since == 0 )) && easy_since=$(date +%s)
+            if (( $(date +%s) - easy_since >= 60 && ${#frozen[@]} )); then
+                u=${frozen[-1]}; unset 'frozen[-1]'
+                systemctl --user thaw "$u" 2>/dev/null && log "thawed $u (avail ${a}MB, psi ${s}%)"
+                easy_since=0
+            fi
+        else
+            easy_since=0
+        fi
+    fi
+    (( $(stat -c%s "$LOG" 2>/dev/null || echo 0) > 500000 )) && tail -n 2000 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+    sleep 10
+done

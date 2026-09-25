@@ -41,7 +41,11 @@ Eitan has two Linux machines on one Tailscale network:
   `whatclaude` (:8090), doctor/assist timers, `surf-report.timer`, `ai-detect-*` timers.
   The laptop has a READ-ONLY mirror of messages.db (`wa-mirror.timer`, ~30 s lag) and a guard file
   `~/.config/whatsapp-claude/REMOTE` that stops any laptop bridge from starting. Never start a bridge on the laptop.
-- Internet watch: `server-netwatch.service` (bin/server-netwatch) probes ping, DNS and Polymarket HTTPS every 15 s;
+- Bots first: `server-priority-guard.service` (bin/server-priority-guard). PolyArena units run at CPUWeight=1000 with
+  MemoryLow (drop-ins in server/systemd/polyarena*.d). Every Blender gets CPUWeight=10, MemoryHigh=4G and OOM score 1000,
+  ffmpeg gets nice 15, and when memory runs tight the guard FREEZES the newest render and thaws it when memory is easy again.
+  A render that seems stuck may just be frozen: `systemctl --user list-units --state=frozen`, log `~/.local/state/server-priority-guard.log`.
+- Internet watch: `server-netwatch.service` (bin/server-netwatch, unit in server/systemd) probes ping, DNS and Polymarket HTTPS every 15 s;
   after ~30 s down it pops a laptop notification, and on recovery says how long in My Claude (WhatsApp can't send mid-outage).
   Log `~/.local/state/server-netwatch.log`, outages in `server-netwatch-outages.log`.
 - ServerScreen: `server-screen.service` (:7800) and the kiosk on the server's own display.

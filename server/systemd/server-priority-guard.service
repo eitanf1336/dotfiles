@@ -1,0 +1,13 @@
+[Unit]
+Description=Bots first: throttle and freeze Blender renders when PolyArena would starve (server-priority-guard)
+
+[Service]
+ExecStart=%h/code/linux-setup/bin/server-priority-guard
+Restart=always
+RestartSec=5
+CPUWeight=1000
+MemoryLow=50M
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
