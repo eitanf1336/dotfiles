@@ -9,6 +9,9 @@
 #   - memory tight (MemAvailable < 1.5 GB, or memory pressure avg10 > 25%): FREEZE the newest
 #     running render unit (systemctl --user freeze), one per round, until it eases
 #   - memory easy again for 60 s (MemAvailable > 3.5 GB and pressure < 5%): thaw one render
+#   - a render frozen for 5 min is STOPPED instead (thaw, then stop): a frozen Blender keeps its
+#     memory, so "easy" may never come and it would sit frozen for hours (it did: 2.5 h, 25 Sep).
+#     The farm requeues a stopped chunk as a stale claim; a stopped test still is just retried.
 # PolyArena units get CPUWeight=1000 + MemoryLow from their drop-ins (server/systemd/*.d).
 # Log: ~/.local/state/server-priority-guard.log
 set -u
@@ -19,7 +22,8 @@ avail_mb() { awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo; }
 psi10() { awk '/^some/{split($2,a,"="); print int(a[2])}' /proc/pressure/memory; }
 unit_of() { sed -n 's|.*/\([^/]*\.service\)$|\1|p' "/proc/$1/cgroup" 2>/dev/null | head -1; }
 
-declare -A tuned=()
+declare -A tuned=() frozen_at=()
+MAX_FROZEN=300
 frozen=()          # stack of units we froze, newest last
 easy_since=0
 log "start"
@@ -27,7 +31,7 @@ log "start"
 for p in $(ps -C blender -o pid= 2>/dev/null); do
     u=$(unit_of "$p"); [[ -z "$u" ]] && continue
     [[ $(systemctl --user show -p FreezerState --value "$u" 2>/dev/null) == frozen ]] \
-        && [[ " ${frozen[*]} " != *" $u "* ]] && frozen+=("$u") && log "adopted frozen $u"
+        && [[ " ${frozen[*]} " != *" $u "* ]] && frozen+=("$u") && frozen_at[$u]=$(date +%s) && log "adopted frozen $u"
 done
 while true; do
     # newest first, so a freeze hits the render that started last
@@ -53,18 +57,27 @@ while true; do
     if (( a < TIGHT_MB || s > TIGHT_PSI )) && (( ${#running[@]} )); then
         u=${running[0]}
         if systemctl --user freeze "$u" 2>/dev/null; then
-            frozen+=("$u"); log "FROZE $u (avail ${a}MB, psi ${s}%)"
+            frozen+=("$u"); frozen_at[$u]=$(date +%s); log "FROZE $u (avail ${a}MB, psi ${s}%)"
         fi
         easy_since=0
     elif (( ${#frozen[@]} )); then
         # drop units that ended while frozen
         keep=(); for u in "${frozen[@]}"; do systemctl --user is-active -q "$u" && keep+=("$u"); done
         frozen=("${keep[@]}")
+        # frozen too long: stop it so its memory comes back and the queue moves on
+        keep=(); now=$(date +%s)
+        for u in "${frozen[@]}"; do
+            if (( now - ${frozen_at[$u]:-$now} >= MAX_FROZEN )); then
+                systemctl --user thaw "$u" 2>/dev/null; systemctl --user stop "$u" 2>/dev/null
+                log "STOPPED $u (frozen ${MAX_FROZEN}s+, avail ${a}MB, psi ${s}%)"; unset "frozen_at[$u]"
+            else keep+=("$u"); fi
+        done
+        frozen=("${keep[@]}")
         if (( a > EASY_MB && s < EASY_PSI )); then
             (( easy_since == 0 )) && easy_since=$(date +%s)
             if (( $(date +%s) - easy_since >= 60 && ${#frozen[@]} )); then
                 u=${frozen[-1]}; unset 'frozen[-1]'
-                systemctl --user thaw "$u" 2>/dev/null && log "thawed $u (avail ${a}MB, psi ${s}%)"
+                unset "frozen_at[$u]"; systemctl --user thaw "$u" 2>/dev/null && log "thawed $u (avail ${a}MB, psi ${s}%)"
                 easy_since=0
             fi
         else
