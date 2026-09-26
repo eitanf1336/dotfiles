@@ -11,8 +11,9 @@ RestartSec=5
 # Memory limits folded in from the laptop's set-property drop-ins (user.control/polyarena.service.d).
 # The cgroup counts the sqlite page cache, so MemoryLow keeps the hot index pages resident.
 MemoryLow=1500M
-MemoryHigh=2G
-MemoryMax=2500M
+# 2G starved it on 26 Sep (throttled at the ceiling, site hung); raised live, same values here.
+MemoryHigh=3500M
+MemoryMax=4G
 MemorySwapMax=0
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/home/eitan/bin:/home/eitan/.local/bin:/usr/local/bin:/usr/bin:/bin
