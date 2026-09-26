@@ -6,9 +6,9 @@
 #   - every ffmpeg process: nice 15
 #   - every blender process: oom_score_adj 1000 (the kernel kills it first), and its unit gets
 #     CPUWeight=10 and MemoryHigh=4G (runtime only, whoever started it: farm or systemd-run)
-#   - memory tight (MemAvailable < 1.5 GB, or memory pressure avg10 > 25%): FREEZE the newest
+#   - memory tight (MemAvailable < 700 MB, or memory pressure avg10 > 25%; idle pages go to zram first): FREEZE the newest
 #     running render unit (systemctl --user freeze), one per round, until it eases
-#   - memory easy again for 60 s (MemAvailable > 3.5 GB and pressure < 5%): thaw one render
+#   - memory easy again for 60 s (MemAvailable > 2 GB and pressure < 5%): thaw one render
 #   - a render frozen for 5 min is STOPPED instead (thaw, then stop): a frozen Blender keeps its
 #     memory, so "easy" may never come and it would sit frozen for hours (it did: 2.5 h, 25 Sep).
 #     The farm requeues a stopped chunk as a stale claim; a stopped test still is just retried.
@@ -16,7 +16,7 @@
 # Log: ~/.local/state/server-priority-guard.log
 set -u
 LOG="$HOME/.local/state/server-priority-guard.log"; mkdir -p "${LOG%/*}"
-TIGHT_MB=1500; EASY_MB=3500; TIGHT_PSI=25; EASY_PSI=5
+TIGHT_MB=700; EASY_MB=2000; TIGHT_PSI=25; EASY_PSI=5
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
 avail_mb() { awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo; }
 psi10() { awk '/^some/{split($2,a,"="); print int(a[2])}' /proc/pressure/memory; }
