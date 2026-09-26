@@ -5,6 +5,10 @@ facts that only exist on this laptop.
 Every run (user timer, every 10 min):
   * CuteWorld: ~40 of the newest rendered frames, sampled across the newest shots,
     downscaled to 960px JPG (cached, so unchanged frames are never re-encoded).
+  * CuteWorld clips: a pool of ~24 silent 4 s clips (960px H.264) cut from random approved
+    shots of every video (only the current frames/ of each shot; old pre-review renders and
+    tests never). 4 new random clips per run, the oldest drop out, so the pool keeps changing.
+    Cut here on the laptop, cached; the server only plays them.
   * laptop.json: latest MinecraftArena run, the `learning` study desk, Loorp, CuteWorld.
   * ~/.config/portfolio/holdings.json and ~/.config/surf/config.json (the stock and
     surf math on the server reads them).
@@ -16,13 +20,86 @@ import glob, json, os, re, sqlite3, subprocess, sys, time, datetime as dt
 HOME = os.path.expanduser('~')
 STAGE = f'{HOME}/.cache/server-screen-stage'
 FRAMES = f'{STAGE}/frames'
+CLIPS = f'{STAGE}/clips'
 CUTE = f'{HOME}/code/MyProjects/CuteWorld/out/storyboard'
 MC_RUNS = f'{HOME}/code/MyProjects/MinecraftArena/runs'
 LEARNING_DB = f'{HOME}/code/learning/data/learning.db'
 LOORP = f'{HOME}/code/MyProjects/Loorp'
 N_FRAMES = 40
 PER_SHOT = 6
+CLIP_POOL, CLIP_NEW, CLIP_LEN = 24, 4, 48      # clips kept, new per run, frames per clip (4 s at 12 fps)
 HOST = os.environ.get('SERVER_SCREEN_HOST', 'server')
+
+
+def good_shots():
+    """(story, shot, frames dir, sorted frame numbers) for every shot worth showing: the current
+    frames/ only; for Gideon only beats 1-7.5 and shots he approved after review (READY list)."""
+    ok = set()
+    try:
+        for ln in open(f'{HOME}/code/MyProjects/CuteWorld/storyboard/READY_TO_RENDER.txt'):
+            w = ln.split()
+            if len(w) >= 2 and 'approved by main' in ln:
+                ok.add((w[0], w[1]))
+    except OSError:
+        pass
+    out = []
+    for story in sorted(os.listdir(CUTE)) if os.path.isdir(CUTE) else []:
+        p1 = f'{CUTE}/{story}/p1'
+        for shot in sorted(os.listdir(p1)) if os.path.isdir(p1) else []:
+            fd = f'{p1}/{shot}/frames'
+            if not os.path.isdir(fd):
+                continue
+            if story == 'gideon':
+                m = re.match(r'[\d.]+?(?=[a-z])', shot)
+                if not ((m and float(m.group(0)) <= 7.5) or (story, shot) in ok):
+                    continue
+            nums = sorted(int(f[:-4]) for f in os.listdir(fd) if re.fullmatch(r'\d{4}\.png', f))
+            if len(nums) >= 24:
+                out.append((story, shot, fd, nums))
+    return out
+
+
+def clips():
+    """Keep a changing pool of short clips of approved shots for the screen."""
+    import random
+    os.makedirs(CLIPS, exist_ok=True)
+    have = sorted((f for f in os.listdir(CLIPS) if f.endswith('.mp4')), key=lambda f: os.path.getmtime(f'{CLIPS}/{f}'))
+    shots = good_shots()
+    random.shuffle(shots)
+    made = 0
+    for story, shot, fd, nums in shots:
+        if made >= CLIP_NEW:
+            break
+        runs, a = [], 0          # contiguous runs of frame numbers
+        for i in range(1, len(nums) + 1):
+            if i == len(nums) or nums[i] != nums[i - 1] + 1:
+                if i - a >= 24:
+                    runs.append(nums[a:i])
+                a = i
+        if not runs:
+            continue
+        run = random.choice(runs)
+        st = random.randint(0, max(0, len(run) - CLIP_LEN))
+        f0, n = run[st], min(CLIP_LEN, len(run) - st)
+        name = f'{story}_{shot}_{f0:04d}_{int(os.path.getmtime(fd))}.mp4'
+        if name in have:
+            continue
+        r = subprocess.run(['nice', '-n', '19', 'ffmpeg', '-loglevel', 'error', '-y', '-framerate', '12',
+                            '-start_number', str(f0), '-i', f'{fd}/%04d.png', '-frames:v', str(n),
+                            '-vf', 'scale=960:-2', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28',
+                            '-pix_fmt', 'yuv420p', '-an', '-movflags', '+faststart', f'{CLIPS}/{name}'],
+                           check=False)
+        if r.returncode == 0:
+            have.append(name); made += 1
+    # a clip whose shot is no longer approved (or was re-rendered) goes; then trim to the pool size
+    live = {(s, sh, int(os.path.getmtime(fd))) for s, sh, fd, _ in good_shots()}
+    for f in list(have):
+        m = re.fullmatch(r'([a-z]+)_(.+)_\d{4}_(\d+)\.mp4', f)
+        if not m or (m.group(1), m.group(2), int(m.group(3))) not in live:
+            os.remove(f'{CLIPS}/{f}'); have.remove(f)
+    for f in have[:-CLIP_POOL]:
+        os.remove(f'{CLIPS}/{f}')
+    return len(have[-CLIP_POOL:])
 
 
 def cuteworld():
@@ -167,6 +244,11 @@ def main():
     rs = ['rsync', '-a', '--timeout=30']
     subprocess.run(['ssh', HOST, 'mkdir -p ~/.cache/server-screen ~/.config/portfolio ~/.config/surf'], check=True, timeout=30)
     subprocess.run([*rs, '--delete', f'{FRAMES}/', f'{HOST}:.cache/server-screen/frames/'], check=True)
+    try:
+        clips()
+        subprocess.run([*rs, '--delete', f'{CLIPS}/', f'{HOST}:.cache/server-screen/clips/'], check=True)
+    except Exception as e:  # noqa: BLE001
+        print(f'clips: {e}', file=sys.stderr)
     subprocess.run([*rs, f'{STAGE}/laptop.json', f'{HOST}:.cache/server-screen/laptop.json'], check=True)
     for src, dst in ((f'{HOME}/.config/portfolio/holdings.json', '.config/portfolio/holdings.json'),
                      (f'{HOME}/.config/surf/config.json', '.config/surf/config.json')):
