@@ -113,3 +113,4 @@ Ctrl+Alt+F2 gives a normal console. Disable the kiosk with
 `~/fleet-staging/*-cutover.sh` / `*-rollback.sh`.
 
 - **/tmp scratch cleanup (26 Sep 2026):** server crontab entry `# claude-scratch-clean` deletes files older than 2 h under /tmp/claude-1000/*MinecraftArena-runs* every hour (xx:17). /tmp is tmpfs, and the arena bots' headless claude sessions leaked 2.5 GB of cached camera frames into RAM. The Minecraft chat confirmed nothing reads them after a chapter (15-25 min).
+- **zram swappiness 180 (26 Sep 2026):** /etc/sysctl.d/99-zram-swappiness.conf on the server so idle pages compress into the 7.7 GB zram before renders get frozen. Undo: delete the file and `sudo sysctl vm.swappiness=60`.
