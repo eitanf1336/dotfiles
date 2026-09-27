@@ -704,18 +704,51 @@ def status_cell(status, frame):
     return f"{STATUS_ICON.get(status, STATUS_ICON['unknown'])[0]}  "
 
 
-def agents_active():
+AGENTS_SHARED_TTL = 2.5
+
+
+def _agents_cache_path():
+    # One cache per config dir: the deed board runs with its own CLAUDE_CONFIG_DIR.
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    tag = re.sub(r"[^A-Za-z0-9]+", "_", cfg).strip("_") or "default"
+    return os.path.expanduser(f"~/.cache/claude-c/agents-{tag}.json")
+
+
+def agents_active(shared=False):
     """Authoritative set of currently-live background agents, straight from
     Claude itself. These are exactly the sessions `claude --resume` refuses
-    (must fork/attach). Returns sessionId -> record. Empty on any failure."""
-    try:
-        out = subprocess.run(["claude", "agents", "--json"],
-                             capture_output=True, text=True, timeout=8)
-        if out.returncode != 0:
+    (must fork/attach). Returns sessionId -> record. Empty on any failure.
+
+    shared=True lets every open board reuse one result for AGENTS_SHARED_TTL.
+    Each call boots a full `claude` (~1 CPU-s, ~180 MB), and on 2026-09-27
+    twelve open boards were each doing that every 2.5s: about a core and a
+    steady spawn storm on an already swapping laptop, just to poll."""
+    data = None
+    cache = _agents_cache_path()
+    if shared:
+        try:
+            if time.time() - os.path.getmtime(cache) < AGENTS_SHARED_TTL:
+                with open(cache) as f:
+                    data = json.load(f)
+        except Exception:
+            data = None
+    if data is None:
+        try:
+            out = subprocess.run(["claude", "agents", "--json"],
+                                 capture_output=True, text=True, timeout=8)
+            if out.returncode != 0:
+                return {}
+            data = json.loads(out.stdout or "[]")
+        except Exception:
             return {}
-        data = json.loads(out.stdout or "[]")
-    except Exception:
-        return {}
+        try:
+            os.makedirs(os.path.dirname(cache), exist_ok=True)
+            tmp = f"{cache}.{os.getpid()}"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, cache)
+        except Exception:
+            pass
     live = {x["sessionId"]: x for x in data
             if isinstance(x, dict) and x.get("sessionId")}
     for sid, rec in remote_agents().items():
@@ -1451,7 +1484,7 @@ class App:
         throttled (it spawns `claude`); job tempo files are cheap, read each time."""
         now = time.time()
         if force or now - self._agents_ts > 2.5:
-            self._agents = agents_active()
+            self._agents = agents_active(shared=not force)
             self._agents_ts = now
         jobs = job_tempo_map()
         active = self._agents
