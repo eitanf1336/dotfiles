@@ -1,0 +1,21 @@
+# Apeirion live launch detector auto-start (server, user unit).
+# Install: cp to ~/.config/systemd/user/ on the server, then
+#   systemctl --user daemon-reload && systemctl --user enable --now apeirion-livewatch
+# Copy kept in ~/code/linux-setup/server/systemd/. Docs: apeirion-client/docs/live-detect.md
+[Unit]
+Description=Apeirion live launch detector auto-start (watches upcoming Starship launches)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/code/MyProjects/Apeirion/apeirion-client/scripts/live-detect
+ExecStart=/usr/bin/node livewatch.mjs
+Restart=on-failure
+RestartSec=60
+CPUWeight=20
+MemoryHigh=250M
+Nice=10
+
+[Install]
+WantedBy=default.target
