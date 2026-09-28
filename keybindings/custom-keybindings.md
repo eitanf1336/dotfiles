@@ -29,3 +29,4 @@ These are GNOME `media-keys` custom shortcuts. Restore them with `keybindings/re
 | End Yom Kippur blackout | `<Control><Alt><Shift>k` | `/home/eitan/.local/bin/kipur off` |
 | Memory task manager (memtop) | `<Control><Shift>Escape` | `/home/eitan/.local/bin/memtop` |
 | Takeover: pause or resume the job | `<Control><Alt>p` | `/home/eitan/.local/bin/takeover pause` |
+| Render blackout: hand the laptop to the CuteWorld farm | `<Control><Alt>b` | `setsid -f /home/eitan/bin/render-blackout` |

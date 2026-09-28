@@ -212,6 +212,12 @@ fi
 # "<schema>.custom-keybinding:<path>" (GNOME Settings, keys-cheatsheet) can only
 # resolve a full path, and silently sees no shortcuts at all with the bare form.
 arr="["
+paths+=("/render-blackout/")
+k="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/render-blackout/"
+gsettings set "$k" name 'Render blackout (CuteWorld)'
+gsettings set "$k" binding '<Control><Alt>b'
+gsettings set "$k" command 'setsid -f /home/eitan/bin/render-blackout'
+
 for p in "${paths[@]}"; do arr="$arr'$PREFIX$p', "; done
 arr="${arr%, }]"
 gsettings set $BASE custom-keybindings "$arr"

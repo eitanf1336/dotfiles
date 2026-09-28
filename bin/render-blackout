@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Ctrl+Alt+B: hand the laptop to the CuteWorld render farm. Starts a blackout (takeover hold) and the
+# laptop farm worker, which renders whatever is queued. The Apeirion recording is kept (~/.config/takeover/keep-units).
+# End it the usual way (the blackout screen, or `takeover finish`); the worker stops by itself when it ends.
+export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
+if systemctl --user is-active --quiet takeover-job; then
+  notify-send "Blackout already on" "The render farm has the laptop."; exit 0
+fi
+takeover hold -l "CuteWorld renders" >/dev/null 2>&1
+sleep 2
+farm laptop >/dev/null 2>&1
+notify-send "Laptop handed to the render farm" "$(farm 2>/dev/null | sed -n 2p)"
