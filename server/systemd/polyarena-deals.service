@@ -1,0 +1,10 @@
+[Unit]
+Description=PolyArena deals: fire Eitan's due ultimatums and promises (bin/arena-deals check)
+After=polyarena.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/MyProjects/PolyArena
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/code/MyProjects/PolyArena/bin/arena-deals check --quiet
+TimeoutStartSec=900

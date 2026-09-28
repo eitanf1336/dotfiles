@@ -45,6 +45,7 @@ Eitan has two Linux machines on one Tailscale network:
   retries the same day). After each session `bin/arena-inbox` posts numbered `📊 Message N` items (passages, money asks, questions)
   to the "PolyArena" WhatsApp group; `polyarena-whatsapp.service` (a second bot.py, cwd PolyArena, guide WHATSAPP-LISTENER.md)
   answers him there. Its env file is `~/.config/polyarena-whatsapp/env` (system prompt + CWB_GROUP_JID).
+- PolyArena deals: `polyarena-deals.timer` runs `bin/arena-deals check` every 10 min: Eitan's deals/ultimatums live in `deals.json` (DEALS.md is generated), fired state in `data/deals-state.json` (never rsync over it). On fire it words the bot and posts a numbered group message with the commands; it never moves money or cuts a bot.
 - Bots first: `server-priority-guard.service` (bin/server-priority-guard). PolyArena units run at CPUWeight=1000 with
   MemoryLow (drop-ins in server/systemd/polyarena*.d). Every Blender gets CPUWeight=10, MemoryHigh=4G and OOM score 1000,
   ffmpeg gets nice 15, and when memory runs tight the guard FREEZES the newest render and thaws it when memory is easy again.
