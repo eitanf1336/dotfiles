@@ -116,19 +116,24 @@ fi
 
 # ctx segment: a compact nudge that gets louder as the chat gets fat.
 # Every turn re-sends the whole context, so a bloated chat quietly bills the
-# same tokens over and over. Two signals, the worse one wins:
-#   * tokens actually carried per turn  - what costs quota on a 1M window
-#   * how full the window is            - what bites on a 200k one
-# autoCompactWindow=300000 fires autocompact near 267k, so every level has to
-# land before that or it is never seen: the point is to /compact yourself at a
-# clean break instead of letting auto cut in mid-task.
+# same tokens over and over. Levels hang off the autocompact point, which is
+# min(autoCompactWindow, model window) - 33k (measured: a 300k setting fires
+# at 266-269k in every transcript). Yellow and bold come before it, so you can
+# /compact at a clean break; red only once a chat is actually past it.
 CTX_LVL=0
 if [ -n "$CTX_REMAIN" ]; then
   ctx=$(printf '%.0f' "$CTX_REMAIN")
   tok=${CTX_TOKENS:-0}; tok=${tok%%.*}; [ -z "$tok" ] && tok=0
-  (( tok >= 150000 || ctx < 35 )) && CTX_LVL=1
-  (( tok >= 200000 || ctx < 20 )) && CTX_LVL=2
-  (( tok >= 240000 || ctx < 10 )) && CTX_LVL=3
+  win=$(echo "$input" | jq -r '.context_window.context_window_size // empty'); win=${win%%.*}
+  if [ -z "$win" ] || (( win <= 0 )); then
+    (( ctx < 100 && tok > 0 )) && win=$(( tok * 100 / (100 - ctx) )) || win=1000000
+  fi
+  acw=$(jq -r '.autoCompactWindow // empty' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" 2>/dev/null)
+  acw=${acw%%.*}; [ -n "$acw" ] && (( acw < win )) && win=$acw
+  ac_at=$(( win - 33000 ))
+  (( tok >= ac_at * 9 / 16 )) && CTX_LVL=1
+  (( tok >= ac_at * 3 / 4 ))  && CTX_LVL=2
+  (( tok >= ac_at ))          && CTX_LVL=3
   if (( tok >= 1000 )); then tk="$(( tok / 1000 ))k"; else tk="$tok"; fi
   case $CTX_LVL in
     0) c_ctx="${DIM}ctx ${ctx}%${RESET}";                       p_ctx="ctx ${ctx}%" ;;

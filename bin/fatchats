@@ -21,7 +21,7 @@ import time
 CTXDIR = os.path.expanduser("~/.claude/state/ctx")
 NOTIFIED = os.path.join(CTXDIR, "notified.json")
 STALE_AFTER = 20 * 60          # a crumb older than this = chat is closed or idle
-LEVELS = {2: "200k+", 3: "240k+, autocompact is close"}
+LEVELS = {2: "3/4 of the way to autocompact", 3: "past the autocompact point"}
 
 TTY = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 RED, YEL, GRN, DIM, BLD, RST = (
