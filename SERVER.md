@@ -88,6 +88,9 @@ dev testbeds, desktop tools, `server-link`, `server-chats-sync`, `server-claude-
    a new project scene is added in `ServerScreen/web/index.html` + `server.py` (real numbers only: real people,
    real users, real money; never page views or internal counters; every project leads with money earned).
    Deploy ServerScreen like any project and `ssh server 'systemctl --user restart server-screen'`.
+   Its bottom-right "Running now" list shows every project with one live word (auto from services and
+   `claude agents`; add auto rules in `AUTO_NOW` in server.py). Any Claude sets its own word with
+   `server-now <project> <word> [detail] [--ttl 2h]` / `--clear` (POST :7800/api/now, works from the laptop too).
 6. Report: `dash milestone fleet "<what moved>"`, and a line in `~/fleet-staging/PROGRESS.md`.
 7. Anything that pops a GUI (`notify-send`, `zenity`) on the server is forwarded to the laptop screen
    through `~/bin/laptop-gui` symlinks; don't rely on it for anything critical, alert via WhatsApp instead.
