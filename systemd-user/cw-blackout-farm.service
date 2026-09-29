@@ -1,0 +1,11 @@
+[Unit]
+Description=CuteWorld: start the render farm in every blackout he starts
+
+[Service]
+ExecStart=%h/.local/bin/cw-blackout-farm
+Restart=always
+RestartSec=30
+MemoryMax=64M
+
+[Install]
+WantedBy=default.target

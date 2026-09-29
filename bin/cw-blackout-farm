@@ -1,0 +1,10 @@
+#!/bin/bash
+# Keeps the CuteWorld render farm running in every blackout he starts (takeover-job active):
+# if the laptop worker is not running and the queue has work, start it. Never starts a blackout.
+while true; do
+  if systemctl --user is-active --quiet takeover-job && ! systemctl --user is-active --quiet cuteworld-farm-laptop; then
+    n=$(farm status 2>/dev/null | awk '/^tasks:/{print $2}')
+    if [ "${n:-0}" -gt 0 ]; then farm laptop && echo "$(date '+%F %T') blackout: farm started ($n tasks)"; fi
+  fi
+  sleep 60
+done
