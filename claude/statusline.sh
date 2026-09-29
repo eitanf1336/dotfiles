@@ -119,13 +119,16 @@ fi
 # same tokens over and over. Two signals, the worse one wins:
 #   * tokens actually carried per turn  - what costs quota on a 1M window
 #   * how full the window is            - what bites on a 200k one
+# autoCompactWindow=300000 fires autocompact near 267k, so every level has to
+# land before that or it is never seen: the point is to /compact yourself at a
+# clean break instead of letting auto cut in mid-task.
 CTX_LVL=0
 if [ -n "$CTX_REMAIN" ]; then
   ctx=$(printf '%.0f' "$CTX_REMAIN")
   tok=${CTX_TOKENS:-0}; tok=${tok%%.*}; [ -z "$tok" ] && tok=0
   (( tok >= 150000 || ctx < 35 )) && CTX_LVL=1
-  (( tok >= 300000 || ctx < 20 )) && CTX_LVL=2
-  (( tok >= 600000 || ctx < 10 )) && CTX_LVL=3
+  (( tok >= 200000 || ctx < 20 )) && CTX_LVL=2
+  (( tok >= 240000 || ctx < 10 )) && CTX_LVL=3
   if (( tok >= 1000 )); then tk="$(( tok / 1000 ))k"; else tk="$tok"; fi
   case $CTX_LVL in
     0) c_ctx="${DIM}ctx ${ctx}%${RESET}";                       p_ctx="ctx ${ctx}%" ;;
