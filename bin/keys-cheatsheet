@@ -24,6 +24,8 @@ EXTRAS = [
     ('Move a terminal within its group',      'Super+Left / Right'),
     ('Focus the next / previous terminal',    'Super+Alt+Left / Right'),
     ('Zoom one terminal over its group',      'Super+Up / Down'),
+    ('Flip to the next / previous terminal layer', 'Super+Alt+Down / Up'),
+    ('New terminal layer on this screen',     'Super+Alt+Return'),
     ('Show this shortcuts overlay',           'Super+K'),
 ]
 

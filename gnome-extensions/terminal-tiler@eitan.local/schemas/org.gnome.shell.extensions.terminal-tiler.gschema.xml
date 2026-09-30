@@ -51,6 +51,24 @@
       <description>Undoes maximize-terminal: re-flows the batch on the focused window's monitor back into equal columns/rows. Does nothing if the monitor's batch is not currently maximised.</description>
     </key>
 
+    <key name="next-terminal-layer" type="as">
+      <default><![CDATA[['<Super><Alt>Down']]]></default>
+      <summary>Flip the focused monitor to its next layer of terminals</summary>
+      <description>A monitor can hold several groups of columns (layers), one visible at a time. Hides the visible layer and shows the next one. With only one layer, starts a second one with a fresh terminal.</description>
+    </key>
+
+    <key name="previous-terminal-layer" type="as">
+      <default><![CDATA[['<Super><Alt>Up']]]></default>
+      <summary>Flip the focused monitor to its previous layer of terminals</summary>
+      <description>Same as next-terminal-layer, in the other direction.</description>
+    </key>
+
+    <key name="new-terminal-layer" type="as">
+      <default><![CDATA[['<Super><Alt>Return']]]></default>
+      <summary>Start a new layer of terminals on the focused monitor</summary>
+      <description>Hides the visible layer and opens a fresh terminal as a new, empty layer after it.</description>
+    </key>
+
     <key name="terminal-command" type="s">
       <default>'terminator'</default>
       <summary>Command used to launch a new terminal</summary>

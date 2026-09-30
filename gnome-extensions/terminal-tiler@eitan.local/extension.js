@@ -32,6 +32,9 @@ const FOCUS_LEFT_KEY = 'focus-terminal-left';
 const FOCUS_RIGHT_KEY = 'focus-terminal-right';
 const MAX_KEY = 'maximize-terminal';
 const UNMAX_KEY = 'unmaximize-terminal';
+const LAYER_NEXT_KEY = 'next-terminal-layer';
+const LAYER_PREV_KEY = 'previous-terminal-layer';
+const LAYER_NEW_KEY = 'new-terminal-layer';
 
 // Grab-op flag that Mutter ORs into the op for unconstrained moves.
 const GRAB_OP_WINDOW_FLAG_UNCONSTRAINED = 1024;
@@ -69,6 +72,14 @@ export default class TerminalTilerExtension extends Extension {
         // batch (fills the work area, peers hidden behind it). Absent unless
         // that monitor's group is in the temporary maximised state.
         this._maxed = new Map();
+        // Layers: a monitor can hold several groups of columns, one visible at
+        // a time. _batches is always the visible layer; the hidden ones wait
+        // here, minimised and unwatched, as monitorIndex -> array of layers
+        // (each an array of Meta.Window) kept in flip order: the first is what
+        // "next layer" shows, the last is what "previous layer" shows.
+        this._stash = new Map();
+        // monitorIndex -> number of the visible layer (0-based), for the OSD.
+        this._layerNo = new Map();
         // monitors waiting for a freshly-spawned terminal window to appear.
         this._pending = [];
         // Re-entrancy guard while we propagate minimize/restore across a batch.
@@ -148,6 +159,30 @@ export default class TerminalTilerExtension extends Extension {
             this._onUnmaximize.bind(this)
         );
 
+        // Flip between the focused monitor's layers of terminals, or start a
+        // fresh layer with a new terminal in it.
+        Main.wm.addKeybinding(
+            LAYER_NEXT_KEY,
+            this._settings,
+            Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
+            Shell.ActionMode.NORMAL,
+            () => this._onFlipLayer(1)
+        );
+        Main.wm.addKeybinding(
+            LAYER_PREV_KEY,
+            this._settings,
+            Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
+            Shell.ActionMode.NORMAL,
+            () => this._onFlipLayer(-1)
+        );
+        Main.wm.addKeybinding(
+            LAYER_NEW_KEY,
+            this._settings,
+            Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
+            Shell.ActionMode.NORMAL,
+            () => this._newLayer(this._keyMonitor())
+        );
+
         // A new window appeared — claim it if we asked for a terminal.
         global.display.connectObject(
             'window-created',
@@ -221,6 +256,9 @@ export default class TerminalTilerExtension extends Extension {
         Main.wm.removeKeybinding(FOCUS_RIGHT_KEY);
         Main.wm.removeKeybinding(MAX_KEY);
         Main.wm.removeKeybinding(UNMAX_KEY);
+        Main.wm.removeKeybinding(LAYER_NEXT_KEY);
+        Main.wm.removeKeybinding(LAYER_PREV_KEY);
+        Main.wm.removeKeybinding(LAYER_NEW_KEY);
         global.display.disconnectObject(this);
         global.window_manager.disconnectObject(this);
         Main.layoutManager.disconnectObject(this);
@@ -254,6 +292,8 @@ export default class TerminalTilerExtension extends Extension {
         }
 
         this._batches = null;
+        this._stash = null;
+        this._layerNo = null;
         this._pending = null;
         this._settings = null;
         this._grabWin = null;
@@ -332,8 +372,12 @@ export default class TerminalTilerExtension extends Extension {
             return;
         const win = global.display.focus_window;
         const monitor = this._monitorOf(win);
-        if (monitor === null)
+        if (monitor === null) {
+            // A terminal from a hidden layer was picked (dock, Alt+Tab): bring
+            // its whole layer up instead of leaving it alone over the others.
+            this._surfaceStashed(win);
             return;
+        }
         const arr = this._batches.get(monitor);
         if (!arr)
             return;
@@ -739,6 +783,186 @@ export default class TerminalTilerExtension extends Extension {
         // and re-flow whatever remains on that monitor.
         this._remove(win, monitor);
         this._tile(monitor);
+        this._fillEmptyLayer(monitor);
+    }
+
+    // ----- layers ------------------------------------------------------------
+
+    // The monitor a layer key acts on: the focused window's, else the pointer's.
+    _keyMonitor() {
+        const focus = global.display.focus_window;
+        return focus ? focus.get_monitor() : global.display.get_current_monitor();
+    }
+
+    // Hidden layers of `monitor`, with closed windows and emptied layers
+    // dropped. Always returns the live array (stored back), possibly empty.
+    _stashOf(monitor) {
+        const layers = (this._stash.get(monitor) ?? [])
+            .map(l => l.filter(w => this._isAlive(w)))
+            .filter(l => l.length);
+        if (layers.length)
+            this._stash.set(monitor, layers);
+        else
+            this._stash.delete(monitor);
+        return layers;
+    }
+
+    // Take the visible layer off `monitor` without touching its windows yet:
+    // they leave _batches and lose our handlers, so nothing we do to them next
+    // (minimising) is mirrored, re-tiled or read as an eject. Returns them.
+    _detachLayer(monitor) {
+        const arr = (this._batches.get(monitor) ?? [])
+            .filter(w => this._isAlive(w));
+        for (const w of this._batches.get(monitor) ?? [])
+            w.disconnectObject(this);
+        this._batches.delete(monitor);
+        this._maxed.delete(monitor);
+        return arr;
+    }
+
+    _hideWindows(wins) {
+        this._syncing = true;
+        for (const w of wins)
+            if (this._isAlive(w) && !w.minimized)
+                w.minimize();
+        this._syncing = false;
+    }
+
+    // Make `layer` the visible one on `monitor` (which must have none).
+    _showLayer(monitor, layer) {
+        for (const w of layer)
+            this._add(monitor, w);
+        this._raiseGroup(monitor);
+    }
+
+    // delta +1 = next layer, -1 = previous. With a single layer there is
+    // nothing to flip to, so the key starts a second one instead.
+    _onFlipLayer(delta) {
+        const monitor = this._keyMonitor();
+        const stash = this._stashOf(monitor);
+        if (!stash.length) {
+            if (this._batches.get(monitor)?.length)
+                this._newLayer(monitor);
+            return;
+        }
+        const old = this._detachLayer(monitor);
+        const total = stash.length + (old.length ? 1 : 0);
+        let next;
+        if (delta > 0) {
+            if (old.length)
+                stash.push(old);
+            next = stash.shift();
+        } else {
+            if (old.length)
+                stash.unshift(old);
+            next = stash.pop();
+        }
+        if (stash.length)
+            this._stash.set(monitor, stash);
+        else
+            this._stash.delete(monitor);
+        const no = ((this._layerNo.get(monitor) ?? 0) + delta + total) % total;
+        this._layerNo.set(monitor, no);
+        // Show first, hide second, so focus goes straight to the new layer
+        // instead of bouncing through whatever else is on the screen.
+        this._showLayer(monitor, next);
+        this._hideWindows(old);
+        this._layerOsd(monitor, no, total);
+    }
+
+    // Park the visible layer and open a fresh terminal as a new one after it.
+    _newLayer(monitor) {
+        const old = this._detachLayer(monitor);
+        if (!old.length) {
+            this._spawnInto(monitor);
+            return;
+        }
+        const stash = this._stashOf(monitor);
+        stash.push(old);
+        this._stash.set(monitor, stash);
+        const no = (this._layerNo.get(monitor) ?? 0) + 1;
+        this._layerNo.set(monitor, no);
+        this._spawnInto(monitor);
+        this._hideWindows(old);
+        this._layerOsd(monitor, no, stash.length + 1);
+    }
+
+    // The visible layer just lost its last terminal: show the next hidden one
+    // rather than leaving the screen empty with layers parked behind it.
+    _fillEmptyLayer(monitor) {
+        if (!this._stash || this._batches.get(monitor)?.length)
+            return;
+        const stash = this._stashOf(monitor);
+        if (!stash.length) {
+            this._layerNo.delete(monitor);
+            return;
+        }
+        const next = stash.shift();
+        if (stash.length)
+            this._stash.set(monitor, stash);
+        else
+            this._stash.delete(monitor);
+        const total = stash.length + 1;
+        const no = (this._layerNo.get(monitor) ?? 0) % total;
+        this._layerNo.set(monitor, no);
+        this._showLayer(monitor, next);
+        this._layerOsd(monitor, no, total);
+    }
+
+    // `win` got focus while parked in a hidden layer: flip to that layer.
+    _surfaceStashed(win) {
+        if (!win || !this._stash)
+            return;
+        for (const [monitor, layers] of this._stash) {
+            const i = layers.findIndex(l => l.includes(win));
+            if (i < 0)
+                continue;
+            const stash = this._stashOf(monitor);
+            const j = stash.findIndex(l => l.includes(win));
+            if (j < 0)
+                return;
+            const next = stash.splice(j, 1)[0];
+            const old = this._detachLayer(monitor);
+            // Keep the flip order a ring: what came after `next` stays after.
+            const ring = [...stash.slice(j), ...(old.length ? [old] : []),
+                ...stash.slice(0, j)];
+            if (ring.length)
+                this._stash.set(monitor, ring);
+            else
+                this._stash.delete(monitor);
+            const total = ring.length + 1;
+            const no = ((this._layerNo.get(monitor) ?? 0) + j + 1) % total;
+            this._layerNo.set(monitor, no);
+            for (const w of next)
+                this._add(monitor, w);
+            this._syncing = true;
+            for (const w of next) {
+                if (w.minimized)
+                    w.unminimize();
+                w.raise();
+            }
+            this._syncing = false;
+            this._tile(monitor);
+            this._hideWindows(old);
+            this._layerOsd(monitor, no, total);
+            return;
+        }
+    }
+
+    // "Layer 2 / 3" on the monitor that flipped. Cosmetic: never let a change
+    // in the shell's OSD API break the flip itself.
+    _layerOsd(monitor, no, total) {
+        try {
+            const osd = Main.osdWindowManager;
+            const icon = Gio.ThemedIcon.new('view-paged-symbolic');
+            const label = `Layer ${no + 1} / ${total}`;
+            if (osd.showOne)
+                osd.showOne(monitor, icon, label);
+            else
+                osd.show(monitor, icon, label);
+        } catch (e) {
+            // No OSD, the flip still happened.
+        }
     }
 
     // ----- batch bookkeeping -------------------------------------------------
@@ -765,6 +989,7 @@ export default class TerminalTilerExtension extends Extension {
                     return;
                 this._remove(win, m);
                 this._tile(m);
+                this._fillEmptyLayer(m);
             },
             'size-changed', () => this._onSizeChanged(win),
             this);
@@ -1021,6 +1246,19 @@ export default class TerminalTilerExtension extends Extension {
             return;
         const cols = this._settings.get_string('orientation') !== 'rows';
         const rehomed = new Map();
+
+        // Hidden layers parked on a monitor that no longer exists follow their
+        // windows to the last screen that does.
+        for (const key of [...this._stash.keys()]) {
+            if (key < nMon)
+                continue;
+            const layers = this._stashOf(key);
+            this._stash.delete(key);
+            this._layerNo.delete(key);
+            if (layers.length)
+                this._stash.set(nMon - 1,
+                    [...this._stashOf(nMon - 1), ...layers]);
+        }
 
         for (const [key, arr] of this._batches) {
             for (const win of arr) {

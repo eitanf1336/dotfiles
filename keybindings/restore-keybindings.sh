@@ -218,6 +218,11 @@ gsettings set "$k" name 'Render blackout (CuteWorld)'
 gsettings set "$k" binding '<Control><Alt>b'
 gsettings set "$k" command 'setsid -f /home/eitan/bin/render-blackout'
 
+# Super+Alt+Up/Down flip Terminal Tiler layers; free them from the shell's
+# "shift overview" default, which would otherwise swallow the keys.
+gsettings set org.gnome.shell.keybindings shift-overview-up "[]"
+gsettings set org.gnome.shell.keybindings shift-overview-down "[]"
+
 # claude-session configurations: Ctrl+Alt+<n> loads slot n, Ctrl+Alt+Shift+<n>
 # saves the chats open right now into it.
 for n in 1 2 3 4 5 6 7 8 9; do
