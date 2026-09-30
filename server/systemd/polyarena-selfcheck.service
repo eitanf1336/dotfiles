@@ -1,0 +1,13 @@
+[Unit]
+Description=PolyArena daily self-check: coverage, feed, accounting, sim exchange, live wallet (read only), bots, wakes, services, tests; posts a verdict to the PolyArena group
+After=polyarena.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/MyProjects/PolyArena
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash -c 'exec /usr/bin/python3 %h/code/MyProjects/PolyArena/bin/arena-selfcheck >> %h/code/MyProjects/PolyArena/data/logs/selfcheck.log 2>&1'
+TimeoutStartSec=3600
+Nice=10

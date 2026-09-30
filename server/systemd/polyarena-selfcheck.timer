@@ -1,0 +1,9 @@
+[Unit]
+Description=PolyArena self-check every day at 06:30, after the 05:00 wakes start (Eitan, 30 Sep)
+
+[Timer]
+OnCalendar=*-*-* 06:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
