@@ -13,6 +13,23 @@ So: remember what was open, and put it back.
   claude-session restore   reopen them, tiled the way they were
   claude-session list      show what would be restored
 
+Named configurations, for moving between desks (three screens at home, one on
+the road) or between sets of chats:
+
+  claude-session save <name>       keep the chats open right now, and where
+                                   they sit, under a name
+  claude-session load <name>       open that configuration; chats already open
+                                   are left alone. `load -` goes back to what
+                                   was open before the last load.
+      --close                      also close the chat terminals that are not
+                                   part of it (a real switch, not an add)
+      --dry-run                    only print what would happen
+  claude-session configs           list the saved configurations
+  claude-session rm <name>         forget one
+
+A configuration saved on more screens than are plugged in still loads: the
+tiler puts a column meant for a missing monitor on the last one that exists.
+
 `save` runs on a timer while you are logged in and once more as the session
 shuts down, so the file on disk is never more than a minute stale. `restore`
 runs from ~/.config/autostart at login.
@@ -56,6 +73,8 @@ HOME = Path.home()
 STATE = HOME / ".claude" / "chats-session"
 SESSION = STATE / "session.json"
 HISTORY = STATE / "history"
+CONFIGS = STATE / "configs"            # named configurations, one json each
+PREVIOUS = "-"                         # `load -`: what was open before a load
 LAYOUT = STATE / "tiler-layout.json"   # written by the Terminal Tiler extension
 TERMINAL = "terminator"
 BUS = ("--session", "--dest", "org.gnome.Shell",
@@ -246,8 +265,8 @@ def _previous_session():
         return {}
 
 
-def save():
-    STATE.mkdir(parents=True, exist_ok=True)
+def snapshot():
+    """The chats open right now and the column each one sits in."""
     entries = []
     seen = set()
     for b in open_boards():
@@ -281,7 +300,13 @@ def save():
         if spot:
             e.update(spot)
 
-    payload = {"saved": time.time(), "chats": entries}
+    return {"saved": time.time(), "chats": entries}
+
+
+def save():
+    STATE.mkdir(parents=True, exist_ok=True)
+    payload = snapshot()
+    entries = payload["chats"]
     tmp = SESSION.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, indent=2))
     tmp.replace(SESSION)                       # atomic: never a half-written file
@@ -430,9 +455,9 @@ def legacy_placements():
     return where
 
 
-def plan():
+def plan(data=None):
     """The chats to reopen, in the order their columns should be spawned."""
-    data = last_pre_boot_session()
+    data = data or last_pre_boot_session()
     if not data:
         return []
     legacy = legacy_placements()
@@ -517,8 +542,8 @@ def _wait_up(chats, limit):
     return up, list(pending.values())
 
 
-def restore():
-    chats = plan()
+def restore(data=None):
+    chats = plan(data)
     if not chats:
         _log("nothing saved to restore")
         return 0
@@ -579,8 +604,168 @@ def show():
     return 0
 
 
+# --------------------------------------------------------- configurations
+
+def _config_path(name):
+    if name == PREVIOUS:
+        return CONFIGS / ".previous.json"
+    ok = name and all(c.isalnum() or c in "-_" for c in name)
+    if not ok:
+        sys.exit(f"bad name {name!r}: letters, digits, - and _ only")
+    return CONFIGS / f"{name}.json"
+
+
+def _write_config(name, payload):
+    CONFIGS.mkdir(parents=True, exist_ok=True)
+    path = _config_path(name)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.replace(path)
+    return path
+
+
+def _read_config(name):
+    try:
+        return json.loads(_config_path(name).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _describe(e, names):
+    for jid, name in names.items():
+        if _same_chat(e["chat"], jid):
+            return name
+    return e.get("cwd") or ""
+
+
+def save_config(name):
+    payload = snapshot()
+    if not payload["chats"]:
+        print("no chats are open, nothing to save")
+        return 1
+    path = _write_config(name, payload)
+    placed = sum(1 for e in payload["chats"] if e.get("monitor") is not None)
+    print(f"saved {len(payload['chats'])} chats ({placed} placed) as "
+          f"'{name}' -> {path}")
+    return 0
+
+
+def list_configs():
+    files = sorted(CONFIGS.glob("*.json")) if CONFIGS.is_dir() else []
+    files = [f for f in files if not f.name.startswith(".")]
+    if not files:
+        print("no saved configurations; make one with `claude-session save <name>`")
+        return 0
+    names = job_names()
+    for f in files:
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        chats = d.get("chats") or []
+        mons = sorted({e["monitor"] for e in chats
+                       if e.get("monitor") is not None})
+        days = (time.time() - d.get("saved", 0)) / 86400
+        print(f"{f.stem}: {len(chats)} chats on {len(mons) or '?'} "
+              f"screen{'s' if len(mons) != 1 else ''}, saved {days:.0f}d ago")
+        for e in plan(d):
+            spot = (f"monitor {e['monitor']} col {e['column']}"
+                    if e.get("monitor") is not None else "unplaced")
+            print(f"    {e['chat'][:8]}  {spot:<18} {_describe(e, names)}")
+    return 0
+
+
+def _terminal_shell(pid):
+    """The process directly under the terminal emulator that `pid` runs in;
+    hanging that up closes the window, the same as clicking its X."""
+    while pid > 1:
+        stat = _read(Path(f"/proc/{pid}/stat"))
+        try:
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])
+        except (IndexError, ValueError):
+            return None
+        parent = _argv(ppid)
+        if any(TERMINAL in a.rsplit("/", 1)[-1] for a in parent[:2]):
+            return pid
+        pid = ppid
+    return None
+
+
+def _close_others(keep, dry):
+    """Close the terminals of open chats that are not in `keep`. Nothing is
+    lost: a background agent keeps running and any chat resumes from its
+    transcript. Boards with no chat open and plain shells are left alone."""
+    import signal
+    names = job_names()
+    n = 0
+    for b in open_boards():
+        chat = b["chat"]
+        if not chat or _is_open(chat["id"], keep):
+            continue
+        label = _describe({"chat": chat["id"], "cwd": chat["cwd"]}, names)
+        shell = _terminal_shell(b["pid"])
+        if shell is None:
+            print(f"  cannot find the terminal of {chat['id'][:8]} {label}")
+            continue
+        print(f"  {'would close' if dry else 'closing'} {chat['id'][:8]} {label}")
+        n += 1
+        if not dry:
+            try:
+                os.kill(shell, signal.SIGHUP)
+            except OSError:
+                pass
+    return n
+
+
+def load_config(name, close=False, dry=False):
+    data = _read_config(name)
+    if not data or not data.get("chats"):
+        print(f"no configuration named '{name}'"
+              if name != PREVIOUS else "no previous configuration yet")
+        list_configs()
+        return 1
+    chats = plan(data)
+    ids = open_chat_ids()
+    names = job_names()
+    for e in chats:
+        spot = (f"monitor {e['monitor']} col {e['column']}"
+                if e.get("monitor") is not None else "unplaced")
+        state = "already open" if _is_open(e["chat"], ids) else (
+            "would open" if dry else "opening")
+        print(f"  {state:<12} {e['chat'][:8]}  {spot:<18} {_describe(e, names)}")
+    if dry:
+        if close:
+            _close_others({e["chat"] for e in chats}, dry=True)
+        return 0
+    # Remember what is open now, so `load -` flips straight back.
+    now = snapshot()
+    if now["chats"]:
+        _write_config(PREVIOUS, now)
+    if close:
+        _close_others({e["chat"] for e in chats}, dry=False)
+        time.sleep(1.5)       # let the tiler re-flow before new columns arrive
+    return restore(data)
+
+
 def main():
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "list"
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    cmd = args[0] if args else "list"
+    if cmd == "save" and len(args) > 1:
+        return save_config(args[1])
+    if cmd in ("load", "switch", "open") and len(args) > 1:
+        return load_config(args[1], close="--close" in flags,
+                           dry="--dry-run" in flags)
+    if cmd in ("configs", "config", "ls"):
+        return list_configs()
+    if cmd in ("rm", "delete") and len(args) > 1:
+        try:
+            _config_path(args[1]).unlink()
+            print(f"removed '{args[1]}'")
+            return 0
+        except OSError:
+            print(f"no configuration named '{args[1]}'")
+            return 1
     if cmd == "save":
         entries = save()
         placed = sum(1 for e in entries if e.get("monitor") is not None)
