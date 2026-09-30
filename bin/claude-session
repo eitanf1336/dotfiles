@@ -27,6 +27,9 @@ the road) or between sets of chats:
   claude-session configs           list the saved configurations
   claude-session rm <name>         forget one
 
+  Ctrl+Alt+<1-9>                   load configuration <n>
+  Ctrl+Alt+Shift+<1-9>             save what is open now as configuration <n>
+
 A configuration saved on more screens than are plugged in still loads: the
 tiler puts a column meant for a missing monitor on the last one that exists.
 
@@ -751,6 +754,27 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
     cmd = args[0] if args else "list"
+    if cmd == "slot" and len(args) > 2:
+        # From the keyboard (Ctrl+Alt+<n> loads, Ctrl+Alt+Shift+<n> saves):
+        # there is no terminal to print to, so say it in a notification.
+        verb, n = args[1], args[2]
+        if verb == "save":
+            rc = save_config(n)
+            d = _read_config(n) or {}
+            _notify(f"Configuration {n}",
+                    "Nothing open, nothing saved" if rc else
+                    f"Saved {len(d.get('chats') or [])} chats")
+            return rc
+        d = _read_config(n)
+        if not d or not d.get("chats"):
+            _notify(f"Configuration {n}", "Empty. Ctrl+Alt+Shift+"
+                    f"{n} saves what is open now.")
+            return 1
+        ids = open_chat_ids()
+        todo = sum(1 for e in d["chats"] if not _is_open(e["chat"], ids))
+        _notify(f"Configuration {n}", f"Opening {todo} of {len(d['chats'])} chats"
+                if todo else "All of its chats are already open")
+        return load_config(n, close="--close" in flags)
     if cmd == "save" and len(args) > 1:
         return save_config(args[1])
     if cmd in ("load", "switch", "open") and len(args) > 1:
