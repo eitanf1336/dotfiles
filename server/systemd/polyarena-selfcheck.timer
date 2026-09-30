@@ -1,8 +1,8 @@
 [Unit]
-Description=PolyArena self-check every day at 06:30, after the 05:00 wakes start (Eitan, 30 Sep)
+Description=PolyArena self-check fallback at 12:00 (normally it runs right after the 05:00 wakes finish; skipped if it already ran today)
 
 [Timer]
-OnCalendar=*-*-* 06:30:00
+OnCalendar=*-*-* 12:00:00
 Persistent=true
 
 [Install]

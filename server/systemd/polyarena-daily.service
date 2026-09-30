@@ -1,6 +1,9 @@
 [Unit]
 Description=PolyArena daily wake of every bot (live first), survives the Claude limit, numbered inbox to WhatsApp
 After=polyarena.service
+# the self-check runs the moment the wakes are done, whatever their result (Eitan, 1 Oct: "after the wakes")
+OnSuccess=polyarena-selfcheck.service
+OnFailure=polyarena-selfcheck.service
 
 [Service]
 Type=simple

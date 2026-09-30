@@ -5,6 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# once a day: started after the wakes, and by the 12:00 fallback timer only if that did not happen
+ExecCondition=/bin/bash -c '! test -e %h/code/MyProjects/PolyArena/data/selfcheck/$(date +%%Y-%%m-%%d).md'
 WorkingDirectory=%h/code/MyProjects/PolyArena
 Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
