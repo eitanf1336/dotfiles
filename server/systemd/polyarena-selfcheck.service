@@ -1,5 +1,5 @@
 [Unit]
-Description=PolyArena daily self-check: coverage, feed, accounting, sim exchange, live wallet (read only), bots, wakes, services, tests; posts a verdict to the PolyArena group
+Description=PolyArena daily self-check: coverage, feed, accounting, sim exchange, live wallet (read only), bots, wakes, services, tests; runs a claude fix session for what is left, then posts one line to the PolyArena group
 After=polyarena.service network-online.target
 Wants=network-online.target
 
@@ -11,5 +11,6 @@ WorkingDirectory=%h/code/MyProjects/PolyArena
 Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/bin/bash -c 'exec /usr/bin/python3 %h/code/MyProjects/PolyArena/bin/arena-selfcheck >> %h/code/MyProjects/PolyArena/data/logs/selfcheck.log 2>&1'
-TimeoutStartSec=3600
+# about 6 min of checks plus up to 45 min of the automatic fix session (arena/selfcheck_fix.py)
+TimeoutStartSec=5400
 Nice=10
