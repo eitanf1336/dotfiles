@@ -8,22 +8,32 @@
 # matching the others, so the hardware-driven screens are listed in the
 # overlay's `no-dim-at` key and the overlay skips them.
 #
-# Usage: brightness {low|med|high|full|up|down|<10-100>|status}
+# Usage: brightness {low|med|high|full|up|down|<2-100>|status}
 
 SCHEMA="org.gnome.shell.extensions.displaylink-nightlight"
 export GSETTINGS_SCHEMA_DIR="$HOME/.local/share/gnome-shell/extensions/displaylink-nightlight@eitan.local/schemas"
 KEY="brightness"
-MIN=0.10
+MIN=0.02
 STEP=0.10
+FINE=0.02   # step size below 10%, where each step is a big change in light
 SCREEN_DARK="$HOME/.local/bin/screen-dark"
 
 usage() {
-    echo "Usage: brightness {low|med|high|full|up|down|<10-100>|status}"
+    echo "Usage: brightness {low|med|high|full|up|down|<2-100>|status}"
     exit 1
 }
 
 clamp() { awk -v v="$1" -v lo="$MIN" 'BEGIN{ if(v<lo)v=lo; if(v>1)v=1; printf "%.2f", v }'; }
 cur() { gsettings get "$SCHEMA" "$KEY"; }
+
+# A shell started before the floor dropped to 2% still holds the old schema
+# (min 0.1) and would read anything lower as out of range, falling back to the
+# default 1.0: full brightness. Keep the old floor until the next login.
+shell_pid=$(pgrep -xo gnome-shell)
+compiled="$GSETTINGS_SCHEMA_DIR/gschemas.compiled"
+if [ -n "$shell_pid" ] && [ "$(stat -c %Y "/proc/$shell_pid")" -lt "$(stat -c %Y "$compiled")" ]; then
+    MIN=0.10
+fi
 
 # Tell the overlay which monitors dim in hardware, so it leaves those alone.
 sync_exempt() {
@@ -53,8 +63,8 @@ case "${1,,}" in
     med|medium) set_val 0.55 ;;
     high)  set_val 0.80 ;;
     full|max) set_val 1.00 ;;
-    up)    set_val "$(awk -v c="$(cur)" -v s="$STEP" 'BEGIN{printf "%.2f", c+s}')" ;;
-    down)  set_val "$(awk -v c="$(cur)" -v s="$STEP" 'BEGIN{printf "%.2f", c-s}')" ;;
+    up)    set_val "$(awk -v c="$(cur)" -v s="$STEP" -v f="$FINE" 'BEGIN{ if(c<0.099) printf "%.2f", c+f; else printf "%.2f", c+s }')" ;;
+    down)  set_val "$(awk -v c="$(cur)" -v s="$STEP" -v f="$FINE" 'BEGIN{ if(c<0.101) printf "%.2f", c-f; else printf "%.2f", c-s }')" ;;
     status)
         echo "brightness: $(awk -v v="$(cur)" 'BEGIN{printf "%d%%", v*100}')"
         if [ -x "$SCREEN_DARK" ]; then

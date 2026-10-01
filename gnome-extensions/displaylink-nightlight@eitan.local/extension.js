@@ -224,8 +224,11 @@ export default class DisplayLinkNightLight extends Extension {
         // gamma-encoded pixel values, so 1 - brightness made the DisplayLink
         // screens far darker than the DDC one at the same number. Aim for the
         // same light, then undo the 2.2 gamma to get the pixel multiplier.
-        const light = 0.1 + 0.9 * Math.max(0, Math.min(1, brightness));
-        const dimAlpha = Math.max(0, Math.min(0.9, 1 - Math.pow(light, 1 / 2.2)));
+        // Below 10% there is no hardware screen left to match (DDC bottoms out
+        // there), so the curve just falls toward black for night use.
+        const b = Math.max(0, Math.min(1, brightness));
+        const light = b >= 0.1 ? 0.1 + 0.9 * b : 0.19 * Math.pow(b / 0.1, 2);
+        const dimAlpha = Math.max(0, Math.min(0.97, 1 - Math.pow(light, 1 / 2.2)));
 
         this._overlays.forEach(o => {
             // The warm tint still applies everywhere: no monitor can do that in
@@ -281,23 +284,23 @@ export default class DisplayLinkNightLight extends Extension {
         indicator.menu.addMenuItem(tintItem);
         this._slider = tintSlider;
 
-        // Brightness slider (0.1 .. 1.0).
+        // Brightness slider (0.02 .. 1.0).
         const dimItem = new PopupMenu.PopupBaseMenuItem({activate: false});
         dimItem.add_child(new St.Icon({
             icon_name: 'display-brightness-symbolic',
             style_class: 'popup-menu-icon',
         }));
-        const dimSlider = new Slider((this._settings.get_double('brightness') - 0.1) / 0.9);
+        const dimSlider = new Slider((this._settings.get_double('brightness') - 0.02) / 0.98);
         dimSlider.x_expand = true;
         dimSlider.connect('notify::value', () => {
             if (this._syncingDim)
                 return;
-            this._settings.set_double('brightness', 0.1 + dimSlider.value * 0.9);
+            this._settings.set_double('brightness', 0.02 + dimSlider.value * 0.98);
         });
         dimItem.add_child(dimSlider);
         indicator.menu.addMenuItem(dimItem);
         this._signalIds.push(this._settings.connect('changed::brightness', () => {
-            const v = (this._settings.get_double('brightness') - 0.1) / 0.9;
+            const v = (this._settings.get_double('brightness') - 0.02) / 0.98;
             if (Math.abs(v - dimSlider.value) > 0.001) {
                 this._syncingDim = true;
                 dimSlider.value = v;

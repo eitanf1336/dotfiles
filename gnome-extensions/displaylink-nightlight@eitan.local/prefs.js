@@ -40,9 +40,9 @@ export default class DisplayLinkNightLightPrefs extends ExtensionPreferences {
         // Brightness
         const brightnessRow = new Adw.SpinRow({
             title: 'Screen brightness',
-            subtitle: 'Software dim (1 = native, 0.1 = darkest). Cannot exceed the panel’s own max.',
+            subtitle: 'Software dim (1 = native, 0.02 = darkest). Cannot exceed the panel’s own max.',
             adjustment: new Gtk.Adjustment({
-                lower: 0.1,
+                lower: 0.02,
                 upper: 1,
                 step_increment: 0.05,
                 page_increment: 0.1,
