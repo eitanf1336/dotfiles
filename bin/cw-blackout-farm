@@ -1,10 +1,24 @@
 #!/bin/bash
 # Keeps the CuteWorld render farm running in every blackout he starts (takeover-job active):
 # if the laptop worker is not running and the queue has work, start it. Never starts a blackout.
+# Loud when a blackout would be wasted: an empty queue at blackout start, or a new failed task.
+was=0; fails=
 while true; do
-  if systemctl --user is-active --quiet takeover-job && ! systemctl --user is-active --quiet cuteworld-farm-laptop; then
-    n=$(farm status 2>/dev/null | awk '/^tasks:/{print $2}')
-    if [ "${n:-0}" -gt 0 ]; then farm laptop && echo "$(date '+%F %T') blackout: farm started ($n tasks)"; fi
+  if systemctl --user is-active --quiet takeover-job; then
+    st=$(farm status 2>/dev/null); n=$(awk '/^tasks:/{print $2}' <<< "$st"); f=$(awk '/^failed:/{print $2}' <<< "$st")
+    if [ $was = 0 ] && [ "${n:-0}" -eq 0 ]; then
+      notify-send -u critical "Blackout: render queue is EMPTY" "Nothing will render. Tell Kit to queue shots."
+      echo "$(date '+%F %T') blackout started with an empty queue"
+    fi
+    if [ -n "$fails" ] && [ "${f:-0}" -gt "$fails" ]; then
+      notify-send -u critical "Render farm: a chunk FAILED" "$((f - fails)) new failed task(s). Tell Kit."
+      echo "$(date '+%F %T') blackout: $((f - fails)) new failed task(s)"
+    fi
+    [ -n "$f" ] && fails=$f; was=1
+    if ! systemctl --user is-active --quiet cuteworld-farm-laptop && [ "${n:-0}" -gt 0 ]; then
+      farm laptop && echo "$(date '+%F %T') blackout: farm started ($n tasks)"
+    fi
+  else was=0; fails=
   fi
   sleep 60
 done
