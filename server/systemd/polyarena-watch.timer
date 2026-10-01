@@ -1,0 +1,9 @@
+[Unit]
+Description=PolyArena stage 3 wake triggers every 5 minutes (Eitan, 1 Oct: stage 3 for fable-01). Acts only on stage 3+ bots, only on their own rules.
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=false
+
+[Install]
+WantedBy=timers.target
