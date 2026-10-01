@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# claude-account-little / claude-account-grandpa / claude-account-servers
+#
+# One script, three names (the other two are symlinks to this file). Runs the
+# server's OWN `claude-account` over ssh, with every argument passed through:
+#
+#   claude-account-little              list little's logins + usage
+#   claude-account-little whoami       who little is signed in as
+#   claude-account-little use eitan    switch little's live login
+#   claude-account-little add dad      log in a new account ON little (interactive)
+#   claude-account-grandpa ...         same, on grandpa
+#   claude-account-servers ...         the same command on every server in turn
+#
+# Each server keeps its own slots in its own ~/.claude/accounts. Logins are never
+# copied between machines on purpose: refresh tokens rotate, so the same login
+# live on two machines means one of them gets logged out (the "one owner per
+# thing" rule in SERVER.md). To give a server an account, `add` it there.
+#
+# Hosts are ssh aliases: little = `little` (same entry as `server`),
+# grandpa = `grandpa`. A host with no ssh entry yet is reported as "not set up"
+# with the steps in ~/code/linux-setup/server/CLAUDE-ACCOUNTS.md.
+
+set -u
+NOTES="$HOME/code/linux-setup/server/CLAUDE-ACCOUNTS.md"
+SERVERS=(little grandpa)
+
+if [ -t 1 ]; then B=$'\033[1m'; C=$'\033[36m'; Y=$'\033[33m'; R=$'\033[31m'; X=$'\033[0m'
+else B=; C=; Y=; R=; X=; fi
+
+configured() {
+    # An alias with no ssh entry resolves to itself as the hostname.
+    local hn
+    hn=$(ssh -G "$1" 2>/dev/null | awk '$1=="hostname"{print $2; exit}')
+    [ -n "$hn" ] && [ "$hn" != "$1" ]
+}
+
+run_on() {
+    local host=$1; shift
+    if ! configured "$host"; then
+        echo "${Y}$host is not set up yet${X} (no ssh alias '$host'). Steps: $NOTES"
+        return 3
+    fi
+    local tty=()
+    [ -t 0 ] && [ -t 1 ] && tty=(-t)
+    # printf %q keeps quoting intact through the remote shell.
+    local cmd="PATH=\$HOME/.local/bin:\$HOME/bin:\$PATH claude-account"
+    [ $# -gt 0 ] && cmd+=" $(printf '%q ' "$@")"
+    ssh "${tty[@]}" -o ConnectTimeout=8 "$host" "$cmd"
+    local rc=$?
+    [ $rc -eq 255 ] && echo "${R}could not reach $host${X} (ssh failed)" >&2
+    return $rc
+}
+
+case "$(basename "$0")" in
+    claude-account-little)  run_on little "$@" ;;
+    claude-account-grandpa) run_on grandpa "$@" ;;
+    *)
+        if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+            sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0
+        fi
+        case "${1:-}" in add|login)
+            echo "${R}'add' logs in interactively; do it per server:${X} claude-account-little add <name>" >&2
+            exit 2 ;;
+        esac
+        worst=0
+        for h in "${SERVERS[@]}"; do
+            echo "${B}${C}== $h ==${X}"
+            run_on "$h" "$@"; rc=$?
+            # "not set up" is expected for grandpa today; don't fail the batch on it.
+            [ $rc -ne 0 ] && [ $rc -ne 3 ] && worst=$rc
+            echo
+        done
+        exit $worst ;;
+esac
