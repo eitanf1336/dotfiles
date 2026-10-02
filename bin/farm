@@ -19,7 +19,7 @@ set -uo pipefail
 CWD=$HOME/code/MyProjects/CuteWorld
 CHUNK=${CHUNK:-48}   # 48 since 27 Sep: half the scene rebuilds
 if [ "$(hostname)" = eitan-vivobook-server ]; then RUN() { bash -c "$1"; }
-else RUN() { ssh -o BatchMode=yes -o ConnectTimeout=10 server "$1"; }; fi
+else RUN() { ssh -o ControlMaster=no -o ControlPath=none -o BatchMode=yes -o ConnectTimeout=10 server "$1"; }; fi
 RUN 'mkdir -p ~/cwfarm/{tasks,claimed,done,failed,logs}; [ -s ~/cwfarm/mode ] || echo night > ~/cwfarm/mode' || { echo "server unreachable" >&2; exit 1; }
 
 cmd=${1:-status}; shift || true
