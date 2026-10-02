@@ -40,7 +40,8 @@ case "$cmd" in
     [ $# -ge 2 ] || { echo "farm queue [--night] [--hd] <ep> <shot|all> [a b]" >&2; exit 2; }
     ep=$1; want=$2; ra=${3:-}; rb=${4:-}
     cd "$CWD" || exit 1
-    rsync -a --exclude=out/ --exclude=__pycache__/ --exclude=.git/ --exclude=tools/voice/ --exclude=tools/tts/ --exclude=tools/recorder/ ./ server:code/MyProjects/CuteWorld/ || { echo "code push failed" >&2; exit 1; }
+    # 2 Oct: the server no longer renders (grandpa + laptop only, and grandpa pushes its own code), so no code push
+    if [ "${FARM_PUSH_SERVER:-0}" = 1 ]; then rsync -a --exclude=out/ --exclude=__pycache__/ --exclude=.git/ --exclude=tools/voice/ --exclude=tools/tts/ --exclude=tools/recorder/ ./ server:code/MyProjects/CuteWorld/ || { echo "code push failed" >&2; exit 1; }; fi
     # a new batch when nothing is pending: the old done list is archived so progress counts this batch
     RUN 'cd ~/cwfarm; [ -z "$(ls tasks claimed)" ] && [ -n "$(ls done)" ] && mkdir -p archive && mv done/* archive/ ; true'
     seq=$(RUN 'cd ~/cwfarm; ls tasks claimed done failed archive 2>/dev/null | grep -oE "^[0-9]+" | sort -n | tail -1'); seq=$((10#${seq:-0}))
