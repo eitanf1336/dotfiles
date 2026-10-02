@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Grandpa's backlight follows the shared blank state of the two screens.
+
+Little's ServerScreen (/api/sync, reached through grandpa-screen-tunnel) holds one blank flag for
+both screens; b on either keyboard flips it. Little's server dims little's own backlight; this
+dims grandpa's. Awake = 30% of max. Runs as root (grandpa-screen-backlight.service).
+"""
+import json, os, time, urllib.request
+
+BL = '/sys/class/backlight/intel_backlight'
+LEVEL = 0.30
+URL = 'http://127.0.0.1:7800/api/sync'
+
+
+def write(v):
+    try:
+        with open(os.path.join(BL, 'brightness'), 'w') as f:
+            f.write(str(v))
+    except OSError as e:
+        print(f'cannot set backlight: {e}', flush=True)
+
+
+mx = int(open(os.path.join(BL, 'max_brightness')).read())
+awake = max(1, round(mx * LEVEL))
+write(awake)                     # a modest 30% from boot, even before the tunnel is up
+last = False
+while True:
+    try:
+        with urllib.request.urlopen(URL, timeout=3) as r:
+            blank = bool(json.load(r).get('blank'))
+    except Exception:  # noqa: BLE001  (tunnel down or little restarting: keep the screen as it is)
+        blank = last
+    if blank != last:
+        write(0 if blank else awake)
+        print('blank' if blank else 'wake', flush=True)
+        last = blank
+    time.sleep(0.5)

@@ -1,0 +1,8 @@
+[ -f ~/.profile ] && . ~/.profile
+# Grandpa's own screen: autologin on tty1 shows little's ServerScreen, half a cycle out of phase.
+# Ctrl+Alt+F2 = a normal console. Off switch: touch ~/.config/server-kiosk-off
+if [ "$(tty)" = /dev/tty1 ] && [ -z "$WAYLAND_DISPLAY" ] && [ ! -f ~/.config/server-kiosk-off ]; then
+  ~/bin/server-kiosk
+  sleep 3
+  logout
+fi

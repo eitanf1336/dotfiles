@@ -1,0 +1,15 @@
+[Unit]
+Description=Grandpa's screen backlight follows the shared blank state (b on either screen)
+After=grandpa-screen-tunnel.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/eitan/bin/screen-backlight-follow
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+Nice=10
+MemoryMax=60M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+#!/bin/bash
+# Grandpa's own display shows little's ServerScreen, half a cycle out of phase (?role=grandpa).
+# The page comes through grandpa-screen-tunnel.service (127.0.0.1:7800 here = little's 127.0.0.1:7800).
+# tty1 autologin runs this from ~/.bash_profile. Off switch: touch ~/.config/server-kiosk-off
+# Backlight (30%, and b on either keyboard) is grandpa-screen-backlight.service, not this script.
+# card1 is the Intel iGPU that drives the panel; card0 is the GTX 950M.
+export WLR_DRM_DEVICES=/dev/dri/card1
+until curl -s -m 2 http://127.0.0.1:7800/api/health >/dev/null; do sleep 2; done
+exec cage -d -- chromium --kiosk --ozone-platform=wayland --noerrdialogs --disable-infobars \
+  --no-first-run --password-store=basic --disable-features=Translate,TranslateUI \
+  --disable-session-crashed-bubble --check-for-update-interval=31536000 \
+  --app='http://127.0.0.1:7800/?role=grandpa'
