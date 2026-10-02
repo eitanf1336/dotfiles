@@ -1,0 +1,10 @@
+[Unit]
+Description=FocusRace store watch: App Store and Play state changes to WhatsApp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/code/MyProjects/FocusRace/scripts/store-watch.py
+TimeoutStartSec=300
