@@ -1,0 +1,8 @@
+[Unit]
+Description=Minecraft Arena: WhatsApp Eitan when the bots reach a new ladder rung
+After=network-online.target server-screen.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/code/MyProjects/MinecraftArena/bin/ladder-alarm
