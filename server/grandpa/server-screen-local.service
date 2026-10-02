@@ -1,0 +1,15 @@
+[Unit]
+Description=ServerScreen local panel: grandpa's own CPU, memory and services for its screen (:7801)
+
+[Service]
+ExecStart=/usr/bin/python3 %h/code/MyProjects/ServerScreen/server.py
+Environment=SCREEN_MODE=local
+Environment=SCREEN_PORT=7801
+Environment=SCREEN_SYSTEM_UNITS=^(grandpa-(pack|stallguard)|wifi-watchdog|tailscaled)
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target
