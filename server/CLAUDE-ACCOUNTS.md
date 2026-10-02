@@ -17,7 +17,7 @@ Every argument passes straight through, so it is the normal tool:
 login live on two machines logs one of them out. To give a server an account,
 run `claude-account-<server> add <name>` and log in there.
 
-## Activating grandpa (not set up yet)
+## Activating grandpa (done 2 Oct 2026 except the login: step 2 Tailscale and step 5 wait on Eitan; the alias uses home WiFi for now)
 
 Until these are done `claude-account-grandpa` just prints "not set up yet" and
 `claude-account-servers` skips it.

@@ -112,6 +112,20 @@ Keys on the server's keyboard: `b` sleep/wake (backlight), `←` `→` previous/
 Ctrl+Alt+F2 gives a normal console. Disable the kiosk with
 `touch ~/.config/server-kiosk-off` on the server.
 
+## grandpa (the second server)
+
+Late grandpa Chaim's ThinkPad E570 (GTX 950M), Ubuntu 26.04 on its NVMe since 2 Oct 2026.
+- Reach it: `ssh grandpa` (laptop `~/.ssh/config`: user eitan, key `~/.ssh/id_ed25519_fleet`, NOPASSWD sudo,
+  `HostKeyAlias grandpa`). Today that is home WiFi `192.168.68.69` (DHCP, may move: find it with
+  `nmap -p22 --open 192.168.68.0/22` and `ssh -i ~/.ssh/id_ed25519_fleet eitan@<ip> hostname`).
+  Tailscale is installed but logged out; after `sudo tailscale up --hostname grandpa` switch HostName to its 100.x IP.
+- Claude: `claude-account-grandpa [list|whoami|use|add <name>]` (`~/.local/bin/claude` + claude-account there).
+- Runs: the backup of its 1 TB disk to Drive (system units `grandpa-pack`, `grandpa-stallguard`, logs in
+  `~/grandpa/logs/main.log`). The 1 TB WD disk (`/dev/sda`, serial WD-WXM1A5731ZTT) holds his files: kernel
+  read-only (`hdd-readonly.service`) and mounted ro at /mnt/data. NEVER write to it or wipe it.
+- Screen: little's ServerScreen half a cycle ahead (`?role=grandpa`, tunnel `grandpa-screen-tunnel`), with its own
+  SERVER panel and Running now list from a local `server-screen-local` (:7801). Files: `server/grandpa/`.
+
 ## Plans, history, rollbacks
 
 `~/fleet-staging/SERVER-PLAN.md` (the plan), `~/fleet-staging/PROGRESS.md` (what moved, with rollbacks),
