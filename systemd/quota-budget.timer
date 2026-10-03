@@ -1,0 +1,11 @@
+[Unit]
+Description=Update per-project Claude quota budgets every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=quota-budget.service
+
+[Install]
+WantedBy=timers.target

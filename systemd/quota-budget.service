@@ -1,0 +1,7 @@
+[Unit]
+Description=Attribute Claude quota to projects and enforce per-project budgets
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/quota-budget tick
+Nice=10

@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""quota-budget - give a project a hard slice of the weekly Claude quota.
+
+The weekly limit is one number per account, so nothing upstream knows which
+project spent what. This tool works it out from the transcripts:
+
+  * every assistant turn in ~/.claude/projects/**/*.jsonl carries its token
+    usage, model and cwd. Each turn is priced at API rates (a proxy for how
+    hard it hits the quota) and filed under its cwd and the account that was
+    live when it was seen. Subagents and headless `claude -p` runs write
+    transcripts too, so they count, as long as their cwd is inside the project.
+  * every time the account's real weekly % (claude-limits) goes up, that step
+    is split across the cwds that spent since the previous step, by cost. So
+    parallel Claudes in other projects do not leak into this one's number:
+    they take their own share of each step. Spend that has not produced a step
+    yet is priced with the learned %-per-$ rate, so a project is stopped
+    before the next whole percent shows up.
+  * a PreToolUse hook blocks every tool call in a session whose cwd is inside a
+    project that is over budget, a UserPromptSubmit hook tells the session its
+    budget, and a PostToolUse hook warns at 80/90/95%.
+
+  quota-budget set <name> <pct> [--path DIR]   budget a project (DIR defaults to cwd)
+  quota-budget rm <name>
+  quota-budget status [name] [--json]          used vs budget (exit 3 if name is over)
+  quota-budget top                             spend by cwd this window, budgeted or not
+  quota-budget brief <name>                    text to paste into a manager's prompt
+  quota-budget tick                            scan new transcript lines (timer, every 60s)
+  quota-budget hook                            Claude Code hook entry point (stdin JSON)
+
+Numbers are estimates: they assume quota burns like API price across models,
+and any use of the account not on this laptop (claude.ai, the server) gets
+blamed on the projects that ran here. Both errors make a project look MORE
+expensive, never less, which is the safe side for a budget.
+"""
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+HOME = os.path.expanduser("~")
+CONF_DIR = os.path.join(HOME, ".config", "quota-budget")
+BUDGETS = os.path.join(CONF_DIR, "budgets.json")
+STATE_DIR = os.path.join(HOME, ".claude", "quota-budget")
+LEDGER = os.path.join(STATE_DIR, "ledger.json")
+SEEN = os.path.join(STATE_DIR, "seen.json")
+STATUS = os.path.join(STATE_DIR, "status.json")
+WARNED = os.path.join(STATE_DIR, "warned")
+ACTIVE = os.path.join(HOME, ".claude", "accounts", "active")
+PROJECT_ROOTS = [os.path.join(HOME, ".claude", "projects"),
+                 os.path.join(HOME, ".claude-deed", "projects")]
+WARN_BANDS = (80, 90, 95)
+STALE_AFTER = 600   # status older than this is reported as stale, never trusted to block
+
+# $ per million tokens: input, output, cache read. Cache writes are priced from
+# input (5m = 1.25x, 1h = 2x). Only the ratios matter, the account's real % does
+# the scaling.
+PRICES = {
+    "fable": (10.0, 50.0, 0.25),
+    "mythos": (10.0, 50.0, 0.25),
+    "opus-5-5": (4.0, 20.0, 0.20),
+    "opus": (5.0, 25.0, 0.50),
+    "sonnet": (2.0, 10.0, 0.20),
+    "haiku": (1.0, 5.0, 0.10),
+}
+
+
+def price_of(model):
+    m = (model or "").lower()
+    for key in ("fable", "mythos", "opus-5-5", "opus", "sonnet", "haiku"):
+        if key in m:
+            return PRICES[key]
+    return None   # <synthetic> and friends cost nothing
+
+
+def cost_of(model, u):
+    p = price_of(model)
+    if not p or not isinstance(u, dict):
+        return 0.0
+    pin, pout, pread = p
+    cc = u.get("cache_creation") or {}
+    w1h = cc.get("ephemeral_1h_input_tokens")
+    w5m = cc.get("ephemeral_5m_input_tokens")
+    if w1h is None and w5m is None:
+        w5m, w1h = u.get("cache_creation_input_tokens") or 0, 0
+    tokens = ((u.get("input_tokens") or 0) * pin
+              + (w5m or 0) * pin * 1.25 + (w1h or 0) * pin * 2.0
+              + (u.get("cache_read_input_tokens") or 0) * pread
+              + (u.get("output_tokens") or 0) * pout)
+    return tokens / 1e6
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def active_account():
+    try:
+        return open(ACTIVE).read().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def weekly_reading():
+    """(utilization %, window key, window start epoch) or None."""
+    try:
+        out = subprocess.run(["claude-limits", "--json"], capture_output=True,
+                             text=True, timeout=60).stdout
+        d = json.loads(out)
+        w = d["seven_day"]
+        util = float(w["utilization"])
+        reset = datetime.fromisoformat(w["resets_at"])
+    except Exception:
+        return None
+    # resets_at jitters by microseconds between reads, the hour is the identity
+    key = reset.replace(minute=0, second=0, microsecond=0).isoformat()
+    start = (reset - timedelta(days=7)).timestamp()
+    return util, key, start
+
+
+def parse_ts(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+# ---------------------------------------------------------------- tick
+#
+# Attribution is by deltas, so resets and account switches cannot smear it:
+# new spend piles up as "pending" $ per cwd on the live account; when that
+# account's weekly % rises by D, D is split across the pending pile by cost and
+# the pile is cleared. k (% per $) is learned from those steps and prices the
+# pile that has not been converted yet, so a project is stopped before the
+# next whole-percent step shows up, not after.
+
+def new_account(key, util):
+    return {"window": key, "util": util, "assigned": {}, "pending": {},
+            "k": None}
+
+
+def tick():
+    ledger = load(LEDGER, {"files": {}, "accounts": {}, "last_scan": 0})
+    seen = load(SEEN, {})
+    acct = active_account()
+    reading = weekly_reading()
+    accts = ledger["accounts"]
+    first_run = not ledger["files"]
+    now = time.time()
+    if first_run and not reading:
+        print("quota-budget: no usage reading, try again", file=sys.stderr)
+        return 1
+    a = accts.get(acct)
+    if not a:
+        util, key, _ = reading or (0.0, "?", 0)
+        a = accts[acct] = new_account(key, util)
+    # first run: count this window's history; afterwards only fresh lines
+    floor = reading[2] if first_run else now - 86400
+
+    files = []
+    for root in PROJECT_ROOTS:
+        files += glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)
+    since = ledger["last_scan"] - 120
+    for path in files:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        fs = ledger["files"].get(path)
+        if fs is None:
+            if st.st_mtime < floor or (not first_run and st.st_mtime < since):
+                ledger["files"][path] = {"off": st.st_size}
+                continue
+            fs = ledger["files"][path] = {"off": 0}
+        if st.st_size < fs["off"]:
+            fs["off"] = 0          # rewritten
+        if st.st_size == fs["off"]:
+            continue
+        with open(path, "rb") as f:
+            f.seek(fs["off"])
+            data = f.read()
+        end = data.rfind(b"\n") + 1   # never consume a half-written line
+        fs["off"] += end
+        for raw in data[:end].splitlines():
+            if b'"usage"' not in raw or b'"assistant"' not in raw:
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            if d.get("cwd"):
+                fs["cwd"] = d["cwd"]
+            msg = d.get("message") or {}
+            # one request is logged once per content block, and resumed or
+            # forked sessions copy old turns into a new file: count each once
+            rid = d.get("requestId") or msg.get("id")
+            if not rid or rid in seen:
+                continue
+            ts = parse_ts(d.get("timestamp", ""))
+            seen[rid] = ts
+            if ts < floor:
+                continue
+            c = cost_of(msg.get("model"), msg.get("usage"))
+            if c > 0:
+                cwd = d.get("cwd") or fs.get("cwd") or "?"
+                a["pending"][cwd] = a["pending"].get(cwd, 0.0) + c
+
+    if reading:
+        util, key, _ = reading
+        if key != a["window"] or util < a["util"] - 0.5:
+            # new week for this account: spend that never showed up as a step
+            # belongs to the week that just ended
+            a["window"], a["assigned"], a["pending"] = key, {}, {}
+            a["util"] = 0.0
+        if first_run:
+            a["util"] = 0.0      # convert the whole window's history below
+        step = util - a["util"]
+        if step > 0:
+            pend = sum(a["pending"].values())
+            if pend > 0:
+                for cwd, c in a["pending"].items():
+                    a["assigned"][cwd] = a["assigned"].get(cwd, 0.0) + step * c / pend
+                if pend >= 1.0:
+                    k = step / pend
+                    a["k"] = k if a["k"] is None else 0.7 * a["k"] + 0.3 * k
+                a["pending"] = {}
+            else:
+                a["assigned"]["(not on this laptop)"] = \
+                    a["assigned"].get("(not on this laptop)", 0.0) + step
+            a["util"] = util
+        if first_run:
+            a["pending"] = {}    # history the current % does not cover
+        a["read_at"] = now
+    seen = {k: v for k, v in seen.items() if v >= now - 8 * 86400}
+    ledger["last_scan"] = now
+    save(LEDGER, ledger)
+    save(SEEN, seen)
+    save(STATUS, compute_status(ledger))
+    return 0
+
+
+# ---------------------------------------------------------------- math
+
+def inside(cwd, root):
+    root = root.rstrip("/")
+    return cwd == root or cwd.startswith(root + "/")
+
+
+def usage_by_cwd(ledger):
+    """{cwd: (weekly %, $ not yet converted)} summed over accounts."""
+    agg = {}
+    for a in ledger["accounts"].values():
+        k = a.get("k") or 0.0
+        for cwd in set(a["assigned"]) | set(a["pending"]):
+            pend = a["pending"].get(cwd, 0.0)
+            u, p = agg.get(cwd, (0.0, 0.0))
+            agg[cwd] = (u + a["assigned"].get(cwd, 0.0) + pend * k, p + pend)
+    return agg
+
+
+def compute_status(ledger):
+    budgets = load(BUDGETS, {})
+    agg = usage_by_cwd(ledger)
+    out = {"at": time.time(), "projects": {}, "accounts": {}}
+    for name, a in ledger["accounts"].items():
+        out["accounts"][name] = {"util": a["util"], "window": a["window"],
+                                 "k": a.get("k")}
+    for pname, b in budgets.items():
+        used = sum(u for cwd, (u, _) in agg.items() if inside(cwd, b["path"]))
+        limit = float(b["weekly_pct"])
+        out["projects"][pname] = {
+            "path": b["path"], "limit": limit, "used": round(used, 3),
+            "over": used >= limit, "left": round(max(0.0, limit - used), 3)}
+    return out
+
+
+def fresh_status():
+    st = load(STATUS, None)
+    if not st:
+        return None
+    st["stale"] = time.time() - st.get("at", 0) > STALE_AFTER
+    return st
+
+
+def project_for(cwd, st):
+    """The most specific budgeted project containing cwd."""
+    best = None
+    for name, p in (st or {}).get("projects", {}).items():
+        if inside(cwd or "", p["path"]):
+            if not best or len(p["path"]) > len(st["projects"][best]["path"]):
+                best = name
+    return best
+
+
+# ---------------------------------------------------------------- hook
+
+def hook():
+    try:
+        inp = json.load(sys.stdin)
+    except ValueError:
+        return 0
+    st = fresh_status()
+    name = project_for(inp.get("cwd"), st)
+    if not name:
+        return 0
+    p = st["projects"][name]
+    event = inp.get("hook_event_name")
+    line = (f"Quota budget for project '{name}': {p['used']:.2f}% of "
+            f"{p['limit']:g}% weekly used ({p['left']:.2f}% left)"
+            + (" [reading is stale]" if st["stale"] else "") + ".")
+
+    if event == "PreToolUse":
+        if p["over"] and not st["stale"]:
+            print(f"BLOCKED: project '{name}' has used its whole quota budget "
+                  f"({p['used']:.2f}% of {p['limit']:g}% weekly). Stop working: "
+                  "write a short handoff of where things stand in your final "
+                  "message and end the turn. Only Eitan can raise the budget "
+                  f"(quota-budget set {name} <pct>).", file=sys.stderr)
+            return 2
+        return 0
+
+    if event == "UserPromptSubmit" or event == "SessionStart":
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": event,
+            "additionalContext": line + " Check anytime with "
+            f"`quota-budget status {name}`. When it runs out every tool call is blocked."}}))
+        return 0
+
+    if event == "PostToolUse":
+        band = max([b for b in WARN_BANDS if p["used"] >= p["limit"] * b / 100], default=0)
+        if not band:
+            return 0
+        sid = inp.get("session_id", "x")
+        mark = os.path.join(WARNED, f"{name}.{sid}")
+        try:
+            prev = int(open(mark).read())
+        except (OSError, ValueError):
+            prev = 0
+        if band <= prev:
+            return 0
+        os.makedirs(WARNED, exist_ok=True)
+        with open(mark, "w") as f:
+            f.write(str(band))
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": f"WARNING: {band}% of the budget is gone. " + line
+            + " Wrap up or cut scope now; at 100% every tool call is blocked."}}))
+    return 0
+
+
+# ---------------------------------------------------------------- cli
+
+def fmt_status(st, only=None):
+    rows = []
+    if st.get("stale"):
+        rows.append(f"(reading is {int(time.time() - st['at'])}s old: is quota-budget.timer running?)")
+    for name, p in sorted(st["projects"].items()):
+        if only and name != only:
+            continue
+        frac = p["used"] / p["limit"] if p["limit"] else 1
+        bar = "#" * min(20, int(frac * 20)) + "." * max(0, 20 - int(frac * 20))
+        tag = "OVER" if p["over"] else f"{p['left']:.2f}% left"
+        rows.append(f"{name:<18} [{bar}] {p['used']:6.2f}% / {p['limit']:g}%  {tag}   {p['path']}")
+    for name, a in st["accounts"].items():
+        k = f", ~{a['k'] * 10:.2f}% per $10 of API-priced use" if a.get("k") else ", rate not learned yet"
+        rows.append(f"  account {name}: weekly {a['util']:g}%{k}, window resets {a['window'][:16]}")
+    return "\n".join(rows) or "no budgets set (quota-budget set <name> <pct>)"
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    args = argv[2:]
+    if cmd == "tick":
+        return tick()
+    if cmd == "hook":
+        return hook()
+    if cmd == "set":
+        if len(args) < 2:
+            print("usage: quota-budget set <name> <pct> [--path DIR]")
+            return 1
+        path = os.getcwd()
+        if "--path" in args:
+            path = args[args.index("--path") + 1]
+        budgets = load(BUDGETS, {})
+        budgets[args[0]] = {"path": os.path.realpath(os.path.expanduser(path)),
+                            "weekly_pct": float(args[1])}
+        save(BUDGETS, budgets)
+        ledger = load(LEDGER, None)
+        if ledger:
+            save(STATUS, compute_status(ledger))
+        print(f"{args[0]}: {float(args[1]):g}% weekly for {budgets[args[0]]['path']}")
+        return 0
+    if cmd == "rm":
+        budgets = load(BUDGETS, {})
+        budgets.pop(args[0] if args else "", None)
+        save(BUDGETS, budgets)
+        ledger = load(LEDGER, None)
+        if ledger:
+            save(STATUS, compute_status(ledger))
+        return 0
+    st = fresh_status()
+    if not st:
+        print("no data yet: run `quota-budget tick` (first run scans this week's transcripts)")
+        return 1
+    if cmd == "status":
+        only = next((a for a in args if not a.startswith("-")), None)
+        if "--json" in args:
+            print(json.dumps(st["projects"].get(only) if only else st, indent=1))
+        else:
+            print(fmt_status(st, only))
+        return 3 if only and st["projects"].get(only, {}).get("over") else 0
+    if cmd == "top":
+        agg = usage_by_cwd(load(LEDGER, {"accounts": {}}))
+        for cwd, (u, p) in sorted(agg.items(), key=lambda x: -x[1][0])[:25]:
+            print(f"{u:6.2f}%  (${p:7.2f} pending)  {cwd}")
+        return 0
+    if cmd == "brief":
+        name = args[0] if args else None
+        p = st["projects"].get(name)
+        if not p:
+            print(f"no budget named {name!r}")
+            return 1
+        print(f"""You manage project '{name}' ({p['path']}) on a hard quota budget of {p['limit']:g}% of the weekly Claude limit. {p['used']:.2f}% is already spent this week.
+- Everything run with its cwd inside {p['path']} counts: you, your subagents, any `claude -p` you launch. Run all of it from inside that directory.
+- Check what is left with `quota-budget status {name}` before every expensive step (a big agent, a long loop). It updates every minute.
+- Spend like it is money: Sonnet/Haiku for mechanical work, short briefs, no fan-outs, no polling.
+- At 80/90/95% you get a warning. At 100% every tool call in the project is blocked by a hook and you cannot get around it, so leave a handoff note before you get there.""")
+        return 0
+    print(__doc__)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
