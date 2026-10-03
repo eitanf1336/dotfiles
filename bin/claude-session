@@ -172,7 +172,10 @@ def open_chat_ids():
     for b in open_boards():
         if b["chat"]:
             ids.add(b["chat"]["id"])
-        if b["opening"]:
+        elif b["opening"]:
+            # Only while it is still starting: once a board shows a chat, the
+            # `--open` id in its argv is history (you may have switched it to
+            # another chat since), and counting it made loads skip that chat.
             ids.add(b["opening"])
     return ids
 
