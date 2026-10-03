@@ -82,6 +82,8 @@ export default class TerminalTilerExtension extends Extension {
         this._layerNo = new Map();
         // monitors waiting for a freshly-spawned terminal window to appear.
         this._pending = [];
+        // Windows just moved to their spawn screen; see _onWindowCreated.
+        this._settling = new Set();
         // Re-entrancy guard while we propagate minimize/restore across a batch.
         this._syncing = false;
         // Window currently being moved/resized by the user (between grab-op
@@ -295,6 +297,7 @@ export default class TerminalTilerExtension extends Extension {
         this._stash = null;
         this._layerNo = null;
         this._pending = null;
+        this._settling = null;
         this._settings = null;
         this._grabWin = null;
         this._maxed = null;
@@ -732,8 +735,26 @@ export default class TerminalTilerExtension extends Extension {
             // so it really lives on the monitor whose column it is taking.
             // Otherwise _tile sees a stray and hands it to the other screen.
             if (monitor < Main.layoutManager.monitors.length &&
-                win.get_monitor() !== monitor)
+                win.get_monitor() !== monitor) {
                 win.move_to_monitor(monitor);
+                // move_to_monitor alone does not always stick on a freshly
+                // mapped window: it kept reporting the screen it opened on,
+                // _tile took it for a stray, and _regroup piled every restored
+                // chat onto that one screen (2026-10-04). Put it inside the
+                // target screen outright, and keep the stray check off it
+                // until it has settled there.
+                const wa = this._workArea(monitor);
+                const r = win.get_frame_rect();
+                win.move_resize_frame(false, wa.x, wa.y,
+                    Math.min(r.width, wa.width), Math.min(r.height, wa.height));
+                this._settling.add(win);
+                GLib.timeout_add(GLib.PRIORITY_DEFAULT, 3000, () => {
+                    this._settling?.delete(win);
+                    if (this._batches && this._isAlive(win))
+                        this._tile(this._monitorOf(win) ?? monitor);
+                    return GLib.SOURCE_REMOVE;
+                });
+            }
             this._add(monitor, win);
             this._tile(monitor);
         };
@@ -1057,6 +1078,8 @@ export default class TerminalTilerExtension extends Extension {
         if (!this._regrouping) {
             const nMon = Main.layoutManager.monitors.length;
             const strayed = arr.some(w => {
+                if (this._settling.has(w))
+                    return false;
                 const m = w.get_monitor();
                 return m >= 0 && m < nMon && m !== monitor;
             });
@@ -1266,7 +1289,8 @@ export default class TerminalTilerExtension extends Extension {
                     win.disconnectObject(this);
                     continue;
                 }
-                let m = win.get_monitor();
+                // One we just placed keeps the screen it was spawned for.
+                let m = this._settling.has(win) ? key : win.get_monitor();
                 // Off every screen for a moment (mid-unmap, or the monitor it
                 // was on has just left): keep it in the group rather than lose
                 // it, on the nearest still-existing screen. Tiling it there

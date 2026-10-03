@@ -86,6 +86,7 @@ BUS = ("--session", "--dest", "org.gnome.Shell",
 TILER_WAIT = 30      # seconds to wait at login for the extension to answer
 UP_WAIT = 45         # seconds for a spawned chat to show up before retrying
 RETRY_WAIT = 30      # and again after the retry
+SCREEN_WAIT = 20     # seconds to wait at login for the dock's screens
 
 
 # ---------------------------------------------------------------- inspection
@@ -527,22 +528,64 @@ def _launch(chats, tiler_up):
     return n_tiled
 
 
+def _attached_ids():
+    """Chats a board is really showing (claude attached/resumed below it), not
+    just a board started with `--open`. Counting `--open` as success made every
+    restore log "5/5" the instant the terminals launched (2026-10-04)."""
+    return {b["chat"]["id"] for b in open_boards() if b["chat"]}
+
+
 def _wait_up(chats, limit):
-    """Which of `chats` came up (a board opening or showing that chat) within
-    `limit` seconds. A chat counts as up once seen, even if it is closed again
-    before the time is over, so a chat you close straight away is not retried."""
+    """Which of `chats` came up (a board showing that chat) within `limit`
+    seconds. A chat counts as up once seen, even if it is closed again before
+    the time is over, so a chat you close straight away is not retried. One
+    whose board is still alive and starting is not retried either (that would
+    open a second terminal on it); it is returned as missing only if its board
+    is gone too."""
     pending = {e["chat"]: e for e in chats}
     up = []
     deadline = time.time() + limit
     while pending:
-        ids = open_chat_ids()
+        ids = _attached_ids()
         for cid in list(pending):
             if _is_open(cid, ids):
                 up.append(pending.pop(cid))
         if not pending or time.time() >= deadline:
             break
         time.sleep(2)
-    return up, list(pending.values())
+    opening = {b["opening"] for b in open_boards() if b["opening"]}
+    starting = [e for e in pending.values() if _is_open(e["chat"], opening)]
+    missing = [e for e in pending.values() if e not in starting]
+    if starting:
+        _log("still starting (board up, chat not attached yet): "
+             + " ".join(e["chat"] for e in starting))
+    return up, missing
+
+
+def _n_screens():
+    try:
+        out = subprocess.run(["xrandr", "--listmonitors"], capture_output=True,
+                             text=True, timeout=3).stdout
+        return int(out.split()[1])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+
+def wait_for_screens(chats, limit=SCREEN_WAIT):
+    """At login the dock's DisplayLink screens come up after the shell does.
+    Spawning before they exist clamps every chat onto the screens that do, so
+    wait (bounded) until there are as many screens as the save used."""
+    need = max((e["monitor"] for e in chats if e["monitor"] is not None),
+               default=-1) + 1
+    deadline = time.time() + limit
+    while True:
+        n = _n_screens()
+        if n is None or n >= need:
+            return
+        if time.time() >= deadline:
+            _log(f"only {n} of {need} screens up; placing on what there is")
+            return
+        time.sleep(1)
 
 
 def restore(data=None):
@@ -562,6 +605,7 @@ def restore(data=None):
 
     layout = wait_for_tiler()
     tiler_up = layout is not None
+    wait_for_screens(chats)
     if not tiler_up:
         _log("Terminal Tiler not answering; restoring untiled")
     _spread_unplaced(chats, layout)
