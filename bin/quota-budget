@@ -54,6 +54,15 @@ ACTIVE = os.path.join(HOME, ".claude", "accounts", "active")
 PROJECT_ROOTS = [os.path.join(HOME, ".claude", "projects"),
                  os.path.join(HOME, ".claude-deed", "projects")]
 WARN_BANDS = (80, 90, 95)
+# Eitan's rule for every budgeted Claude: the budget is information, not a
+# licence to cut corners. Shown in the brief and on every prompt.
+RULES = ("Rules for this budget: (1) before real work, and whenever the plan "
+         "changes, check `quota-budget status {name}` and tell Eitan plainly "
+         "what this budget will and will not be enough for (your best estimate, "
+         "e.g. 'enough for X and Y, not Z'); (2) if it will not cover the job, "
+         "ask him for more, saying how much and why; (3) NEVER cut scope, "
+         "quality, checks or steps to save quota without his explicit approval: "
+         "when you would have to, stop and ask instead.")
 ALLOW_CD = re.compile(r"^\s*cd\s+[^;&|`$()<>\n]+$")
 ALLOW_READ = re.compile(r"^\s*quota-budget\s+(status|top|brief)\b[^;&|`$()<>\n]*$")
 STALE_AFTER = 600   # status older than this is reported as stale, never trusted to block
@@ -379,9 +388,11 @@ def hook():
             return 0
         if p["over"] and not st["stale"]:
             print(f"BLOCKED: project '{name}' has used its whole quota budget "
-                  f"({p['used']:.2f}% of {p['limit']:g}% weekly). Stop working: "
-                  "write a short handoff of where things stand in your final "
-                  "message and end the turn. Only Eitan can raise the budget "
+                  f"({p['used']:.2f}% of {p['limit']:g}% weekly). Stop working "
+                  "and end the turn with: where things stand, what is still "
+                  "left to do, and your estimate of how much more budget that "
+                  "needs, as a request to Eitan. Do not drop or shrink the "
+                  "remaining work on your own. Only he can raise the budget "
                   f"(quota-budget set {name} <pct>). If this session only "
                   "wandered into the folder, a bare `cd <elsewhere>` still works.",
                   file=sys.stderr)
@@ -391,8 +402,8 @@ def hook():
     if event == "UserPromptSubmit" or event == "SessionStart":
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": event,
-            "additionalContext": line + " Check anytime with "
-            f"`quota-budget status {name}`. When it runs out every tool call is blocked."}}))
+            "additionalContext": line + " When it runs out every tool call is "
+            "blocked. " + RULES.format(name=name)}}))
         return 0
 
     if event == "PostToolUse":
@@ -415,7 +426,9 @@ def hook():
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PostToolUse",
             "additionalContext": f"WARNING: {band}% of the budget is gone. " + line
-            + " Wrap up or cut scope now; at 100% every tool call is blocked."}}))
+            + " Do NOT cut scope or quality to stretch it. Tell Eitan now what "
+            "the rest of the budget will cover, what it will not, and ask whether "
+            "he wants to raise it; at 100% every tool call is blocked."}}))
     return 0
 
 
@@ -500,8 +513,10 @@ def main(argv):
         print(f"""You manage project '{name}' ({p['path']}) on a hard quota budget of {p['limit']:g}% of the weekly Claude limit. {p['used']:.2f}% is already spent this week.
 - Everything started inside {p['path']} counts, wherever it later cd's to: you, your subagents, any `claude -p` you launch. Launch all of it from inside that directory.
 - Check what is left with `quota-budget status {name}` before every expensive step (a big agent, a long loop). It updates every minute.
-- Spend like it is money: Sonnet/Haiku for mechanical work, short briefs, no fan-outs, no polling.
-- At 80/90/95% you get a warning. At 100% every tool call in the project is blocked by a hook and you cannot get around it, so leave a handoff note before you get there.""")
+- Do not waste it (Sonnet/Haiku for mechanical work, short briefs, no fan-outs, no polling), but waste is the only thing you cut on your own.
+- First thing: tell Eitan what this budget will be enough for and what it will not, as a concrete estimate. Repeat that whenever the plan or the burn rate changes.
+- If it will not cover the job, ask him for more (how much, and for what). NEVER cut scope, quality, checks or steps because of quota without his explicit approval. If you would have to, stop and ask.
+- At 80/90/95% you get a warning: re-assess and ask him then. At 100% every tool call in the project is blocked by a hook and you cannot get around it, so ask before you get there.""")
         return 0
     print(__doc__)
     return 1
