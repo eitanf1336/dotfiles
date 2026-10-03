@@ -227,13 +227,20 @@ export default class DisplayLinkNightLight extends Extension {
         // Below 10% there is no hardware screen left to match (DDC bottoms out
         // there), so the curve just falls toward black for night use.
         const lvl = Math.max(0, Math.min(1, brightness));
-        const light = lvl >= 0.1 ? 0.1 + 0.9 * lvl : 0.19 * Math.pow(lvl / 0.1, 2);
+        // Cubed, not squared, below 10%: at 2% the squared curve still left
+        // the screens too bright for night use (2026-10-04).
+        const light = lvl >= 0.1 ? 0.1 + 0.9 * lvl : 0.19 * Math.pow(lvl / 0.1, 3);
         const dimAlpha = Math.max(0, Math.min(0.97, 1 - Math.pow(light, 1 / 2.2)));
+        // A hardware-dimmed screen bottoms out at its DDC floor (about the 10%
+        // light level). Below that it gets the rest from the overlay too, or
+        // it stays the brightest screen in the room.
+        const hwAlpha = light >= 0.1 ? 0
+            : Math.max(0, Math.min(0.97, 1 - Math.pow(light / 0.1, 1 / 2.2)));
 
         this._overlays.forEach(o => {
             // The warm tint still applies everywhere: no monitor can do that in
-            // hardware. Only the dim is skipped.
-            const a = o.noDim ? 0 : dimAlpha;
+            // hardware. The dim is skipped down to the hardware floor.
+            const a = o.noDim ? hwAlpha : dimAlpha;
             o.setState(mr, mg, mb, tr, tg, tb, fa, tintOn, a);
             o.visible = tintOn || a > 0.001;
         });
