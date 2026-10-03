@@ -152,6 +152,14 @@ def open_boards():
                     and ka[1] in ("attach", "--resume")):
                 chat = {"id": ka[2], "cwd": _cwd(kid)}
                 break
+            # A server chat: `ssh -t <host> "<env>claude attach <short>"`.
+            # These were never saved, so they vanished on every restore.
+            if ka and ka[0].rsplit("/", 1)[-1] == "ssh":
+                words = " ".join(ka[1:]).split()
+                if "attach" in words and words.index("attach") + 1 < len(words):
+                    chat = {"id": words[words.index("attach") + 1],
+                            "cwd": _cwd(kid)}
+                    break
         opening = None
         if "--open" in a[2:]:
             i = a.index("--open")
@@ -275,11 +283,17 @@ def _previous_session():
 def snapshot():
     """The chats open right now and the column each one sits in."""
     entries = []
+    boards = []
     seen = set()
     for b in open_boards():
         chat = b["chat"]
         if not chat:
-            continue          # a board sitting on the list, nothing open in it
+            if not b["opening"]:
+                # A board sitting on the list, nothing open in it. Still a
+                # terminal you had open, so it comes back as a board.
+                boards.append({"board": True, "cwd": b["cwd"],
+                               "project": b["project"]})
+            continue
         if chat["id"] in seen:
             # The same conversation can be open in two boards at once (easy to
             # do by accident). Restoring it twice would just make two terminals
@@ -307,7 +321,7 @@ def snapshot():
         if spot:
             e.update(spot)
 
-    return {"saved": time.time(), "chats": entries}
+    return {"saved": time.time(), "chats": entries, "boards": boards}
 
 
 def save():
@@ -591,7 +605,32 @@ def wait_for_screens(chats, limit=SCREEN_WAIT):
         time.sleep(1)
 
 
+def _restore_boards(data):
+    """Reopen the boards that were sitting on the list (no chat in them), minus
+    as many as are already open that way, so a re-run adds no duplicates."""
+    want = list((data or {}).get("boards") or [])
+    have = sum(1 for b in open_boards() if not b["chat"] and not b["opening"])
+    want = want[have:]
+    for e in want:
+        cmd = "claude-c" + (f" {shlex.quote(e['project'])}" if e.get("project")
+                            else "") + "; exec bash"
+        if not (live_layout() is not None
+                and _spawn_tiled(cmd, e.get("cwd"), 0)):
+            _spawn_plain(cmd, e.get("cwd"), "board")
+        time.sleep(1.2)
+    if want:
+        _log(f"reopened {len(want)} boards that had no chat open")
+    return len(want)
+
+
 def restore(data=None):
+    data = data or last_pre_boot_session()
+    rc = _restore_chats(data)
+    _restore_boards(data)      # after, so they don't take the chats' columns
+    return rc
+
+
+def _restore_chats(data):
     chats = plan(data)
     if not chats:
         _log("nothing saved to restore")
