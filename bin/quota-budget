@@ -32,9 +32,11 @@ and any use of the account not on this laptop (claude.ai, the server) gets
 blamed on the projects that ran here. Both errors make a project look MORE
 expensive, never less, which is the safe side for a budget.
 """
+import fcntl
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -52,6 +54,8 @@ ACTIVE = os.path.join(HOME, ".claude", "accounts", "active")
 PROJECT_ROOTS = [os.path.join(HOME, ".claude", "projects"),
                  os.path.join(HOME, ".claude-deed", "projects")]
 WARN_BANDS = (80, 90, 95)
+ALLOW_CD = re.compile(r"^\s*cd\s+[^;&|`$()<>\n]+$")
+ALLOW_READ = re.compile(r"^\s*quota-budget\s+(status|top|brief)\b[^;&|`$()<>\n]*$")
 STALE_AFTER = 600   # status older than this is reported as stale, never trusted to block
 
 # $ per million tokens: input, output, cache read. Cache writes are priced from
@@ -153,7 +157,34 @@ def new_account(key, util):
             "k": None}
 
 
+def session_root(path, files=None):
+    """The cwd a session started in. A session's cwd follows `cd`, so this is
+    what ties a manager to its project even after it wanders off. Subagent
+    transcripts belong to the session that spawned them."""
+    if not path:
+        return None
+    m = re.match(r"(.*)/([^/]+)/subagents/[^/]+\.jsonl$", path or "")
+    if m:
+        path = f"{m.group(1)}/{m.group(2)}.jsonl"
+    fs = (files or {}).get(path)
+    if fs and fs.get("root"):
+        return fs["root"]
+    try:
+        with open(path, "rb") as f:
+            head = f.read(1 << 20)
+    except OSError:
+        return None
+    m = re.search(rb'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"', head)
+    root = json.loads(b'"' + m.group(1) + b'"') if m else None
+    if root and fs is not None:
+        fs["root"] = root
+    return root
+
+
 def tick():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lock = open(os.path.join(STATE_DIR, "tick.lock"), "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)    # two ticks at once would count twice
     ledger = load(LEDGER, {"files": {}, "accounts": {}, "last_scan": 0})
     seen = load(SEEN, {})
     acct = active_account()
@@ -195,6 +226,7 @@ def tick():
             data = f.read()
         end = data.rfind(b"\n") + 1   # never consume a half-written line
         fs["off"] += end
+        root = session_root(path, ledger["files"])
         for raw in data[:end].splitlines():
             if b'"usage"' not in raw or b'"assistant"' not in raw:
                 continue
@@ -217,7 +249,8 @@ def tick():
             c = cost_of(msg.get("model"), msg.get("usage"))
             if c > 0:
                 cwd = d.get("cwd") or fs.get("cwd") or "?"
-                a["pending"][cwd] = a["pending"].get(cwd, 0.0) + c
+                key = (root or cwd) + "\t" + cwd
+                a["pending"][key] = a["pending"].get(key, 0.0) + c
 
     if reading:
         util, key, _ = reading
@@ -260,11 +293,20 @@ def inside(cwd, root):
     return cwd == root or cwd.startswith(root + "/")
 
 
+def counts_for(key, path):
+    """Spend is keyed "<session start dir>\t<cwd at the time>"; it belongs to
+    a project if either is inside it."""
+    return any(inside(part, path) for part in key.split("\t"))
+
+
 def usage_by_cwd(ledger):
-    """{cwd: (weekly %, $ not yet converted)} summed over accounts."""
+    """{key: (weekly %, $ not yet converted)} summed over accounts."""
     agg = {}
+    # an account that has not stepped yet borrows the rate learned on another
+    known = [a["k"] for a in ledger["accounts"].values() if a.get("k")]
+    fallback = max(known) if known else 0.0
     for a in ledger["accounts"].values():
-        k = a.get("k") or 0.0
+        k = a.get("k") or fallback
         for cwd in set(a["assigned"]) | set(a["pending"]):
             pend = a["pending"].get(cwd, 0.0)
             u, p = agg.get(cwd, (0.0, 0.0))
@@ -280,7 +322,7 @@ def compute_status(ledger):
         out["accounts"][name] = {"util": a["util"], "window": a["window"],
                                  "k": a.get("k")}
     for pname, b in budgets.items():
-        used = sum(u for cwd, (u, _) in agg.items() if inside(cwd, b["path"]))
+        used = sum(u for key, (u, _) in agg.items() if counts_for(key, b["path"]))
         limit = float(b["weekly_pct"])
         out["projects"][pname] = {
             "path": b["path"], "limit": limit, "used": round(used, 3),
@@ -314,9 +356,13 @@ def hook():
     except ValueError:
         return 0
     st = fresh_status()
-    name = project_for(inp.get("cwd"), st)
-    if not name:
+    names = {project_for(inp.get("cwd"), st),
+             project_for(session_root(inp.get("transcript_path")), st)} - {None}
+    if not names:
         return 0
+    # the session answers to every project it is tied to; report the tightest
+    name = max(names, key=lambda n: (st["projects"][n]["over"],
+                                     st["projects"][n]["used"] / max(st["projects"][n]["limit"], 1e-9)))
     p = st["projects"][name]
     event = inp.get("hook_event_name")
     line = (f"Quota budget for project '{name}': {p['used']:.2f}% of "
@@ -324,12 +370,21 @@ def hook():
             + (" [reading is stale]" if st["stale"] else "") + ".")
 
     if event == "PreToolUse":
+        cmd = (inp.get("tool_input") or {}).get("command", "") \
+            if inp.get("tool_name") == "Bash" else ""
+        # still allowed when over: leaving the folder (only frees a session that
+        # wandered in; one that started inside stays tied to it) and reading
+        # the budget
+        if cmd and (ALLOW_CD.match(cmd) or ALLOW_READ.match(cmd)):
+            return 0
         if p["over"] and not st["stale"]:
             print(f"BLOCKED: project '{name}' has used its whole quota budget "
                   f"({p['used']:.2f}% of {p['limit']:g}% weekly). Stop working: "
                   "write a short handoff of where things stand in your final "
                   "message and end the turn. Only Eitan can raise the budget "
-                  f"(quota-budget set {name} <pct>).", file=sys.stderr)
+                  f"(quota-budget set {name} <pct>). If this session only "
+                  "wandered into the folder, a bare `cd <elsewhere>` still works.",
+                  file=sys.stderr)
             return 2
         return 0
 
@@ -341,6 +396,8 @@ def hook():
         return 0
 
     if event == "PostToolUse":
+        if p["limit"] <= 0:
+            return 0
         band = max([b for b in WARN_BANDS if p["used"] >= p["limit"] * b / 100], default=0)
         if not band:
             return 0
@@ -387,7 +444,11 @@ def main(argv):
     if cmd == "tick":
         return tick()
     if cmd == "hook":
-        return hook()
+        try:
+            return hook()
+        except Exception as e:      # a bug here must never break a session
+            print(f"quota-budget hook error: {e}", file=sys.stderr)
+            return 0
     if cmd == "set":
         if len(args) < 2:
             print("usage: quota-budget set <name> <pct> [--path DIR]")
@@ -425,8 +486,10 @@ def main(argv):
         return 3 if only and st["projects"].get(only, {}).get("over") else 0
     if cmd == "top":
         agg = usage_by_cwd(load(LEDGER, {"accounts": {}}))
-        for cwd, (u, p) in sorted(agg.items(), key=lambda x: -x[1][0])[:25]:
-            print(f"{u:6.2f}%  (${p:7.2f} pending)  {cwd}")
+        for key, (u, p) in sorted(agg.items(), key=lambda x: -x[1][0])[:25]:
+            root, _, cwd = key.partition("\t")
+            where = (cwd or root) if root == cwd or not cwd else f"{cwd}  (started in {root})"
+            print(f"{u:6.2f}%  (${p:7.2f} pending)  {where}")
         return 0
     if cmd == "brief":
         name = args[0] if args else None
@@ -435,7 +498,7 @@ def main(argv):
             print(f"no budget named {name!r}")
             return 1
         print(f"""You manage project '{name}' ({p['path']}) on a hard quota budget of {p['limit']:g}% of the weekly Claude limit. {p['used']:.2f}% is already spent this week.
-- Everything run with its cwd inside {p['path']} counts: you, your subagents, any `claude -p` you launch. Run all of it from inside that directory.
+- Everything started inside {p['path']} counts, wherever it later cd's to: you, your subagents, any `claude -p` you launch. Launch all of it from inside that directory.
 - Check what is left with `quota-budget status {name}` before every expensive step (a big agent, a long loop). It updates every minute.
 - Spend like it is money: Sonnet/Haiku for mechanical work, short briefs, no fan-outs, no polling.
 - At 80/90/95% you get a warning. At 100% every tool call in the project is blocked by a hook and you cannot get around it, so leave a handoff note before you get there.""")
