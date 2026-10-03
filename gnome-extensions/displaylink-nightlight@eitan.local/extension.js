@@ -226,8 +226,8 @@ export default class DisplayLinkNightLight extends Extension {
         // same light, then undo the 2.2 gamma to get the pixel multiplier.
         // Below 10% there is no hardware screen left to match (DDC bottoms out
         // there), so the curve just falls toward black for night use.
-        const b = Math.max(0, Math.min(1, brightness));
-        const light = b >= 0.1 ? 0.1 + 0.9 * b : 0.19 * Math.pow(b / 0.1, 2);
+        const lvl = Math.max(0, Math.min(1, brightness));
+        const light = lvl >= 0.1 ? 0.1 + 0.9 * lvl : 0.19 * Math.pow(lvl / 0.1, 2);
         const dimAlpha = Math.max(0, Math.min(0.97, 1 - Math.pow(light, 1 / 2.2)));
 
         this._overlays.forEach(o => {
