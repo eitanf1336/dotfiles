@@ -1,0 +1,12 @@
+[Unit]
+Description=PolyArena afternoon hunter wake, only if the PolyArena Claude budget allows (bin/arena-hunt wake pm)
+After=polyarena.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/MyProjects/PolyArena
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash -c 'exec /usr/bin/python3 %h/code/MyProjects/PolyArena/bin/arena-hunt wake pm >> %h/code/MyProjects/PolyArena/data/logs/daily-pm-$(date +%%Y%%m%%d).log 2>&1'
+CPUWeight=1000
+# a session can be re-run; the core and the live bots cannot miss trades (same as polyarena-daily)
+OOMScoreAdjust=700

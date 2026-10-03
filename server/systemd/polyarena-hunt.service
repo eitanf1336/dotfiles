@@ -1,0 +1,12 @@
+[Unit]
+Description=PolyArena hunt gate: corners from board to tape, sim, live and scale, safety rules, the daily line (bin/arena-hunt tick)
+After=polyarena.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/MyProjects/PolyArena
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash -c 'exec /usr/bin/python3 %h/code/MyProjects/PolyArena/bin/arena-hunt tick >> %h/code/MyProjects/PolyArena/data/logs/hunt.log 2>&1'
+# two backtests of up to 20 minutes each, plus the gate itself
+TimeoutStartSec=3000
+Nice=5

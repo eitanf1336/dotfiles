@@ -1,0 +1,9 @@
+[Unit]
+Description=PolyArena hunt gate every hour (Eitan, 4 Oct: a script, not a human, promotes corners)
+
+[Timer]
+OnCalendar=*-*-* *:20:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

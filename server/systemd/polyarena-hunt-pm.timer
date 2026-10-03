@@ -1,0 +1,9 @@
+[Unit]
+Description=PolyArena afternoon hunter wake at 15:00 (Eitan, 4 Oct: two sessions a day if the quota allows)
+
+[Timer]
+OnCalendar=*-*-* 15:00:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target
