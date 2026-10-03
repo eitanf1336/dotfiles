@@ -56,10 +56,13 @@ PROJECT_ROOTS = [os.path.join(HOME, ".claude", "projects"),
 WARN_BANDS = (80, 90, 95)
 # Eitan's rule for every budgeted Claude: the budget is information, not a
 # licence to cut corners. Shown in the brief and on every prompt.
-RULES = ("Rules for this budget: (1) before real work, and whenever the plan "
-         "changes, check `quota-budget status {name}` and tell Eitan plainly "
-         "what this budget will and will not be enough for (your best estimate, "
-         "e.g. 'enough for X and Y, not Z'); (2) if it will not cover the job, "
+RULES = (" for this budget: (1) you cannot know the cost up front, so work "
+         "a bit first; once a real chunk is done (first milestone, or ~10-20% "
+         "of the budget), check `quota-budget status {name}`, work out the burn "
+         "rate from what that chunk cost, and tell Eitan plainly what the budget "
+         "will and will not be enough for (e.g. 'that took 1%, so 5% covers X "
+         "and Y but not Z'); re-assess at each milestone or when the plan "
+         "changes; (2) if it will not cover the job, "
          "ask him for more, saying how much and why; (3) NEVER cut scope, "
          "quality, checks or steps to save quota without his explicit approval: "
          "when you would have to, stop and ask instead.")
@@ -514,7 +517,7 @@ def main(argv):
 - Everything started inside {p['path']} counts, wherever it later cd's to: you, your subagents, any `claude -p` you launch. Launch all of it from inside that directory.
 - Check what is left with `quota-budget status {name}` before every expensive step (a big agent, a long loop). It updates every minute.
 - Do not waste it (Sonnet/Haiku for mechanical work, short briefs, no fan-outs, no polling), but waste is the only thing you cut on your own.
-- First thing: tell Eitan what this budget will be enough for and what it will not, as a concrete estimate. Repeat that whenever the plan or the burn rate changes.
+- You cannot know the cost up front, so work a bit first. Once a real chunk is done (first milestone, or ~10-20% of the budget), measure what it cost and tell Eitan what the budget will be enough for and what it will not, as a concrete estimate ("that took 1%, so 5% covers X and Y but not Z"). Re-assess at each milestone or when the plan changes.
 - If it will not cover the job, ask him for more (how much, and for what). NEVER cut scope, quality, checks or steps because of quota without his explicit approval. If you would have to, stop and ask.
 - At 80/90/95% you get a warning: re-assess and ask him then. At 100% every tool call in the project is blocked by a hook and you cannot get around it, so ask before you get there.""")
         return 0
