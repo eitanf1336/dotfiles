@@ -126,6 +126,18 @@ def write_json(path, obj):
     os.replace(tmp, path)
 
 
+def chat_token_flags(sid):
+    """/token can pin a single chat to another Claude login (~/bin/claude-token).
+    A revive must pass the same per-chat --settings flag, or it would quietly
+    move that chat back onto whatever login the machine is using."""
+    e = (read_json(os.path.join(HOME, ".claude/accounts/chat-tokens.json"), {})
+         or {}).get(sid) or {}
+    f = e.get("settings")
+    if e.get("account") not in (None, "default") and f and os.path.isfile(f):
+        return ["--settings", f]
+    return []
+
+
 # ---- what the daemon knows --------------------------------------------
 def agents():
     """Every session the background daemon still has on its books.
@@ -538,6 +550,7 @@ def run_one(job):
     # agent list it reads as a different chat that renamed itself.
     name = job.get("name") or job.get("detail") or ""
     base = [CLAUDE] + (["-n", name] if name and len(name) < 60 else []) \
+        + chat_token_flags(job["sessionId"]) \
         + ["--resume", job["sessionId"], "-p", CONTINUE_PROMPT]
     # Keep the model the session was actually using — but transcripts outlive
     # model names, so a retired id gets one retry on the default model rather

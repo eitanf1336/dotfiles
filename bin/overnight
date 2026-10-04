@@ -134,6 +134,18 @@ def write_json(path, obj):
     os.replace(tmp, path)
 
 
+def chat_token_flags(sid):
+    """/token can pin a single chat to another Claude login (~/bin/claude-token).
+    A revive must pass the same per-chat --settings flag, or it would quietly
+    move that chat onto whatever account the rotation just switched in."""
+    e = (read_json(os.path.join(HOME, ".claude/accounts/chat-tokens.json"), {})
+         or {}).get(sid) or {}
+    f = e.get("settings")
+    if e.get("account") not in (None, "default") and f and os.path.isfile(f):
+        return ["--settings", f]
+    return []
+
+
 def die(msg, code=1):
     sys.stderr.write(f"{RED}error:{RST} {msg}\n")
     sys.exit(code)
@@ -529,6 +541,7 @@ def revive(m, prompt, cfg, live):
         cmd += ["--model", m["model"]]
     if cfg.get("yolo"):
         cmd += ["--dangerously-skip-permissions"]
+    cmd += chat_token_flags(m["sid"])
     cmd += ["--resume", m["sid"], "-p", prompt]
     if not os.path.isdir(m.get("cwd") or ""):
         m["cwd"] = HOME

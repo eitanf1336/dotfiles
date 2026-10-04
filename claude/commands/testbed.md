@@ -1,13 +1,23 @@
 ---
-description: Keep a project's no-reload dev server up until the PC shuts down, so every session tests against the same stable URL
+description: Keep a project's no-reload dev server up across sessions and reboots, so every session tests against the same stable URL
 argument-hint: <project> [port]  (e.g. surfstatus, or surfstatus 5300) | status | down <project> | logs <project>
 allowed-tools: Bash(testbed:*), Bash(npm:*), Bash(curl:*), Read, Edit, Write, Grep, Glob
 ---
 
 Put a codebase on a **testbed**: one long-lived dev server with hot reload
-turned off, on a fixed port, that survives this session and only dies when the
-machine shuts down or logs out. It is the consistent target we both test
-against, instead of a fresh reloading server per session.
+turned off, on a fixed port, that survives this session **and reboots** (it is
+an enabled systemd user unit, so it starts again at boot). It is the consistent
+target we both test against, instead of a fresh reloading server per session.
+
+Bare `testbed` is `testbed status`: every registered project, its state, its
+`ON BOOT` column and its full URL. Being registered *is* the promise that it
+comes back, so a project that somehow lost its autostart is repaired in place
+by that command rather than reported. `at login` in that column means lingering
+is off and they wait for a login instead of starting at boot.
+
+`testbed down <p>` stops a project for now and it still returns on the next
+boot. `testbed forget <p>` is the only way out of the testbed, and the only
+thing that removes the autostart.
 
 Registered projects right now:
 
@@ -76,8 +86,12 @@ changes nothing, so just relay the error.
 - `testbed` owns the lifetime. Never background a dev server yourself with `&`,
   `nohup`, or `setsid` for a project that has a testbed, and never kill the
   unit with `pkill`; use `testbed down <project>` / `testbed restart <project>`.
-- A code change does **not** need a restart. Vite still recompiles on request,
-  it just does not push the change to the browser. Only restart after editing
+- For a **vite** project a code change does **not** need a restart: vite still
+  recompiles on request, it just does not push the change to the browser. This
+  is not true of a project whose `dev:static` is a build-then-serve command
+  (e.g. `next build && next start`, as in distillsignal) -- that serves a
+  compiled build, so code changes there need `testbed restart <project>`.
+  Otherwise only restart after editing
   `vite.config.*`, `package.json`, `.env*`, or installing dependencies.
 - When something looks broken in the browser, read `testbed logs <project>`
   before theorising.

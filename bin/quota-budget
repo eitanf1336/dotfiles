@@ -76,7 +76,7 @@ RULES = ("Rules for this budget: (1) you cannot know the cost up front, so work 
          "when you would have to, stop and ask instead.")
 ALLOW_CD = re.compile(r"^\s*cd\s+[^;&|`$()<>\n]+$")
 ALLOW_READ = re.compile(r"^\s*quota-budget\s+(status|top|brief)\b[^;&|`$()<>\n]*$")
-ALLOW_ADMIN = re.compile(r"^\s*(\S*/)?quota-budget\s+(set|rm)\b")
+ALLOW_ADMIN = re.compile(r"^\s*(\S*\/)?quota-budget\s+(set|rm)\b[^;&|`$()<>\n]*$")
 STALE_AFTER = 600   # status older than this is reported as stale, never trusted to block
 
 # $ per million tokens: input, output, cache read. Cache writes are priced from
