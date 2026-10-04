@@ -76,6 +76,7 @@ RULES = ("Rules for this budget: (1) you cannot know the cost up front, so work 
          "when you would have to, stop and ask instead.")
 ALLOW_CD = re.compile(r"^\s*cd\s+[^;&|`$()<>\n]+$")
 ALLOW_READ = re.compile(r"^\s*quota-budget\s+(status|top|brief)\b[^;&|`$()<>\n]*$")
+ALLOW_ADMIN = re.compile(r"^\s*(\S*/)?quota-budget\s+(set|rm)\b")
 STALE_AFTER = 600   # status older than this is reported as stale, never trusted to block
 
 # $ per million tokens: input, output, cache read. Cache writes are priced from
@@ -515,7 +516,8 @@ def hook():
         # still allowed when over: leaving the folder (only frees a session that
         # wandered in; one that started inside stays tied to it) and reading
         # the budget
-        if cmd and (ALLOW_CD.match(cmd) or ALLOW_READ.match(cmd)):
+        # his call (4 Oct 2026): Claude may also change or remove a budget itself
+        if cmd and (ALLOW_CD.match(cmd) or ALLOW_READ.match(cmd) or ALLOW_ADMIN.match(cmd)):
             return 0
         if p["over"] and not st["stale"]:
             print(f"BLOCKED: project '{name}' has used its whole quota budget "
@@ -523,7 +525,7 @@ def hook():
                   "and end the turn with: where things stand, what is still "
                   "left to do, and your estimate of how much more budget that "
                   "needs, as a request to Eitan. Do not drop or shrink the "
-                  "remaining work on your own. Only he can raise the budget "
+                  "remaining work on your own. Eitan lets Claude raise or remove it too "
                   f"(quota-budget set {name} <pct>). If this session only "
                   "wandered into the folder, a bare `cd <elsewhere>` still works.",
                   file=sys.stderr)
