@@ -648,6 +648,51 @@ def parse_chat(path):
     }
 
 
+# parse_chat results keyed by path, reused while (mtime, size) is unchanged. With
+# thousands of kept transcripts a cold scan reads ~20 s of JSON; cached it is <1 s.
+_PARSE_CACHE_FILE = HOME / ".claude" / "chats" / "parse_cache.json"
+_parse_cache = None
+_parse_cache_dirty = False
+
+
+def _cached_parse(f):
+    global _parse_cache, _parse_cache_dirty
+    if _parse_cache is None:
+        try:
+            _parse_cache = json.loads(_PARSE_CACHE_FILE.read_text())
+        except Exception:
+            _parse_cache = {}
+    try:
+        st = f.stat()
+    except OSError:
+        return None
+    key = str(f)
+    hit = _parse_cache.get(key)
+    if hit and hit[0] == st.st_mtime and hit[1] == st.st_size:
+        c = dict(hit[2])
+        c["path"] = f
+        return c
+    c = parse_chat(f)
+    if c:
+        _parse_cache[key] = [st.st_mtime, st.st_size,
+                             {k: v for k, v in c.items() if k != "path"}]
+        _parse_cache_dirty = True
+    return c
+
+
+def _save_parse_cache():
+    global _parse_cache_dirty
+    if not _parse_cache_dirty:
+        return
+    try:
+        tmp = _PARSE_CACHE_FILE.with_suffix(".tmp%d" % os.getpid())
+        tmp.write_text(json.dumps(_parse_cache))
+        os.replace(tmp, _PARSE_CACHE_FILE)
+        _parse_cache_dirty = False
+    except OSError:
+        pass
+
+
 def scan_chats():
     chats = []
     if not PROJECTS_DIR.exists():
@@ -656,7 +701,7 @@ def scan_chats():
         if not proj.is_dir():
             continue
         for f in proj.glob("*.jsonl"):
-            c = parse_chat(f)
+            c = _cached_parse(f)
             if c:
                 chats.append(c)
     remote_ids = set()
@@ -665,11 +710,12 @@ def scan_chats():
             if not proj.is_dir():
                 continue
             for f in proj.glob("*.jsonl"):
-                c = parse_chat(f)
+                c = _cached_parse(f)
                 if c:
                     c["host"] = host
                     remote_ids.add(c["id"])
                     chats.append(c)
+    _save_parse_cache()
     chats = [c for c in chats if c.get("host") or c["id"] not in remote_ids]
     chats.sort(key=lambda c: c["mtime"], reverse=True)
     return chats
