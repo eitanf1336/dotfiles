@@ -146,8 +146,9 @@ def weekly_reading():
         reset = datetime.fromisoformat(w["resets_at"])
     except Exception:
         return None
-    # resets_at jitters by microseconds between reads, the hour is the identity
-    key = reset.replace(minute=0, second=0, microsecond=0).isoformat()
+    # resets_at jitters between reads (11:59:59 vs 12:00:00 seen 4 Oct): truncating to the hour
+    # flipped the key across the boundary and wiped the week's ledger; round to the nearest hour
+    key = (reset + timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0).isoformat()
     start = (reset - timedelta(days=7)).timestamp()
     return util, key, start
 
