@@ -24,7 +24,9 @@ project spent what. This tool works it out from the transcripts:
   quota-budget status [name] [--json]          used vs budget (exit 3 if name is over)
   quota-budget top                             spend by cwd this window, budgeted or not
   quota-budget brief <name>                    text to paste into a manager's prompt
-  quota-budget tick                            scan new transcript lines (timer, every 60s)
+  quota-budget tick                            pull + scan new transcript lines (timer, every 60s)
+  quota-budget rebuild --since T --base ACCT=PCT   redo the ledger from transcripts since T,
+                                               when ACCT's weekly % was PCT
   quota-budget hook                            Claude Code hook entry point (stdin JSON)
 
 Numbers are estimates: they assume quota burns like API price across models,
@@ -51,12 +53,14 @@ SEEN = os.path.join(STATE_DIR, "seen.json")
 STATUS = os.path.join(STATE_DIR, "status.json")
 WARNED = os.path.join(STATE_DIR, "warned")
 ACTIVE = os.path.join(HOME, ".claude", "accounts", "active")
-# remote/ holds copies of transcripts from other machines (the server's Minecraft
-# Arena bots, mirrored by MinecraftArena/bin/arena-budget-guard), so a budget can
-# cover work that runs there; their cwd is the same path as on this laptop
-PROJECT_ROOTS = [os.path.join(HOME, ".claude", "projects"),
-                 os.path.join(HOME, ".claude-deed", "projects"),
-                 os.path.join(STATE_DIR, "remote")]
+# remote/ holds copies of transcripts from other machines: remote/server/ is
+# pulled by every tick, remote/server-arena/ is fed by MinecraftArena's
+# arena-budget-guard (its bots delete their own transcripts). Their cwds are the
+# same paths as on this laptop.
+REMOTE = os.path.join(STATE_DIR, "remote")
+DEED_PROJECTS = os.path.join(HOME, ".claude-deed", "projects")
+HOSTS = os.path.join(CONF_DIR, "hosts.json")   # {host: transcript dir under ~}
+PROJECT_ROOTS = [os.path.join(HOME, ".claude", "projects"), DEED_PROJECTS, REMOTE]
 WARN_BANDS = (80, 90, 95)
 # Eitan's rule for every budgeted Claude: the budget is information, not a
 # licence to cut corners. Shown in the brief and on every prompt.
@@ -135,19 +139,27 @@ def active_account():
         return "unknown"
 
 
-def weekly_reading():
-    """(utilization %, window key, window start epoch) or None."""
+def window_epoch(key):
     try:
-        out = subprocess.run(["claude-limits", "--json"], capture_output=True,
-                             text=True, timeout=60).stdout
+        return datetime.fromisoformat(key).timestamp()
+    except Exception:
+        return 0.0
+
+
+def weekly_reading(account=None):
+    """(utilization %, window key, window start epoch) or None. account=None
+    reads the live login, a name reads that saved claude-account slot."""
+    cmd = ["claude-limits", "--json"] + ([account] if account else [])
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout
         d = json.loads(out)
         w = d["seven_day"]
         util = float(w["utilization"])
         reset = datetime.fromisoformat(w["resets_at"])
     except Exception:
         return None
-    # resets_at jitters between reads (11:59:59 vs 12:00:00 seen 4 Oct): truncating to the hour
-    # flipped the key across the boundary and wiped the week's ledger; round to the nearest hour
+    # resets_at jitters between reads (08:59:59.99 vs 09:00:00.8 seen 4 Oct):
+    # round to the nearest hour so the key holds still
     key = (reset + timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0).isoformat()
     start = (reset - timedelta(days=7)).timestamp()
     return util, key, start
@@ -160,18 +172,80 @@ def parse_ts(s):
         return 0.0
 
 
+# ---------------------------------------------------------------- sources
+#
+# Every transcript belongs to the Claude account whose quota it burnt:
+#   ~/.claude/projects          the login live on this laptop
+#   ~/.claude-deed/projects     whatever ~/.claude-deed/.active-account names
+#   remote/<host>/...           mirrored from another machine; the account is
+#                               in remote/<host>/.account (written on every pull)
+# The server runs on the same account as this laptop, so without the mirror
+# everything it does looked like use from nowhere (4 Oct: 13 of 15% "unseen").
+
+def account_of(path, live):
+    if path.startswith(REMOTE + "/"):
+        host = path[len(REMOTE) + 1:].split("/", 1)[0]
+        try:
+            return open(os.path.join(REMOTE, host, ".account")).read().strip() or live
+        except OSError:
+            return live
+    if path.startswith(DEED_PROJECTS + "/"):
+        try:
+            return open(os.path.join(HOME, ".claude-deed", ".active-account")).read().strip() or "deed"
+        except OSError:
+            return "deed"
+    return live
+
+
+def pull_remote(ledger, since):
+    """Mirror the other machines' new transcript lines into remote/<host>/.
+    Transcripts are append-only, so rsync of the recently touched files is
+    cheap. A host that does not answer is skipped, never fatal."""
+    hosts = load(HOSTS, {"server": ".claude/projects"})
+    pulled = ledger.setdefault("pulled", {})
+    ssh = "ssh -o BatchMode=yes -o ConnectTimeout=10 -o ControlPath=none"
+    for host, rdir in hosts.items():
+        started = time.time()
+        last = pulled.get(host, since)
+        mins = int((started - last) / 60) + 5
+        dest = os.path.join(REMOTE, host, "projects")
+        try:
+            r = subprocess.run(
+                ssh.split() + [host, f"cat ~/.claude/accounts/active 2>/dev/null; echo; "
+                               f"cd ~/{rdir} && find . -name '*.jsonl' -mmin -{mins}"],
+                capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr.strip()[:200])
+            lines = r.stdout.split("\n")
+            account, files = lines[0].strip(), [l for l in lines[1:] if l.strip()]
+            os.makedirs(dest, exist_ok=True)
+            if account:
+                with open(os.path.join(REMOTE, host, ".account"), "w") as f:
+                    f.write(account)
+            if files:
+                r = subprocess.run(
+                    ["rsync", "-a", "-e", ssh, "--files-from=-",
+                     f"{host}:{rdir}/", dest + "/"],
+                    input="\n".join(files), capture_output=True, text=True, timeout=600)
+                if r.returncode not in (0, 23, 24):   # 23/24 = a file vanished mid-copy (the arena CLI deletes its own)
+                    raise RuntimeError(r.stderr.strip()[:200])
+            pulled[host] = started
+        except Exception as e:
+            print(f"quota-budget: pull from {host} failed: {e}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------- tick
 #
-# Attribution is by deltas, so resets and account switches cannot smear it:
-# new spend piles up as "pending" $ per cwd on the live account; when that
-# account's weekly % rises by D, D is split across the pending pile by cost and
-# the pile is cleared. k (% per $) is learned from those steps and prices the
-# pile that has not been converted yet, so a project is stopped before the
-# next whole-percent step shows up, not after.
+# Attribution is by deltas: new spend piles up as "pending" $ per (start dir,
+# cwd) on the account that paid for it; when that account's weekly % rises by
+# D, D is split across its pending pile by cost and the pile is cleared. k
+# (% per $) is the ratio over the recent steps and prices the pile that has not
+# been converted yet, so a project is stopped before the next whole percent
+# shows up, not after.
 
 def new_account(key, util):
     return {"window": key, "util": util, "assigned": {}, "pending": {},
-            "k": None}
+            "k": None, "samples": []}
 
 
 def session_root(path, files=None):
@@ -198,26 +272,64 @@ def session_root(path, files=None):
     return root
 
 
-def tick():
+def apply_reading(a, reading, now):
+    util, key, _ = reading
+    if (abs(window_epoch(key) - window_epoch(a["window"])) > 12 * 3600
+            or util < a["util"] - 1.5):
+        # a real new week (the reset moves by days, or the % fell): what was
+        # assigned belongs to the old week. Pending spend is kept, it is
+        # mostly from after the reset.
+        a["window"], a["assigned"], a["util"] = key, {}, 0.0
+    a["window"] = key
+    step = util - a["util"]
+    if step > 0:
+        pend = sum(a["pending"].values())
+        if pend > 0:
+            for k_, c in a["pending"].items():
+                a["assigned"][k_] = a["assigned"].get(k_, 0.0) + step * c / pend
+            a.setdefault("samples", []).append([step, pend])
+            a["samples"] = a["samples"][-40:]
+            tot_step = sum(x[0] for x in a["samples"])
+            tot_pend = sum(x[1] for x in a["samples"])
+            # one step on a thin pile says little; wait for a few dollars of evidence
+            if tot_pend >= 5.0:
+                a["k"] = tot_step / tot_pend
+            a["pending"] = {}
+        else:
+            a["assigned"]["(unseen: claude.ai, phone, other machines)"] = \
+                a["assigned"].get("(unseen: claude.ai, phone, other machines)", 0.0) + step
+        a["util"] = util
+    a["read_at"] = now
+
+
+def tick(rebuild=None):
+    """rebuild = (since epoch, {account: % at that moment}) starts the ledger
+    over from transcripts; normal ticks pass None."""
     os.makedirs(STATE_DIR, exist_ok=True)
     lock = open(os.path.join(STATE_DIR, "tick.lock"), "w")
     fcntl.flock(lock, fcntl.LOCK_EX)    # two ticks at once would count twice
+    if rebuild:
+        for f in (LEDGER, SEEN):
+            if os.path.exists(f):
+                os.remove(f)
     ledger = load(LEDGER, {"files": {}, "accounts": {}, "last_scan": 0})
     seen = load(SEEN, {})
-    acct = active_account()
-    reading = weekly_reading()
+    live = active_account()
     accts = ledger["accounts"]
     first_run = not ledger["files"]
     now = time.time()
-    if first_run and not reading:
+    live_reading = weekly_reading()
+    if first_run and not live_reading:
         print("quota-budget: no usage reading, try again", file=sys.stderr)
         return 1
-    a = accts.get(acct)
-    if not a:
-        util, key, _ = reading or (0.0, "?", 0)
-        a = accts[acct] = new_account(key, util)
-    # first run: count this window's history; afterwards only fresh lines
-    floor = reading[2] if first_run else now - 86400
+    # first run: this window's history (or the rebuild point); then fresh lines only
+    if rebuild:
+        floor = rebuild[0]
+    elif first_run:
+        floor = live_reading[2]
+    else:
+        floor = now - 86400
+    pull_remote(ledger, floor if first_run else now - 3600)
 
     files = []
     for root in PROJECT_ROOTS:
@@ -230,7 +342,8 @@ def tick():
             continue
         fs = ledger["files"].get(path)
         if fs is None:
-            if st.st_mtime < floor or (not first_run and st.st_mtime < since):
+            if st.st_mtime < floor or (not first_run and st.st_mtime < since
+                                       and not path.startswith(REMOTE + "/")):
                 ledger["files"][path] = {"off": st.st_size}
                 continue
             fs = ledger["files"][path] = {"off": 0}
@@ -244,6 +357,7 @@ def tick():
         end = data.rfind(b"\n") + 1   # never consume a half-written line
         fs["off"] += end
         root = session_root(path, ledger["files"])
+        acct = account_of(path, live)
         for raw in data[:end].splitlines():
             if b'"usage"' not in raw or b'"assistant"' not in raw:
                 continue
@@ -267,35 +381,44 @@ def tick():
             if c > 0:
                 cwd = d.get("cwd") or fs.get("cwd") or "?"
                 key = (root or cwd) + "\t" + cwd
-                a["pending"][key] = a["pending"].get(key, 0.0) + c
+                if acct not in accts:
+                    accts[acct] = new_account("", 0.0)
+                p = accts[acct]["pending"]
+                p[key] = p.get(key, 0.0) + c
 
-    if reading:
-        util, key, _ = reading
-        if key != a["window"] or util < a["util"] - 0.5:
-            # new week for this account: spend that never showed up as a step
-            # belongs to the week that just ended
-            a["window"], a["assigned"], a["pending"] = key, {}, {}
-            a["util"] = 0.0
-        if first_run:
-            a["util"] = 0.0      # convert the whole window's history below
-        step = util - a["util"]
-        if step > 0:
-            pend = sum(a["pending"].values())
-            if pend > 0:
-                for cwd, c in a["pending"].items():
-                    a["assigned"][cwd] = a["assigned"].get(cwd, 0.0) + step * c / pend
-                if pend >= 1.0:
-                    k = step / pend
-                    a["k"] = k if a["k"] is None else 0.7 * a["k"] + 0.3 * k
-                a["pending"] = {}
+    # read every account that has spend waiting, plus the live one
+    for name, a in accts.items():
+        if name == live:
+            reading = live_reading
+        elif a["pending"]:
+            reading = weekly_reading(name)
+        else:
+            continue
+        if not reading:
+            continue
+        if not a["window"]:                 # first sight of this account
+            a["window"] = reading[1]
+            if rebuild:
+                a["util"] = rebuild[1].get(name, 0.0)
+            elif first_run:
+                a["util"] = 0.0             # history converts below
             else:
-                a["assigned"]["(not on this laptop)"] = \
-                    a["assigned"].get("(not on this laptop)", 0.0) + step
-            a["util"] = util
-        if first_run:
-            a["pending"] = {}    # history the current % does not cover
-        a["read_at"] = now
+                a["util"] = reading[0]      # nothing known about the past
+        apply_reading(a, reading, now)
+        if first_run and not rebuild:
+            a["pending"] = {}               # history the current % does not cover
+    if live not in accts and live_reading:
+        accts[live] = new_account(live_reading[1], live_reading[0])
     seen = {k: v for k, v in seen.items() if v >= now - 8 * 86400}
+    # the mirror only needs this week; rsync keeps the server's mtimes
+    for path in list(ledger["files"]):
+        if path.startswith(os.path.join(REMOTE, "") ) and "/projects/" in path:
+            try:
+                if os.path.getmtime(path) < now - 9 * 86400:
+                    os.remove(path)
+                    del ledger["files"][path]
+            except OSError:
+                ledger["files"].pop(path, None)
     ledger["last_scan"] = now
     save(LEDGER, ledger)
     save(SEEN, seen)
@@ -464,6 +587,18 @@ def main(argv):
     args = argv[2:]
     if cmd == "tick":
         return tick()
+    if cmd == "rebuild":
+        # quota-budget rebuild --since 2026-10-04T00:46 --base eitan=1
+        if "--since" not in args:
+            print("usage: quota-budget rebuild --since <local ISO time> [--base <account>=<weekly % then> ...]")
+            return 1
+        since = datetime.fromisoformat(args[args.index("--since") + 1]).timestamp()
+        base = {}
+        for i, x in enumerate(args):
+            if x == "--base":
+                n, _, v = args[i + 1].partition("=")
+                base[n] = float(v)
+        return tick(rebuild=(since, base))
     if cmd == "hook":
         try:
             return hook()
