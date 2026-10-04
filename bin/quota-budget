@@ -51,8 +51,12 @@ SEEN = os.path.join(STATE_DIR, "seen.json")
 STATUS = os.path.join(STATE_DIR, "status.json")
 WARNED = os.path.join(STATE_DIR, "warned")
 ACTIVE = os.path.join(HOME, ".claude", "accounts", "active")
+# remote/ holds copies of transcripts from other machines (the server's Minecraft
+# Arena bots, mirrored by MinecraftArena/bin/arena-budget-guard), so a budget can
+# cover work that runs there; their cwd is the same path as on this laptop
 PROJECT_ROOTS = [os.path.join(HOME, ".claude", "projects"),
-                 os.path.join(HOME, ".claude-deed", "projects")]
+                 os.path.join(HOME, ".claude-deed", "projects"),
+                 os.path.join(STATE_DIR, "remote")]
 WARN_BANDS = (80, 90, 95)
 # Eitan's rule for every budgeted Claude: the budget is information, not a
 # licence to cut corners. Shown in the brief and on every prompt.
