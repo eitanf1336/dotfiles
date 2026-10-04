@@ -30,7 +30,7 @@ Eitan has two Linux machines on one Tailscale network:
 
 **Server** (user units, linger on, `systemctl --user` on the server; copies of every unit file in
 `~/code/linux-setup/server/systemd/`):
-- PolyArena: `polyarena.service` (core, 127.0.0.1:7790), `polyarena-bot@*` (10 bots), `polyarena-contest.timer`.
+- PolyArena (CLOSED 4 Oct 2026, every unit disabled, never restart): `polyarena.service` (core, 127.0.0.1:7790), `polyarena-bot@*` (10 bots), `polyarena-contest.timer`.
   **After ANY core restart the wallet is locked**: Eitan runs `~/code/MyProjects/PolyArena/bin/arena-wallet unlock`
   on the LAPTOP (zenity popup; `ARENA_SHOW_PASS=1` shows what he types). Never restart the core without his yes.
   Fable wakes run on the server (`ssh server`, then `bin/arena wake ...` in the repo), only on his word.
@@ -56,7 +56,7 @@ Eitan has two Linux machines on one Tailscale network:
   after ~30 s down it pops a laptop notification, and on recovery says how long in My Claude (WhatsApp can't send mid-outage).
   Log `~/.local/state/server-netwatch.log`, outages in `server-netwatch-outages.log`.
 - ServerScreen: `server-screen.service` (:7800) and the kiosk on the server's own display.
-  Project stats reach it as: laptop `dashboard-laptop-push stats` (hourly; SurfStatus D1/KV via the laptop's wrangler, FocusRace Firebase; Eitan and tests dropped, rules in `TheDashboard/dashboard/collectors/projectstats.py`) -> `dash metric` on the server -> the screen reads The Dashboard (PolyArena money is the live P&L from :7790, never its Money War entries).
+  Project stats reach it as: laptop `dashboard-laptop-push stats` (hourly; SurfStatus D1/KV via the laptop's wrangler, FocusRace Firebase; Eitan and tests dropped, rules in `TheDashboard/dashboard/collectors/projectstats.py`) -> `dash metric` on the server -> the screen reads The Dashboard. PolyArena was closed on 4 Oct 2026 and is gone from the screen and its money.
 - Render farm: `cuteworld-farm.service` + the `farm` CLI (`farm day|night|status|queue|results`).
 - Deed job: see `~/fleet-staging/deed-cutover.sh` (moves the deed chat, watcher, canary, push-limits and the
   deed login to the server; after it, `claude-c-deed` opens the deed board ON the server over ssh).
