@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""deed-usage-report - WhatsApp Eitan what the deed chat spent while it
+borrowed his login.
+
+Sums the tokens of every deed transcript turn since START (the moment the deed
+config was switched to the eitan slot), adds the eitan account's live 5h and
+weekly %, and sends it to the "My Claude" group. --final also says whether the
+deed config is back on the deed slot.
+
+Usage: deed-usage-report START_ISO [--final] [--dry]
+"""
+import glob, json, subprocess, sys, urllib.request
+from datetime import datetime, timezone
+
+GROUP = "120363410856554324@g.us"
+SEND = "http://localhost:8080/api/send"
+
+start = datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
+final = "--final" in sys.argv
+dry = "--dry" in sys.argv
+
+seen, tot, turns = {}, {"in": 0, "cw": 0, "cr": 0, "out": 0}, 0
+for f in glob.glob("/home/eitan/.claude-deed/projects/**/*.jsonl", recursive=True):
+    try:
+        lines = open(f, errors="replace")
+    except OSError:
+        continue
+    for line in lines:
+        if '"usage"' not in line:
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        ts = e.get("timestamp")
+        msg = e.get("message") or {}
+        u = msg.get("usage")
+        if not ts or not u or datetime.fromisoformat(ts.replace("Z", "+00:00")) < start:
+            continue
+        key = msg.get("id") or e.get("uuid")
+        # streamed turns repeat the same message id, the last one carries the full count
+        prev = seen.get(key, {})
+        seen[key] = {k: max(prev.get(k, 0), u.get(k, 0) or 0) for k in
+                     ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")}
+
+turns = len(seen)
+for u in seen.values():
+    tot["in"] += u["input_tokens"]
+    tot["cw"] += u["cache_creation_input_tokens"]
+    tot["cr"] += u["cache_read_input_tokens"]
+    tot["out"] += u["output_tokens"]
+
+def m(n):
+    return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}k"
+
+
+try:
+    lim = json.loads(subprocess.run(["claude-limits", "eitan", "--json"], capture_output=True,
+                                    text=True, timeout=60).stdout)
+    acct = f"Your account now: 5h {lim['five_hour']['utilization']:.0f}%, week {lim['seven_day']['utilization']:.0f}%"
+except Exception:
+    acct = "Your account: could not read limits"
+
+slot = subprocess.run(["claude-account-deed", "list"], capture_output=True, text=True).stdout
+slot = next((l.split(":", 1)[1].strip() for l in slot.splitlines() if l.startswith("signed in as")), "?")
+
+hrs = (datetime.now(timezone.utc) - start).total_seconds() / 3600
+body = (f"Deed chat on your token, last {hrs:.1f}h{' (FINAL)' if final else ''}\n"
+        f"{turns} model turns\n"
+        f"Output {m(tot['out'])}, fresh input {m(tot['in'] + tot['cw'])}, cache reads {m(tot['cr'])}\n"
+        f"{acct}\n"
+        f"Deed config signed in as: {slot}")
+text = f"🤖🤖🤖\n\n{body}\n\n🤖🤖🤖"
+if dry:
+    print(text)
+    sys.exit(0)
+req = urllib.request.Request(SEND, json.dumps({"recipient": GROUP, "message": text, "store_local": True}).encode(),
+                             {"Content-Type": "application/json"})
+print(urllib.request.urlopen(req, timeout=30).read().decode())
