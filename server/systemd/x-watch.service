@@ -1,0 +1,11 @@
+[Unit]
+Description=x-watch: space posts on X worth an Apeirion reply (alerts to WhatsApp)
+After=network-online.target whatsapp-bridge.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/code/MyProjects/Apeirion/scripts/x-watch
+ExecStart=%h/code/MyProjects/Apeirion/scripts/x-watch/.venv/bin/python xwatch.py
+TimeoutStartSec=15min

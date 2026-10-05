@@ -1,0 +1,10 @@
+[Unit]
+Description=Run x-watch every 30 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+RandomizedDelaySec=4min
+
+[Install]
+WantedBy=timers.target
