@@ -1,0 +1,24 @@
+[Unit]
+Description=Apeirion WhatsApp listener: a Claude that answers Eitan in the "Apeirion" group (bot.py, third instance)
+After=network-online.target whatsapp-bridge.service
+Wants=whatsapp-bridge.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/MyProjects/Apeirion/scripts/whatsapp-listener
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CWB_GROUP_NAME=Apeirion
+Environment=CWB_CLAUDE_CWD=%h/code/MyProjects/Apeirion/scripts/whatsapp-listener
+Environment=CWB_STATE_FILE=%h/.config/apeirion-whatsapp/state.json
+Environment=CWB_HISTORY_FILE=%h/.config/apeirion-whatsapp/history.jsonl
+Environment=CWB_HEARTBEAT_FILE=%h/.config/apeirion-whatsapp/heartbeat
+Environment=CWB_IGNORE_PREFIXES=🛰️
+Environment="CWB_SYSTEM_PROMPT=You are replying to Eitan over WhatsApp in his Apeirion group, on his home server. Before acting, read WHATSAPP-LISTENER.md in your working directory: the Apeirion code is on the laptop (ssh laptop), and it says what you may and may never do. Keep answers concise and phone-friendly, plain text. For more chat history run wa-history --limit N."
+ExecStart=/usr/bin/python3 %h/code/claude-stuff/claude-whatsapp-bot/bot.py
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target
