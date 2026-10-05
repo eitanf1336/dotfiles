@@ -4,7 +4,9 @@
 DEST=~/.claude/remote/server
 mkdir -p "$DEST/projects"
 while true; do
-  rsync -a --timeout=20 --include='/*/' --include='/*/*.jsonl' --exclude='*' \
+  # MinecraftArena bots log one headless transcript per model call (thousands, GBs):
+  # mirroring them made every board parse them all at startup and hang.
+  rsync -a --timeout=20 --exclude='/*-MinecraftArena-runs-*/' --include='/*/' --include='/*/*.jsonl' --exclude='*' \
       server:.claude/projects/ "$DEST/projects/" 2>/dev/null
   if out=$(ssh -o ConnectTimeout=8 server '
       printf "[" ; sep=""
