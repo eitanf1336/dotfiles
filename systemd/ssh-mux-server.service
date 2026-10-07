@@ -1,0 +1,17 @@
+[Unit]
+Description=Shared ssh connection to eitan-vivobook-server (never frozen by a blackout)
+# Every `ssh server` reuses this master's socket. It used to be started by whichever
+# terminal ran ssh first, so a blackout that froze that terminal froze the master too
+# and every later `ssh server` hung forever (2026-10-07). Owning it here, listed in
+# takeover's keep-units, keeps it out of any terminal's cgroup.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStartPre=-/bin/rm -f %h/.ssh/cm-eitan@100.85.207.11:22
+ExecStart=/usr/bin/ssh -MNT -o ControlMaster=yes -o ControlPersist=no -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 server
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
