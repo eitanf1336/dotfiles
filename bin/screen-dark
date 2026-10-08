@@ -115,6 +115,13 @@ def ddc_bus(connector):
     return cache.get(connector)
 
 
+def forget_buses():
+    try:
+        os.remove(BUSES)
+    except OSError:
+        pass
+
+
 def statefile(connector):
     return os.path.join(CACHE, "%s.json" % connector.replace("/", "_"))
 
@@ -136,6 +143,11 @@ def dark_on(connector):
     bus = ddc_bus(connector)
     if bus:
         rc, out, _ = run(["ddcutil", "--bus", bus, "getvcp", "10"])
+        if rc != 0:
+            forget_buses()
+            bus = ddc_bus(connector)
+            if bus:
+                rc, out, _ = run(["ddcutil", "--bus", bus, "getvcp", "10"])
         if rc != 0:
             return "ddc unreachable"
         prior = None
@@ -251,6 +263,13 @@ def apply_level(connector, pct):
     bus = ddc_bus(connector)
     if bus:
         rc, _out, err = run(["ddcutil", "--bus", bus, "setvcp", "10", str(pct)])
+        if rc != 0:
+            # i2c bus numbers move after a replug or reboot (HDMI-1 went 20 -> 18),
+            # and a stale cached bus fails every write. Detect again and retry once.
+            forget_buses()
+            bus = ddc_bus(connector)
+            if bus:
+                rc, _out, err = run(["ddcutil", "--bus", bus, "setvcp", "10", str(pct)])
         if rc != 0:
             # A write that did not land must not be reported as one that did.
             return "FAILED (%s)" % (err.strip().splitlines()[-1] if err.strip() else "rc %d" % rc)
