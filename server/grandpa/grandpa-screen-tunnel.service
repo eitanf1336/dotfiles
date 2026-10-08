@@ -7,9 +7,9 @@ After=network-online.target
 Type=simple
 User=eitan
 # little's key entry: restrict,port-forwarding,permitopen="127.0.0.1:7800" (little stays bound to localhost)
-ExecStart=/usr/bin/ssh -N -i /home/eitan/.ssh/id_ed25519_screen -o BatchMode=yes \
+ExecStart=/bin/bash -c 'exec /usr/bin/ssh -N -i /home/eitan/.ssh/id_ed25519_screen -o BatchMode=yes \
   -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-  -o StrictHostKeyChecking=accept-new -L 127.0.0.1:7800:127.0.0.1:7800 eitan@192.168.68.54
+  -o StrictHostKeyChecking=accept-new -L 127.0.0.1:7800:127.0.0.1:7800 "eitan@$(/home/eitan/bin/screen-tunnel-host)"'
 Restart=always
 RestartSec=5
 Nice=5

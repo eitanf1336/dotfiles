@@ -1,0 +1,18 @@
+#!/bin/bash
+# Prints little's current LAN IP. DHCP moves it (.54 -> .58 on 8 Oct), so find it by MAC.
+MAC=58:6c:25:9e:07:d2
+CACHE=/home/eitan/.cache/little-lan-ip
+cached=$(cat "$CACHE" 2>/dev/null)
+if [ -n "$cached" ] && ping -c1 -W1 "$cached" >/dev/null 2>&1 &&
+   ip neigh show "$cached" | grep -qi "$MAC"; then
+  echo "$cached"; exit 0
+fi
+ip=$(ip neigh | grep -i "$MAC" | awk '{print $1}' | head -1)
+if [ -z "$ip" ]; then
+  for i in $(seq 0 3); do for j in $(seq 1 254); do
+    ping -c1 -W1 "192.168.$((68+i)).$j" >/dev/null 2>&1 &
+  done; done; wait
+  ip=$(ip neigh | grep -i "$MAC" | awk '{print $1}' | head -1)
+fi
+[ -n "$ip" ] || exit 1
+mkdir -p "$(dirname "$CACHE")"; echo "$ip" > "$CACHE"; echo "$ip"
