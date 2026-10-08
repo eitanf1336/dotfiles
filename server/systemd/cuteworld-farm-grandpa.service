@@ -1,0 +1,16 @@
+[Unit]
+Description=CuteWorld render farm worker for grandpa, run FROM THE SERVER (GRANDPA_LOCAL=1): renders even with the laptop off; pushes laptop code to grandpa and pulls frames back whenever the laptop answers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=FARM_HOST=grandpa
+Environment=GRANDPA_LOCAL=1
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/code/MyProjects/CuteWorld/farm_worker.sh
+Nice=10
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
