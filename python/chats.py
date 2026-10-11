@@ -1410,6 +1410,29 @@ class App:
         self._auto_open = bool(auto_open and select_id)
         self._select_tries = 0   # the chat list can still be loading pass 1
 
+    def _swallow_escape(self, first):
+        """Consume the rest of an undecoded escape sequence (see _loop)."""
+        self.stdscr.nodelay(True)
+        try:
+            seq = []
+            while len(seq) < 32:
+                nx = self.stdscr.getch()
+                if nx == -1:
+                    break
+                seq.append(nx)
+                if first == 27 and len(seq) == 1 and nx != ord("["):
+                    break                      # Alt+key: ESC + one byte
+                if first == 27 and seq[:2] == [ord("["), ord("M")]:
+                    if len(seq) == 5:          # X10 mouse: 3 raw bytes follow
+                        break
+                    continue
+                if (first == curses.KEY_MOUSE or len(seq) > 1) \
+                        and 0x40 <= nx <= 0x7E and nx != ord("["):
+                    break                      # CSI final byte
+        finally:
+            self.stdscr.nodelay(False)
+            self.stdscr.timeout(350)
+
     def _blocking_getch(self):
         self.stdscr.timeout(-1)
         try:
@@ -2184,6 +2207,7 @@ class App:
         return rows, nav
 
     def run(self):
+        reset_tty_modes()  # again, now curses is up: nothing may re-arm the mouse
         curses.curs_set(0)
         setup_colors()
         self.stdscr.timeout(350)  # wake often so the running-dot animates smoothly
@@ -2239,6 +2263,16 @@ class App:
                 self.sel = max(0, len(nav) - 1)
             self.draw(rows, nav)
             ch = self.stdscr.getch()
+            if ch in (27, curses.KEY_MOUSE):
+                # The board binds no Esc and no mouse. A raw ESC here is the
+                # head of a sequence curses didn't decode, most often a mouse
+                # click from a terminal a killed chat left in mouse mode
+                # (ESC [ M b x y, or ESC [ < b;x;y M). Read as keys, its bytes
+                # hit real bindings: a click near column 78 is 'n' (new chat),
+                # digits move the selected chat. Swallow the whole thing.
+                self._swallow_escape(ch)
+                reset_tty_modes(show_cursor=False)
+                continue
             if ch == -1 and _code_changed():
                 # chats.py was edited (a new feature landed): reload on an idle
                 # tick, exactly like Ctrl+R, so old boards never run stale code.
@@ -3079,8 +3113,11 @@ def create_remote_agent(host, cwd, env, effort=None, model=None):
     if effort:
         flags += f" --effort {effort}"
     remote_trust(host, cwd or "/home/eitan")
-    r = remote_run(host, f"cd {shlex.quote(cwd or '~')} 2>/dev/null || cd; "
-                         f"{env}claude --bg{flags}", 60)
+    go = (f"cd {shlex.quote(cwd)} 2>/dev/null || {{ echo 'NO-SUCH-DIR' >&2; cd; }}; "
+          if cwd else "cd; ")
+    r = remote_run(host, f"{go}{env}claude --bg{flags}", 60)
+    if "NO-SUCH-DIR" in r.stderr:
+        print(f"  ! {cwd} doesn't exist on {host}, so the chat starts in your home folder.")
     m = re.search(r"backgrounded\W+([0-9a-f]{8})", _ANSI_RE.sub("", r.stdout + r.stderr))
     if not m:
         return None, None
@@ -3315,7 +3352,7 @@ def run_child(cmd, cwd=None):
             return  # exited or killed
 
 
-def reset_tty_modes():
+def reset_tty_modes(show_cursor=True):
     """Turn off DEC private modes a child (`claude attach` / `--resume`) can
     leave enabled — focus reporting (?1004) and mouse tracking (?1000/2/3/6)
     especially, plus bracketed paste (?2004). A chat that bugs out, is killed,
@@ -3326,8 +3363,17 @@ def reset_tty_modes():
     so leaving any chat always lands on a clean terminal."""
     try:
         os.write(sys.stdout.fileno(),
-                 b"\033[?1004l\033[?1000l\033[?1002l\033[?1003l"
-                 b"\033[?1006l\033[?2004l\033[?25h")
+                 b"\033[?1004l\033[?1000l\033[?1001l\033[?1002l\033[?1003l"
+                 b"\033[?1005l\033[?1006l\033[?1015l\033[?1007l"
+                 b"\033[?2004l" + (b"\033[?25h" if show_cursor else b""))
+    except Exception:
+        pass
+    # A chat ended by /done (SIGTERM, not a clean detach) can leave mouse codes
+    # already queued, or still arriving, from before the reset landed. Let the
+    # terminal catch up, then drop whatever input it sent in the meantime.
+    try:
+        time.sleep(0.15)
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
     except Exception:
         pass
 
@@ -3626,6 +3672,12 @@ def main():
                               "  Enter = laptop: ").strip().lower()
             if where.startswith("s") and hosts:
                 host = hosts[0]
+                # A folder project may exist only on the server (code that moved
+                # there), so the local isdir() check above can't decide its cwd:
+                # use the project folder as is and let the server cd into it.
+                key = app.active_project
+                if key and os.path.isabs(key):
+                    new_cwd = key
                 env = _remote_cfg_prefix(_load_json(PROJECT_CONFIG_DIRS_STORE).get(
                     app.active_project or "") or "")
                 print(f"\n▶ Creating a new background chat on {host}"
