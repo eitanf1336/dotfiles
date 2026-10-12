@@ -1,0 +1,14 @@
+[Unit]
+Description=Cotube Studio (review app, http://127.0.0.1:7820)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/code/MyProjects/Cotube/studio
+ExecStart=/usr/bin/python3 %h/code/MyProjects/Cotube/studio/server.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

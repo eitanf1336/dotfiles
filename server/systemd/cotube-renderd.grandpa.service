@@ -1,0 +1,14 @@
+[Unit]
+Description=Cotube render queue (grandpa: one job at a time, nice 19)
+
+[Service]
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/cotube-queue
+ExecStart=/usr/bin/python3 %h/cotube-queue/renderd.py run
+# stopping the daemon must never kill a running render: jobs live in their own sessions
+KillMode=process
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
