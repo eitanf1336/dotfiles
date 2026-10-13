@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""Put every new screenshot's absolute path on the primary selection.
+
+Plain Print opens GNOME's own screenshot UI (so it can also record video).
+GNOME copies the image to the clipboard (Ctrl+V) but not the path, so this
+watches ~/Pictures/Screenshots and puts the path on primary (middle-click),
+matching what screenshot-claude does for Shift+Print and Ctrl+Alt+S.
+"""
+import os
+import subprocess
+import time
+
+DIR = os.path.expanduser("~/Pictures/Screenshots")
+os.makedirs(DIR, exist_ok=True)
+
+mon = subprocess.Popen(["gio", "monitor", DIR], stdout=subprocess.PIPE, text=True)
+for line in mon.stdout:
+    # e.g. "<dir>: <dir>/Screenshot From X.png: changes done"
+    parts = line.rstrip("\n").split(": ")
+    if len(parts) < 3 or not parts[-1].startswith("changes done"):
+        continue
+    path = ": ".join(parts[1:-1])
+    if not path.lower().endswith(".png") or not os.path.isfile(path):
+        continue
+    time.sleep(0.2)
+    subprocess.run(["wl-copy", "--primary", "--", path], timeout=10)

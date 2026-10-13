@@ -1,0 +1,12 @@
+[Unit]
+Description=Put new screenshot paths on the primary selection (middle-click)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/bin/screenshot-path-watch
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
