@@ -1,0 +1,19 @@
+[Unit]
+Description=Keep a Claude login shared between config dirs from logging a chat out
+
+# The same account can be live in ~/.claude and in ~/.claude-deed at once. They
+# share one refresh token, the server rotates it on every refresh, and the copy
+# that refreshes second is rejected and logged out. After a long suspend both
+# have expired and refresh together on wake, so one always loses (2026-09-17).
+# `claude-account heal` copies the newest valid token over the loser. Every 30s
+# bounds how long a chat can stay logged out, and a monotonic timer that fell
+# due during sleep fires as soon as the machine wakes.
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

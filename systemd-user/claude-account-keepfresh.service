@@ -1,0 +1,6 @@
+[Unit]
+Description=Renew live Claude logins hours before they expire, so chats never race to refresh
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-account keepfresh -q

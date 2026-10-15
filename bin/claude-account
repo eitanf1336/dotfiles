@@ -18,6 +18,8 @@ Usage:
   claude-account rm <name>       forget a saved account
   claude-account restore         undo the last switch
   claude-account sync            fold the live tokens back into the active slot
+  claude-account heal            repair a login that is live in two config dirs at once
+  claude-account keepfresh       renew live logins hours before they expire (timer)
   claude-account refresh <name>  refresh a parked login now (--force: even if still fresh)
 
 Options:
@@ -616,8 +618,11 @@ def refresh_parked(name, fresh_for=FRESH_FOR, force=False):
             return "live", f"in use in {config_dir}"
 
     with contextlib.ExitStack() as locks:
-        for config_dir in twins:
-            locks.enter_context(refresh_lock(config_dir))
+        # Never refresh a live token without Claude's lock: if a chat is
+        # refreshing it at the same moment, one of the two new tokens is lost
+        # and the login dies (2026-10-15).
+        if not all([locks.enter_context(refresh_lock(d)) for d in twins]):
+            return "failed", "a Claude process holds the refresh lock"
         if oauth_of(path).get("refreshToken") != rt or any(
                 oauth_of(os.path.join(d, ".credentials.json")).get("refreshToken") != rt
                 for d in twins):
@@ -1102,6 +1107,141 @@ def cmd_restore(args):
     return 0
 
 
+def dir_email(config_dir):
+    """Email of whoever is logged in to one config dir, or None.
+
+    ~/.claude keeps its identity in ~/.claude.json; any other config dir keeps
+    it inside the dir itself."""
+    if os.path.realpath(config_dir) == os.path.realpath(CLAUDE_DIR):
+        path = CONFIG
+    else:
+        path = os.path.join(config_dir, ".claude.json")
+    return identity_email(read_json(path, {}) or {})
+
+
+KEEP_FRESH = 2 * 3600        # keepfresh renews a live login with less than this left
+
+
+def cmd_keepfresh(args):
+    """Renew every live login long before it expires, from one place.
+
+    Left alone, a live access token expires (~8h) and then EVERY open chat,
+    agent and headless run discovers it on its next turn and races to refresh
+    it. The refresh token rotates on use, so any racer that dies (killed,
+    frozen, timed out) after the server answered but before it wrote the new
+    pair to disk takes the only valid token with it, and every chat then shows
+    "another Claude Code process is refreshing it" and finally "401 OAuth
+    access token has expired" until a browser /login (2026-10-15, on 'dad').
+
+    This renews the token while it still has hours left, under Claude's own
+    refresh lock (skipping the round if a Claude holds it), writes the new pair
+    to the live file first and then to its slot. Claude only refreshes a token
+    that is about to expire and re-reads the file every turn, so the chats
+    never refresh at all. Run every 5 min by claude-account-keepfresh.timer."""
+    quiet = "-q" in args or "--quiet" in args
+    for config_dir, active_file in CONFIG_DIRS:
+        live = os.path.join(config_dir, ".credentials.json")
+        oauth = oauth_of(live)
+        if not oauth.get("refreshToken"):
+            continue
+        left = oauth.get("expiresAt", 0) / 1000 - time.time()
+        if left > KEEP_FRESH:
+            if not quiet:
+                info(f"{DIM}{config_dir}: {int(left // 60)}m left, nothing to do.{RST}")
+            continue
+        with refresh_lock(config_dir, wait=5.0) as held:
+            if not held:
+                info(f"{DIM}{config_dir}: a Claude is refreshing, next round.{RST}")
+                continue
+            oauth = oauth_of(live)          # it may have moved while we waited
+            if not oauth.get("refreshToken") or \
+                    oauth.get("expiresAt", 0) / 1000 - time.time() > KEEP_FRESH:
+                continue
+            try:
+                new = post_refresh(oauth)
+            except DeadLogin as e:
+                info(f"{YEL}{config_dir}: the server rejected this login ({e}). "
+                     f"Run /login.{RST}")
+                continue
+            except (OSError, ValueError) as e:
+                info(f"{YEL}{config_dir}: could not renew ({e}), next round.{RST}")
+                continue
+            write_creds(live, new)
+            name = marker(active_file)
+            if name and os.path.isdir(slot(name)) and \
+                    oauth_of(slot_cred(name)).get("refreshToken") == oauth["refreshToken"]:
+                write_creds(slot_cred(name), new)
+            info(f"{GRN}{config_dir}: renewed, "
+                 f"{int((new['expiresAt'] / 1000 - time.time()) // 60)}m left.{RST}")
+    return 0
+
+
+def cmd_heal(args):
+    """Repair a login that is live in more than one config dir.
+
+    The same slot can be live in ~/.claude and in a dedicated dir such as
+    ~/.claude-deed at the same time. The two then share one refresh token, and
+    the server rotates it on every refresh, so whichever Claude refreshes first
+    retires the other's copy. The loser's next refresh is rejected and Claude
+    writes its tokens back as empty strings, which logs that chat out.
+    refresh_parked() only coordinates the twins at the moment of a switch.
+    After a long suspend both access tokens have expired and both refresh on
+    wake, so one of them loses (2026-09-17: deed, after a 13 hour sleep).
+
+    For every slot live in two or more dirs that agree on who is logged in,
+    this takes the newest copy that still holds tokens and writes it over the
+    stale or emptied ones, under Claude's own refresh lock, then into the slot.
+    Claude re-reads the credentials file on every turn, so a chat that was
+    logged out works again on its next message. File copies only: no network,
+    nothing to rate-limit, and a no-op unless a login is actually shared."""
+    quiet = "-q" in args or "--quiet" in args
+
+    by_slot = {}
+    for config_dir, active_file in CONFIG_DIRS:
+        name = marker(active_file)
+        if name and os.path.isdir(config_dir):
+            by_slot.setdefault(name, []).append(config_dir)
+
+    healed = 0
+    for name, dirs in by_slot.items():
+        if len(dirs) < 2:
+            continue
+        emails = {dir_email(d) for d in dirs}
+        emails.discard(None)
+        if len(emails) > 1:
+            info(f"{YEL}'{name}' is marked live in {', '.join(dirs)} but they are "
+                 f"logged in as different people ({', '.join(sorted(emails))}) "
+                 f"- not touching them.{RST}")
+            continue
+        with contextlib.ExitStack() as locks:
+            if not all(locks.enter_context(refresh_lock(d, wait=5.0)) for d in dirs):
+                if not quiet:
+                    info(f"{DIM}'{name}': a refresh is in progress, will retry.{RST}")
+                continue
+            copies = [(os.path.join(d, ".credentials.json"), d) for d in dirs]
+            oauths = [(path, d, oauth_of(path)) for path, d in copies]
+            usable = [c for c in oauths
+                      if c[2].get("refreshToken") and c[2].get("accessToken")]
+            if not usable:
+                info(f"{YEL}'{name}': no copy still holds a login - run /login.{RST}")
+                continue
+            _, best_dir, best = max(usable, key=lambda c: c[2].get("expiresAt", 0))
+            for path, d, oauth in oauths:
+                if oauth.get("refreshToken") != best["refreshToken"]:
+                    write_creds(path, best)
+                    healed += 1
+                    was = "logged out" if not oauth.get("refreshToken") else "stale"
+                    info(f"{GRN}'{name}': {d} was {was}, restored from {best_dir}.{RST}")
+            if os.path.isdir(slot(name)) and \
+                    oauth_of(slot_cred(name)).get("refreshToken") != best["refreshToken"]:
+                write_creds(slot_cred(name), best)
+
+    if not healed and not quiet:
+        info(f"{DIM}Nothing to heal: no login is shared between config dirs, "
+             f"or every copy already agrees.{RST}")
+    return 0
+
+
 COMMANDS = {
     "list": cmd_list, "ls": cmd_list,
     "use": cmd_use, "switch": cmd_use,
@@ -1113,7 +1253,9 @@ COMMANDS = {
     "whoami": cmd_whoami, "who": cmd_whoami, "status": cmd_whoami,
     "restore": cmd_restore, "undo": cmd_restore,
     "sync": cmd_sync,
+    "heal": cmd_heal,
     "refresh": cmd_refresh,
+    "keepfresh": cmd_keepfresh,
 }
 
 

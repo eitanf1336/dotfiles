@@ -1,0 +1,9 @@
+[Unit]
+Description=Repair a Claude login that is live in two config dirs at once
+Documentation=man:claude-account(1)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-account heal -q
+# File comparison only: no network, nothing to rate-limit.
+Nice=10

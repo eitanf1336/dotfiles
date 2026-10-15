@@ -1,0 +1,18 @@
+[Unit]
+Description=Renew live Claude logins hours before they expire, so chats never race to refresh
+
+# Kit, 2026-10-15. When a live token expires, every open chat refreshes it at
+# once; the refresh token rotates on use, and a racer that dies after the
+# server answered but before writing to disk takes the only valid token with
+# it (dad logged out, all chats stuck on "another process is refreshing").
+# `claude-account keepfresh` renews it under Claude's lock with 2h still left,
+# so Claude itself never has to refresh. A timer that fell due during sleep
+# fires as soon as the machine wakes.
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
