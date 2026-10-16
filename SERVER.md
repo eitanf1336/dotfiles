@@ -58,6 +58,10 @@ Eitan has two Linux machines on one Tailscale network:
 - ServerScreen: `server-screen.service` (:7800) and the kiosk on the server's own display.
   Project stats reach it as: laptop `dashboard-laptop-push stats` (hourly; SurfStatus D1/KV via the laptop's wrangler, FocusRace Firebase; Eitan and tests dropped, rules in `TheDashboard/dashboard/collectors/projectstats.py`) -> `dash metric` on the server -> the screen reads The Dashboard. PolyArena was closed on 4 Oct 2026 and is gone from the screen and its money.
 - Render farm: `cuteworld-farm.service` + the `farm` CLI (`farm day|night|status|queue|results`).
+- Apeirion launch recorder: `apeirion-launchrec.service` (scheduler, `launchwatch.mjs`) starts a transient `launchrec-<T0>-<id8>`
+  unit 20 min before every SpaceX T-0: headless Chrome (Iris Xe, ANGLE gl-egl) films the live Apeirion page, `edit.py` cuts an
+  X post package, rsynced to the laptop `~/Videos/Launch Posts/`. One Chrome at a time; never posts. Code in
+  `apeirion-client/scripts/live-timelapse/` (dist copy at `apeirion-client/dist`), data `~/launch-recorder-data/`.
 - Deed job: see `~/fleet-staging/deed-cutover.sh` (moves the deed chat, watcher, canary, push-limits and the
   deed login to the server; after it, `claude-c-deed` opens the deed board ON the server over ssh).
 
@@ -112,6 +116,8 @@ tty1 autologins and runs `~/bin/server-kiosk` (cage + chromium kiosk on http://1
 Keys on the server's keyboard: `b` sleep/wake (backlight), `←` `→` previous/next slide, nothing else.
 Ctrl+Alt+F2 gives a normal console. Disable the kiosk with
 `touch ~/.config/server-kiosk-off` on the server.
+`kiosk-watchdog.timer` (every minute, code in `ServerScreen/bin/kiosk-watchdog`) kills cage when the page has not called
+server.py for 3 min (chromium's renderer wedged for 5 days once, 11 to 16 Oct 2026); tty1 then relogs and restarts the kiosk. Log `~/.local/state/kiosk-watchdog.log`.
 
 ## grandpa (the second server)
 
