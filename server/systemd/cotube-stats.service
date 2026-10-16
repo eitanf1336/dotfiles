@@ -1,0 +1,6 @@
+[Unit]
+Description=Cotube: public YouTube views and subscribers into The Dashboard
+
+[Service]
+Type=oneshot
+ExecStart=/home/eitan/bin/cotube stats --push
