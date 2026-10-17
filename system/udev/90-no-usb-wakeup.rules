@@ -1,0 +1,6 @@
+# Stop USB devices from waking the laptop out of suspend.
+# Root cause of the "suspend bounces back after 3-15 s" bug (Oct 2026): the Logitech
+# Lightspeed receivers and the G502 mouse had USB remote wakeup on; every bit of mouse
+# motion or HID++ battery report fired an XHCI PME (ACPI GPE 0x6D, SCI IRQ 9) and woke
+# the machine. Lid, power button and the built-in keyboard still wake it.
+ACTION=="add|change", SUBSYSTEM=="usb", DRIVER=="usb", TEST=="power/wakeup", ATTR{power/wakeup}="disabled"

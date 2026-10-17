@@ -110,6 +110,19 @@ else
     echo "      $REPO/polkit/etc/polkit-1/rules.d/49-force-shutdown-ignore-inhibit.rules /etc/polkit-1/rules.d/"
 fi
 
+# Suspend used to bounce back after 3-15 s: the Logitech receivers/mouse had USB
+# remote wakeup on, so mouse motion or a battery report woke the machine
+# (XHCI PME, GPE 0x6D). The rule turns USB wakeup off; lid and power button still wake.
+echo "==> udev rule: no USB wakeup from suspend"
+if cmp -s "$REPO/system/udev/90-no-usb-wakeup.rules" /etc/udev/rules.d/90-no-usb-wakeup.rules; then
+    echo "    already installed"
+elif pkexec install -m 0644 -o root -g root \
+        "$REPO/system/udev/90-no-usb-wakeup.rules" /etc/udev/rules.d/90-no-usb-wakeup.rules; then
+    echo "    installed 90-no-usb-wakeup.rules (active from next boot or replug)"
+else
+    echo "    NOT installed: suspend will keep bouncing back awake."
+fi
+
 # Every resume leaves the dock's two monitors "connected" with no modes, i.e.
 # black until the cable is replugged (nvidia/README.md, "Screens black after
 # every resume"). The repair has to run as root, so it goes in with pkexec too.
