@@ -1,0 +1,5 @@
+#!/bin/bash
+# Server has no clipboard. Claude Code's Ctrl+V image paste shells out to
+# wl-paste, so proxy it to the laptop's Wayland clipboard over Tailscale ssh.
+exec ssh -o BatchMode=yes -o ConnectTimeout=3 laptop \
+  "WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 wl-paste $(printf '%q ' "$@")"
