@@ -132,6 +132,7 @@ Late grandpa Chaim's ThinkPad E570 (GTX 950M), Ubuntu 26.04 on its NVMe since 2 
   read-only (`hdd-readonly.service`) and mounted ro at /mnt/data. NEVER write to it or wipe it.
 - Screen: little's ServerScreen half a cycle ahead (`?role=grandpa`, tunnel `grandpa-screen-tunnel`), with its own
   SERVER panel and Running now list from a local `server-screen-local` (:7801). Files: `server/grandpa/`.
+  `kiosk-watchdog.timer` there runs `kiosk-watchdog grandpa` (same 3 min rule, watches the grandpa role).
 
 ## Plans, history, rollbacks
 

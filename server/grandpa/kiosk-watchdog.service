@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart grandpa's kiosk if its page stopped talking to ServerScreen
+
+[Service]
+Type=oneshot
+ExecStart=%h/code/MyProjects/ServerScreen/bin/kiosk-watchdog grandpa
