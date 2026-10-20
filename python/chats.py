@@ -442,6 +442,26 @@ def _agent_snapshot(full):
     return (True, rec.get("status"), rec.get("state"))
 
 
+BADGES_STORE = HOME / ".claude" / "chats" / "badges.json"
+_BADGES = {"mtime": None, "v": {}}
+
+
+def load_badges():
+    """sessionId -> a short badge shown before the chat title (the Cotube manager writes it:
+    every channel Claude gets its channel name). Re-read only when the file changes."""
+    try:
+        m = BADGES_STORE.stat().st_mtime
+    except OSError:
+        return {}
+    if m != _BADGES["mtime"]:
+        try:
+            _BADGES["v"] = json.loads(BADGES_STORE.read_text()) or {}
+        except Exception:
+            _BADGES["v"] = {}
+        _BADGES["mtime"] = m
+    return _BADGES["v"]
+
+
 def load_project_tags():
     """sessionId -> project key override. Lets a chat live in a project other
     than the one implied by its folder (e.g. grouping homework chats from several
@@ -632,11 +652,29 @@ def parse_chat(path):
         return None
     if title is None:
         title = "(no readable messages)"
+    # A deliberate /rename writes a "custom-title" line. Claude re-appends title
+    # lines all the time, so the latest one sits near the end: read only the tail.
+    custom_title = None
+    try:
+        with path.open("rb") as fh:
+            fh.seek(max(0, path.stat().st_size - (1 << 20)))
+            for line in fh.read().decode("utf-8", "replace").splitlines():
+                if '"custom-title"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(d, dict) and d.get("customTitle"):
+                    custom_title = " ".join(str(d["customTitle"]).split())[:90]
+    except Exception:
+        pass
     return {
         "id": session_id,
         "cwd": cwd or "(unknown)",
         "title": title,
         "ai_title": ai_title,
+        "custom_title": custom_title,
         # Claude auto-continues a full chat in a NEW session whose first message is
         # its "continued from a previous conversation" summary. Free to detect here
         # (it's just the first user text we already read) and the only signal that
@@ -668,7 +706,8 @@ def _cached_parse(f):
         return None
     key = str(f)
     hit = _parse_cache.get(key)
-    if hit and hit[0] == st.st_mtime and hit[1] == st.st_size:
+    if (hit and hit[0] == st.st_mtime and hit[1] == st.st_size
+            and "custom_title" in hit[2]):
         c = dict(hit[2])
         c["path"] = f
         return c
@@ -1441,8 +1480,8 @@ class App:
             self.stdscr.timeout(350)
 
     def display_title(self, chat):
-        """What to show for a chat: your custom name > Claude's auto name >
-        first user message (fallback). Claude uses the short id as a placeholder
+        """What to show for a chat: your custom name > /rename title > Claude's
+        first auto name > live agent / job name > first user message (fallback). Claude uses the short id as a placeholder
         name until it auto-names a fresh chat, so we skip id-like names."""
         sid = chat["id"]
         if self.names.get(sid):
@@ -1457,10 +1496,15 @@ class App:
                 return None
             return name
 
+        # The chat's FIRST ai-title beats the live agent / job name: Claude
+        # re-titles a chat when it is relaunched as a bg agent (e.g. a LinkedIn
+        # chat became "toolsearch bash invocation" and looked gone). Only a
+        # deliberate /rename (custom-title) may replace the original name.
         rec = self._agents.get(sid)
-        return (_real(rec.get("name") if rec else None)
-                or _real(self.cnames.get(sid))
+        return (_real(chat.get("custom_title"))
                 or _real(chat.get("ai_title"))
+                or _real(rec.get("name") if rec else None)
+                or _real(self.cnames.get(sid))
                 or chat["title"])
 
     def _read_line(self, prompt, initial=""):
@@ -2745,6 +2789,9 @@ class App:
                 t = self.display_title(c)
                 if c.get("host"):  # runs on another machine (opens over ssh)
                     t = "[srv] " + t
+                badge = load_badges().get(c["id"])
+                if badge:  # a role chat (a Cotube channel Claude, the manager): its badge leads the row
+                    t = badge + "  " + t
                 starred = c["id"] in self.starred
                 # A chat is one or the other, never both (the 's' cycle moves it
                 # from ★ to ♡), but guard anyway so a hand-edited store can't
