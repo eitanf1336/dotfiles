@@ -620,6 +620,32 @@ def _tail_last_uuid(path, tail=262144):
     return last
 
 
+def latest_titles(path):
+    """(latest /rename title, latest Claude ai-title) of a transcript. Claude
+    re-appends title lines all the time, so the latest sit near the end: read
+    only the tail."""
+    custom = ai = None
+    try:
+        with path.open("rb") as fh:
+            fh.seek(max(0, path.stat().st_size - (1 << 20)))
+            for line in fh.read().decode("utf-8", "replace").splitlines():
+                if '"custom-title"' not in line and '"ai-title"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                if d.get("customTitle"):
+                    custom = " ".join(str(d["customTitle"]).split())[:90]
+                elif d.get("aiTitle"):
+                    ai = " ".join(str(d["aiTitle"]).split())[:90]
+    except Exception:
+        pass
+    return custom, ai
+
+
 def parse_chat(path):
     """Return dict(id, cwd, title, ai_title, mtime) or None if unreadable/empty."""
     session_id = path.stem
@@ -652,23 +678,7 @@ def parse_chat(path):
         return None
     if title is None:
         title = "(no readable messages)"
-    # A deliberate /rename writes a "custom-title" line. Claude re-appends title
-    # lines all the time, so the latest one sits near the end: read only the tail.
-    custom_title = None
-    try:
-        with path.open("rb") as fh:
-            fh.seek(max(0, path.stat().st_size - (1 << 20)))
-            for line in fh.read().decode("utf-8", "replace").splitlines():
-                if '"custom-title"' not in line:
-                    continue
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                if isinstance(d, dict) and d.get("customTitle"):
-                    custom_title = " ".join(str(d["customTitle"]).split())[:90]
-    except Exception:
-        pass
+    custom_title = latest_titles(path)[0]
     return {
         "id": session_id,
         "cwd": cwd or "(unknown)",
@@ -1157,6 +1167,30 @@ def ensure_trusted(cwd):
 
 
 NAMES_STORE = HOME / ".claude" / "chats" / "names.json"
+SEEN_TITLES_STORE = HOME / ".claude" / "chats" / "seen_titles.json"
+_SEEN = {"mtime": None, "v": {}}
+
+
+def load_seen_titles():
+    """sessionId -> Claude's title when you last left that chat. Re-read only
+    when the file changes."""
+    try:
+        m = SEEN_TITLES_STORE.stat().st_mtime
+    except OSError:
+        return {}
+    if m != _SEEN["mtime"]:
+        _SEEN["v"] = _load_json(SEEN_TITLES_STORE)
+        _SEEN["mtime"] = m
+    return _SEEN["v"]
+
+
+def remember_title(path, *ids):
+    """Pin the chat's current Claude title (read fresh from its transcript) as
+    the name the board keeps showing until you next leave it."""
+    ai = latest_titles(path)[1]
+    if ai:
+        for sid in ids:
+            _json_set(SEEN_TITLES_STORE, sid, ai)
 
 # sessionId -> True for chats you starred ('s'). A star doesn't move the chat;
 # it just paints the row's background so it jumps out wherever it sits.
@@ -1480,8 +1514,8 @@ class App:
             self.stdscr.timeout(350)
 
     def display_title(self, chat):
-        """What to show for a chat: your custom name > /rename title > Claude's
-        first auto name > live agent / job name > first user message (fallback). Claude uses the short id as a placeholder
+        """What to show for a chat: your custom name > /rename title > its name
+        when you last left it > Claude's auto name > first user message. Claude uses the short id as a placeholder
         name until it auto-names a fresh chat, so we skip id-like names."""
         sid = chat["id"]
         if self.names.get(sid):
@@ -1496,15 +1530,16 @@ class App:
                 return None
             return name
 
-        # The chat's FIRST ai-title beats the live agent / job name: Claude
-        # re-titles a chat when it is relaunched as a bg agent (e.g. a LinkedIn
-        # chat became "toolsearch bash invocation" and looked gone). Only a
-        # deliberate /rename (custom-title) may replace the original name.
+        # The name it had when you last LEFT the chat beats Claude's current
+        # one: Claude re-titles a chat when it is relaunched as a bg agent while
+        # you are away (a LinkedIn chat became "toolsearch bash invocation" and
+        # looked gone). Only a deliberate /rename overrides it.
         rec = self._agents.get(sid)
         return (_real(chat.get("custom_title"))
-                or _real(chat.get("ai_title"))
+                or _real(load_seen_titles().get(sid))
                 or _real(rec.get("name") if rec else None)
                 or _real(self.cnames.get(sid))
+                or _real(chat.get("ai_title"))
                 or chat["title"])
 
     def _read_line(self, prompt, initial=""):
@@ -4038,6 +4073,9 @@ def main():
                                     + ([nxt["prompt"]] if nxt.get("prompt") else []),
                                     run_cwd)
                 nxt = chat_token_relaunch(run_id)
+            if c.get("path"):
+                remember_title(Path(c["path"]).parent / f"{run_id}.jsonl",
+                               *{c["id"], run_id})
         except FileNotFoundError:
             print("Could not find the `claude` command on PATH.")
             print(f"Run manually:  cd {cwd} && {' '.join(cmd)}")
