@@ -1,0 +1,11 @@
+[Unit]
+Description=Check every 2 minutes which Claude chats should prepare for compaction
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=20s
+Unit=compact-ask.service
+
+[Install]
+WantedBy=timers.target

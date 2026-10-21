@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""compact-ask - warn each Claude chat BEFORE autocompact hits it, so no chat
+gets compacted by surprise in the middle of a message.
+
+When a live chat's context nears the autocompact point, it gets a message
+(through a cheap haiku courier using SendMessage) telling it to finish its
+step, write resume notes, and end its turn with "FULLY READY TO COMPACT".
+An idle, prepared chat then compacts cleanly at the start of its next turn
+instead of mid-work. A chat can't run /compact on itself and a message can't
+run it either (tested 2026-10-21), so the compact itself stays autocompact's.
+
+Context sizes come from the statusline crumbs in ~/.claude/state/ctx/
+(see fatchats). Runs every 2 min from compact-ask.timer.
+
+Usage:
+  compact-ask           one tick: ask every chat that needs asking
+  compact-ask --dry     show who would be asked, send nothing
+  compact-ask --status  show the ask ledger
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+CTXDIR = os.path.expanduser("~/.claude/state/ctx")
+LEDGER = os.path.expanduser("~/.claude/state/compact-ask.json")
+SETTINGS = os.path.expanduser("~/.claude/settings.json")
+FRESH = 10 * 60           # crumb older than this = chat not active, leave it
+REASK = 20 * 60           # ask again if it is still fat this long after
+LEAD = 55_000             # ask this many tokens before the autocompact point
+RESET_BELOW = 150_000     # under this again = it compacted, forget the ask
+
+
+def autocompact_point():
+    try:
+        with open(SETTINGS) as fh:
+            win = int(json.load(fh).get("autoCompactWindow", 300_000))
+    except (OSError, ValueError):
+        win = 300_000
+    return min(win, 1_000_000) - 33_000
+
+
+def load(path, default):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def live_names():
+    """sessionId -> name, for every live chat Claude knows about."""
+    try:
+        out = subprocess.run(["claude", "agents", "--json"], capture_output=True,
+                             text=True, timeout=30).stdout
+        return {a["sessionId"]: a.get("name") for a in json.loads(out)
+                if a.get("sessionId")}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}
+
+
+def message(tokens, point):
+    return (
+        f"Context check from Kit: you are at {tokens // 1000}k tokens and autocompact "
+        f"fires at about {point // 1000}k. Eitan does not want you compacted by surprise "
+        "mid-message, so prepare now: finish the step you are on (do not start anything "
+        "big), write whatever you would need to carry on into a resume note in your "
+        "project (what is done, what is next, open threads, file paths), and only when "
+        "you are FULLY ready end your turn with the line: FULLY READY TO COMPACT. "
+        "No reply to me is needed, just get ready.")
+
+
+def send(name, text):
+    prompt = (f"Use ListAgents, then SendMessage to the session named exactly "
+              f"{json.dumps(name)} (if two rows share that name, send to each). "
+              f"Send this text verbatim as the message:\n\n{text}\n\n"
+              "Then stop. Do nothing else.")
+    subprocess.Popen(
+        ["claude", "-p", prompt, "--model", "haiku",
+         "--allowedTools=ListAgents,SendMessage"],
+        cwd=os.path.expanduser("~"), stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+
+
+def main():
+    args = sys.argv[1:]
+    ledger = load(LEDGER, {})
+    if "--status" in args:
+        for sid, e in ledger.items():
+            ago = (time.time() - e["asked_at"]) / 60
+            print(f"{e['name'][:40]:40} asked at {e['tokens'] // 1000}k, {ago:.0f}m ago")
+        return
+    if os.path.exists(os.path.expanduser("~/.claude/limits-guard/PAUSE")):
+        return
+    dry = "--dry" in args
+    point = autocompact_point()
+    ask_at = point - LEAD
+    now = time.time()
+    names = None
+    try:
+        files = os.listdir(CTXDIR)
+    except OSError:
+        files = []
+    for fn in files:
+        if not fn.endswith(".json") or fn == "notified.json":
+            continue
+        path = os.path.join(CTXDIR, fn)
+        d = load(path, None)
+        if not d or now - os.path.getmtime(path) > FRESH:
+            continue
+        sid, tokens = d.get("session"), int(d.get("tokens", 0))
+        if not sid:
+            continue
+        if tokens < RESET_BELOW:
+            ledger.pop(sid, None)
+            continue
+        if tokens < ask_at:
+            continue
+        prev = ledger.get(sid)
+        if prev and now - prev["asked_at"] < REASK:
+            continue
+        if names is None:
+            names = live_names()
+        name = names.get(sid) or d.get("name")
+        if not name:
+            continue
+        if dry:
+            print(f"would ask {name!r} at {tokens // 1000}k (point {point // 1000}k)")
+            continue
+        send(name, message(tokens, point))
+        ledger[sid] = {"name": name, "tokens": tokens, "asked_at": now}
+    if not dry:
+        os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+        with open(LEDGER, "w") as fh:
+            json.dump(ledger, fh, indent=1)
+
+
+if __name__ == "__main__":
+    main()

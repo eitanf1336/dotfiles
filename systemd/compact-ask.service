@@ -1,0 +1,7 @@
+[Unit]
+Description=Warn Claude chats to prepare before autocompact reaches them
+
+[Service]
+Type=oneshot
+KillMode=process
+ExecStart=%h/.local/bin/compact-ask
