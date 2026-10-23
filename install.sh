@@ -123,6 +123,18 @@ else
     echo "    NOT installed: suspend will keep bouncing back awake."
 fi
 
+# The USB device rule was not enough: the controllers themselves still woke on the
+# dock's hubs dropping off at suspend. This one turns controller/port wakeup off.
+echo "==> udev rule: no USB/Thunderbolt controller wakeup"
+if cmp -s "$REPO/system/udev/91-no-controller-wakeup.rules" /etc/udev/rules.d/91-no-controller-wakeup.rules; then
+    echo "    already installed"
+elif pkexec install -m 0644 -o root -g root \
+        "$REPO/system/udev/91-no-controller-wakeup.rules" /etc/udev/rules.d/91-no-controller-wakeup.rules; then
+    echo "    installed 91-no-controller-wakeup.rules (active from next boot or replug)"
+else
+    echo "    NOT installed: suspend will keep bouncing back awake when docked."
+fi
+
 # Every resume leaves the dock's two monitors "connected" with no modes, i.e.
 # black until the cable is replugged (nvidia/README.md, "Screens black after
 # every resume"). The repair has to run as root, so it goes in with pkexec too.

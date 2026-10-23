@@ -1,0 +1,13 @@
+# Stop the USB/Thunderbolt controllers and PCIe ports from waking the laptop.
+# 90-no-usb-wakeup.rules turns wakeup off per USB device, but the controller itself
+# still wakes on port connect/disconnect, and the UGREEN dock's hubs (DisplayLink,
+# billboard) drop and reattach as it powers down. Suspend kept bouncing back after
+# 2-3 s (5 times 21-23 Oct 2026). Lid, power button and the built-in keyboard
+# (serio0) still wake it.
+ACTION=="add|change", SUBSYSTEM=="pci", KERNEL=="0000:00:14.0", ATTR{power/wakeup}="disabled"
+ACTION=="add|change", SUBSYSTEM=="pci", KERNEL=="0000:00:0d.0", ATTR{power/wakeup}="disabled"
+ACTION=="add|change", SUBSYSTEM=="pci", KERNEL=="0000:00:0d.2", ATTR{power/wakeup}="disabled"
+ACTION=="add|change", SUBSYSTEM=="pci", KERNEL=="0000:00:07.0", ATTR{power/wakeup}="disabled"
+ACTION=="add|change", SUBSYSTEM=="pci", KERNEL=="0000:00:01.0", ATTR{power/wakeup}="disabled"
+ACTION=="add|change", SUBSYSTEM=="pci", KERNEL=="0000:00:1c.0", ATTR{power/wakeup}="disabled"
+ACTION=="add|change", SUBSYSTEM=="thunderbolt", TEST=="power/wakeup", ATTR{power/wakeup}="disabled"
