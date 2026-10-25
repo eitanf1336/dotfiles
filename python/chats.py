@@ -3028,6 +3028,31 @@ def prompt_model(default=None):
         return default
 
 
+def _bg_launch(cmd, cwd=None, timeout=30):
+    """Run a `claude --bg ...` launcher and return the short id from its
+    'backgrounded · <id>' banner (or None). Output goes to a temp FILE, never a
+    pipe: when the launcher has to start Claude's background service, that
+    service inherits the launcher's stdout and holds it open forever, so
+    capture_output never sees EOF and every new chat timed out (2026-10-25)."""
+    import tempfile
+    try:
+        with tempfile.TemporaryFile("w+") as f:
+            p = subprocess.Popen(cmd, cwd=cwd, stdout=f, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+            end = time.time() + timeout
+            while True:
+                done = p.poll() is not None
+                f.seek(0)
+                mt = re.search(r"backgrounded\W+([0-9a-f]{8})", _ANSI_RE.sub("", f.read()))
+                if mt:
+                    return mt.group(1)
+                if done or time.time() > end:
+                    return None
+                time.sleep(0.1)
+    except Exception:
+        return None
+
+
 def create_bg_agent(cwd=None, effort=None, model=None):
     """Create a new idle background agent and return its short id (or None).
     The agent keeps running in Claude's daemon; we then attach to it so the
@@ -3044,14 +3069,7 @@ def create_bg_agent(cwd=None, effort=None, model=None):
         cmd += ["--model", model_id(model)]
     if effort:
         cmd += ["--effort", effort]
-    try:
-        out = subprocess.run(cmd, cwd=cwd,
-                             capture_output=True, text=True, timeout=30)
-    except Exception:
-        return None
-    txt = _ANSI_RE.sub("", out.stdout + out.stderr)
-    mt = re.search(r"backgrounded\W+([0-9a-f]{8})", txt)
-    return mt.group(1) if mt else None
+    return _bg_launch(cmd, cwd, 30)
 
 
 def create_bg_resume(full_id, fork=False, cwd=None, extra=None):
@@ -3069,14 +3087,7 @@ def create_bg_resume(full_id, fork=False, cwd=None, extra=None):
     if fork:
         cmd.append("--fork-session")
     cmd += list(extra or [])
-    try:
-        out = subprocess.run(cmd, cwd=cwd,
-                             capture_output=True, text=True, timeout=60)
-    except Exception:
-        return None
-    txt = _ANSI_RE.sub("", out.stdout + out.stderr)
-    mt = re.search(r"backgrounded\W+([0-9a-f]{8})", txt)
-    return mt.group(1) if mt else None
+    return _bg_launch(cmd, cwd, 60)
 
 
 def _remote_cfg_prefix(cfg):
@@ -3165,7 +3176,7 @@ def open_remote_chat(app, c, action):
         if bypass:
             print("  ALL permission checks OFF for this chat.")
         r = remote_run(host, f"cd {shlex.quote(cwd)} 2>/dev/null || cd; "
-                             f"{env}claude --bg --resume {c['id']}{flags}", 90)
+                             + _remote_bg_cmd(f"{env}claude --bg --resume {c['id']}{flags}"), 90)
         m = re.search(r"backgrounded\W+([0-9a-f]{8})", _ANSI_RE.sub("", r.stdout + r.stderr))
         if not m:
             print(f"  couldn't start it on {host}: {(r.stderr or r.stdout).strip()[:200]}")
@@ -3187,6 +3198,15 @@ def open_remote_chat(app, c, action):
     run_child(["ssh", "-t", host, f"{env}claude attach {short}"])
 
 
+def _remote_bg_cmd(launch):
+    """Shell for running a `claude --bg ...` launch over ssh. The output goes to
+    a file and the launcher runs detached, because a background service started
+    by the launcher would otherwise keep ssh's channel open (see _bg_launch)."""
+    return ('f=$(mktemp); ' + launch + ' >"$f" 2>&1 </dev/null & p=$!; i=0; '
+            'until grep -qE "backgrounded.*[0-9a-f]{8}" "$f" || ! kill -0 $p 2>/dev/null || [ $i -ge 400 ]; '
+            'do sleep 0.1; i=$((i+1)); done; sleep 0.2; cat "$f"; rm -f "$f"')
+
+
 def create_remote_agent(host, cwd, env, effort=None, model=None):
     """New background chat on another machine; returns (short, full) or (None, None)."""
     flags = ""
@@ -3197,7 +3217,7 @@ def create_remote_agent(host, cwd, env, effort=None, model=None):
     remote_trust(host, cwd or "/home/eitan")
     go = (f"cd {shlex.quote(cwd)} 2>/dev/null || {{ echo 'NO-SUCH-DIR' >&2; cd; }}; "
           if cwd else "cd; ")
-    r = remote_run(host, f"{go}{env}claude --bg{flags}", 60)
+    r = remote_run(host, go + _remote_bg_cmd(f"{env}claude --bg{flags}"), 60)
     if "NO-SUCH-DIR" in r.stderr:
         print(f"  ! {cwd} doesn't exist on {host}, so the chat starts in your home folder.")
     m = re.search(r"backgrounded\W+([0-9a-f]{8})", _ANSI_RE.sub("", r.stdout + r.stderr))
