@@ -1,0 +1,7 @@
+# Stop charger / USB-C power changes from waking the laptop out of suspend.
+# When the UGREEN dock powers down at suspend its USB-C PD contract changes; the AC
+# adapter (ADP0) and the UCSI USB-C power supply report it, and since both are wakeup
+# sources the s2idle suspend aborts after 2-3 s. Seen 25-26 Oct 2026 after the USB
+# rules (90, 91) were in. Battery, lid and power button still wake.
+ACTION=="add|change", SUBSYSTEM=="power_supply", KERNEL=="ADP*", ATTR{power/wakeup}="disabled"
+ACTION=="add|change", SUBSYSTEM=="power_supply", KERNEL=="ucsi-source-psy-*", ATTR{power/wakeup}="disabled"

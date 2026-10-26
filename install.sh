@@ -135,6 +135,17 @@ else
     echo "    NOT installed: suspend will keep bouncing back awake when docked."
 fi
 
+# Then the dock's USB-C power change at suspend woke it via the AC/UCSI power supplies.
+echo "==> udev rule: no charger/USB-C power wakeup"
+if cmp -s "$REPO/system/udev/92-no-charger-wakeup.rules" /etc/udev/rules.d/92-no-charger-wakeup.rules; then
+    echo "    already installed"
+elif pkexec install -m 0644 -o root -g root \
+        "$REPO/system/udev/92-no-charger-wakeup.rules" /etc/udev/rules.d/92-no-charger-wakeup.rules; then
+    echo "    installed 92-no-charger-wakeup.rules (active from next boot or replug)"
+else
+    echo "    NOT installed: suspend will keep bouncing back awake when docked."
+fi
+
 # Every resume leaves the dock's two monitors "connected" with no modes, i.e.
 # black until the cable is replugged (nvidia/README.md, "Screens black after
 # every resume"). The repair has to run as root, so it goes in with pkexec too.
