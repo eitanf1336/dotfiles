@@ -1,0 +1,4 @@
+#!/bin/bash
+# Installs 92-no-charger-wakeup.rules and applies it now (one password).
+R=$HOME/code/linux-setup/system/udev/92-no-charger-wakeup.rules
+pkexec bash -c "install -m 0644 -o root -g root '$R' /etc/udev/rules.d/ && udevadm control --reload && for f in /sys/class/power_supply/ADP*/power/wakeup /sys/class/power_supply/ucsi-source-psy-*/power/wakeup /sys/class/power_supply/hidpp_battery_*/power/wakeup; do echo disabled > \$f; done" && grep -H . /sys/class/power_supply/*/power/wakeup
