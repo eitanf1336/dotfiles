@@ -5,3 +5,6 @@
 # rules (90, 91) were in. Battery, lid and power button still wake.
 ACTION=="add|change", SUBSYSTEM=="power_supply", KERNEL=="ADP*", ATTR{power/wakeup}="disabled"
 ACTION=="add|change", SUBSYSTEM=="power_supply", KERNEL=="ucsi-source-psy-*", ATTR{power/wakeup}="disabled"
+# Logitech HID++ battery reports (wireless mouse/keyboard) are power_supply wakeup
+# sources too and fired during suspend (28 Oct 2026).
+ACTION=="add|change", SUBSYSTEM=="power_supply", KERNEL=="hidpp_battery_*", ATTR{power/wakeup}="disabled"
