@@ -20,7 +20,7 @@ Eitan has two Linux machines on one Tailscale network:
    ONE machine runs it. The other machine's copy stays `disable`d (or `mask`ed) as a rollback. Never start both.
 3. **localhost keeps working.** `server-link.service` (laptop) forwards every port listed in
    `~/.config/server-link/ports` from laptop `127.0.0.1:PORT` to the server's `127.0.0.1:PORT`.
-   Currently: 7777 Dashboard, 7790 PolyArena, 7800 ServerScreen, 8080 WhatsApp bridge, 8090 Whatclaude.
+   Currently: 7777 Dashboard, 7790 PolyArena, 7800 ServerScreen, 7830 Technion VPN screen (noVNC), 8080 WhatsApp bridge, 8090 Whatclaude.
    The service is reachable at localhost, but its FILES and DB live on the server: read/change them with `ssh server`.
 4. **Where work goes.** Long, unattended, overnight work: server. Anything touching his screen, browser,
    GPU, or laptop files: laptop. Renders: server by day, laptop only inside a blackout HE started (`farm`).
@@ -57,6 +57,7 @@ Eitan has two Linux machines on one Tailscale network:
   Log `~/.local/state/server-netwatch.log`, outages in `server-netwatch-outages.log`.
 - ServerScreen: `server-screen.service` (:7800) and the kiosk on the server's own display.
   Project stats reach it as: laptop `dashboard-laptop-push stats` (hourly; SurfStatus D1/KV via the laptop's wrangler, FocusRace Firebase; Eitan and tests dropped, rules in `TheDashboard/dashboard/collectors/projectstats.py`) -> `dash metric` on the server -> the screen reads The Dashboard. PolyArena was closed on 4 Oct 2026 and is gone from the screen and its money.
+- Technion VPN jump host (29 Oct 2026): the Perimeter81 app holds the VPN login on the server; `ssh srv3` on the laptop hops through it. See "Technion VPN jump host" below.
 - Render farm: `cuteworld-farm.service` + the `farm` CLI (`farm day|night|status|queue|results`).
 - Apeirion launch recorder: `apeirion-launchrec.service` (scheduler, `launchwatch.mjs`) starts a transient `launchrec-<T0>-<id8>`
   unit 20 min before every SpaceX T-0: headless Chrome (Iris Xe, ANGLE gl-egl) films the live Apeirion page, `edit.py` cuts an
@@ -68,6 +69,49 @@ Eitan has two Linux machines on one Tailscale network:
 **Laptop**: claude-c and all chats, quota/account tools, creds-guard (main login), takeover/blackout,
 dev testbeds, desktop tools, `server-link`, `server-chats-sync`, `server-claude-sync`, `wa-mirror`,
 `learning-db-push`, `dashboard-laptop-push`, `server-screen-sync`.
+
+## Technion VPN jump host
+
+srv3 (132.68.161.39) is reachable only over the Technion VPN (Perimeter81 / Check Point "Harmony SASE",
+workspace `technion`, routes only 132.68.0.0/16). Technion WiFi blocks the VPN and the phone hotspot is
+unusable, so the VPN login lives on the SERVER (one owner) and the laptop reaches srv3 through it.
+
+- **What runs** (user units on the server, copies in `server/systemd/vpn-*`):
+  `vpn-xvfb` (virtual display :81, 1280x800), `vpn-wm` (openbox), `vpn-vnc` (x11vnc on 127.0.0.1:5981, no password,
+  localhost only), `vpn-novnc` (websockify + noVNC on **127.0.0.1:7830**), `vpn-p81` (the app,
+  `/opt/Perimeter81/perimeter81`, same 10.0.3.933 .deb as the laptop, `~/Downloads/Perimeter81_10.0.3.933.deb`),
+  `vpn-watch.timer` (every 2 min, `server/bin/vpn-watch` -> server `~/bin/vpn-watch`).
+  The root helper `perimeter81helper.service` comes with the package.
+- **The screen**: http://localhost:7830 on the laptop (server-link port) opens the app's display in a browser tab.
+- **Login browser**: the app's "Sign In" opens a browser through `server/bin/vpn-xdg-open` (server
+  `~/.local/share/vpn-jump/bin/xdg-open`, first on vpn-p81's PATH). It uses Playwright's Chrome for Testing
+  (`~/.cache/ms-playwright/chromium-*/`, sandboxed with the package's setuid `/opt/Perimeter81/chrome-sandbox`)
+  with its own profile `~/.local/share/vpn-jump/browser-profile`, because the snap Chromium cannot hand the
+  `perimeter81://...callback` back to the app. If a Playwright update ever removes that build, the login
+  falls back to the snap and the callback breaks: reinstall Playwright's chromium or point the wrapper at another non-snap Chrome.
+- **How to (re)login**: open http://localhost:7830, click "Sign In to Harmony SASE" if the app shows it, workspace
+  `technion`, email `eitanfrenkel@campus.technion.ac.il` + password (plain email/password form with an invisible
+  reCAPTCHA), allow "Open Perimeter81" in the browser, then Connect in the app.
+  `vpn-watch` pops a laptop notification + My Claude WhatsApp "Technion VPN dropped: open localhost:7830 and log in"
+  when srv3 is unreachable (once per outage, reminder every 2 h). `server/bin/vpn-relogin` is a zero-click
+  skeleton that only runs if `~/.config/vpn-jump/credentials` (EMAIL=, PASSWORD=, mode 600) exists on the server;
+  it does not, by default.
+- **Session lifetime** (from the app's own settings log): access token 8 h, refresh token 24 h (another policy
+  says 14.6 days), `sessionExpirationPreferredTime` 03:00, `autoReconnect` user-settable (off by default),
+  `vpnAlwaysOn` and `connectOnLaunch` forced off by the Technion admin.
+- **DNS trap**: the helper DNATs ALL outgoing DNS to its proxy on 127.0.0.1:5354, which answers SERVFAIL while
+  logged out; on 29 Oct 2026 that broke DNS for the whole server the moment the package was installed.
+  `vpn-watch` keeps three nat OUTPUT RETURN rules (systemd-resolve's own queries, and anything to 127.0.0.0/8)
+  above that DNAT, re-adding them after a reboot (timer fires 15 s after boot). Check: `sudo iptables -t nat -S OUTPUT`.
+- **Laptop side**: `~/.ssh/config` has `Match originalhost srv3 !exec "ip route | grep -q '^132.68.0.0/16'"` ->
+  `ProxyJump server`, so `ssh srv3` (and scp/rsync) goes direct when the laptop's own VPN is up and through the
+  server otherwise. The srv3 key stays on the laptop (passphrase + agent); the server only forwards TCP.
+- **Rollback** (laptop owns the VPN again): on the server
+  `touch ~/.config/vpn-jump/off; systemctl --user disable --now vpn-p81 vpn-watch.timer` (sign out in the app first
+  if possible), then connect the laptop's Perimeter81 app as before. Never have both connected at once.
+  Forward again: `rm ~/.config/vpn-jump/off; systemctl --user enable --now vpn-p81 vpn-watch.timer`.
+- Logs: `~/.local/state/vpn-jump.log` (watch + xdg-open lines) on the server; the app's own log is
+  `~/.config/Perimeter81/logs/gui.log`.
 
 ## Deploying a code change to something that runs on the server
 
@@ -141,3 +185,4 @@ Late grandpa Chaim's ThinkPad E570 (GTX 950M), Ubuntu 26.04 on its NVMe since 2 
 
 - **/tmp scratch cleanup (26 Sep 2026):** server crontab entry `# claude-scratch-clean` deletes files older than 2 h under /tmp/claude-1000/*MinecraftArena-runs* every hour (xx:17). /tmp is tmpfs, and the arena bots' headless claude sessions leaked 2.5 GB of cached camera frames into RAM. The Minecraft chat confirmed nothing reads them after a chapter (15-25 min).
 - **zram swappiness 180 (26 Sep 2026):** /etc/sysctl.d/99-zram-swappiness.conf on the server so idle pages compress into the 7.7 GB zram before renders get frozen. Undo: delete the file and `sudo sysctl vm.swappiness=60`.
+- **Root reserve 5% -> 2% (29 Oct 2026):** the server's disk hit 100% (0 bytes free for user services; MinecraftArena alone is 106 GB, `runs/` 68 GB) while installing the VPN jump host. `sudo tune2fs -m 2 /dev/nvme0n1p2` freed ~7 GB for users without deleting anything. Undo: `sudo tune2fs -m 5 /dev/nvme0n1p2`. The real fix is clearing old MinecraftArena runs/out (his call).

@@ -1,0 +1,7 @@
+[Unit]
+Description=Technion VPN jump: DNS guard + srv3 reachability check, popup when the VPN login is needed
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/bin/vpn-watch

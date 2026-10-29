@@ -1,0 +1,14 @@
+[Unit]
+Description=Technion VPN jump: openbox window manager on :81
+Requires=vpn-xvfb.service
+After=vpn-xvfb.service
+
+[Service]
+Environment=DISPLAY=:81
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/bin/openbox
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

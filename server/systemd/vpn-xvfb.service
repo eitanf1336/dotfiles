@@ -1,0 +1,10 @@
+[Unit]
+Description=Technion VPN jump: virtual display :81 for the Perimeter81 app
+
+[Service]
+ExecStart=/usr/bin/Xvfb :81 -screen 0 1280x800x24 -nolisten tcp -ac
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

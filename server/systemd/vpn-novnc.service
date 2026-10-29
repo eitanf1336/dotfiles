@@ -1,0 +1,13 @@
+[Unit]
+Description=Technion VPN jump: noVNC web screen on 127.0.0.1:7830 (laptop: http://localhost:7830)
+After=vpn-vnc.service
+
+[Service]
+# web dir = noVNC's files (symlinked) + vpn-jump-web/index.html (redirects / to the autoconnecting viewer)
+ExecStartPre=/bin/sh -c 'mkdir -p %h/.local/share/vpn-jump/web && for f in /usr/share/novnc/*; do ln -sfn "$$f" %h/.local/share/vpn-jump/web/; done'
+ExecStart=/usr/bin/websockify --web %h/.local/share/vpn-jump/web 127.0.0.1:7830 127.0.0.1:5981
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

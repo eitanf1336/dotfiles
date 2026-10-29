@@ -1,0 +1,10 @@
+[Unit]
+Description=Technion VPN jump watchdog every 2 min
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=2min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

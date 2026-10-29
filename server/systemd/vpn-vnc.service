@@ -1,0 +1,13 @@
+[Unit]
+Description=Technion VPN jump: x11vnc of display :81 on 127.0.0.1:5981 (no password, localhost only)
+Requires=vpn-xvfb.service
+After=vpn-xvfb.service
+
+[Service]
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/bin/x11vnc -display :81 -localhost -rfbport 5981 -forever -shared -nopw -quiet -noxdamage
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

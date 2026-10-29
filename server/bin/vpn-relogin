@@ -1,0 +1,49 @@
+#!/bin/bash
+# vpn-relogin: zero-click re-login of the Perimeter81 (Harmony SASE) app on the server's virtual
+# display :81. SKELETON, untested end to end: it needs stored credentials and the post-login
+# screen layout, neither of which exists yet (29 Oct 2026).
+#   Credentials (only if Eitan says yes): ~/.config/vpn-jump/credentials, mode 600, lines
+#     EMAIL=...
+#     PASSWORD=...
+#   Without that file it exits 3 and vpn-watch falls back to the "open localhost:7830" popup.
+# Exit: 0 = it clicked through a login, 3 = no credentials, 4 = screens not where expected.
+# The login web page has a reCAPTCHA; if it ever shows a challenge this cannot pass it.
+set -u
+CRED="$HOME/.config/vpn-jump/credentials"
+[ -r "$CRED" ] || { echo "vpn-relogin: no credentials, need a human at localhost:7830"; exit 3; }
+# shellcheck disable=SC1090
+. "$CRED"
+: "${EMAIL:?}" "${PASSWORD:?}"
+export DISPLAY=:81 PATH="$HOME/.local/share/vpn-jump/bin:$PATH"
+WORKSPACE=technion
+shot() { xwd -root -silent | convert xwd:- "$HOME/.local/state/vpn-relogin-$1.png" 2>/dev/null; }
+
+# 1. The app window (800x600). On its signed-out screen the "Sign In to Harmony SASE" button
+#    sits at (+195,+397) from the window's corner; it opens the browser via vpn-xdg-open.
+app=$(xdotool search --onlyvisible --class Perimeter81 2>/dev/null | head -1)
+[ -n "$app" ] || { systemctl --user restart vpn-p81; sleep 15; app=$(xdotool search --onlyvisible --class Perimeter81 | head -1); }
+[ -n "$app" ] || { echo "vpn-relogin: no app window"; exit 4; }
+eval "$(xdotool getwindowgeometry --shell "$app")"   # X Y WIDTH HEIGHT
+shot 1-app
+xdotool mousemove $((X+195)) $((Y+397)) click 1
+sleep 12
+
+# 2. The browser: workspace page (only the first time), then email + password.
+win=$(xdotool search --onlyvisible --name "Check Point" 2>/dev/null | tail -1)
+[ -n "$win" ] || { echo "vpn-relogin: no sign-in page"; shot 2-nobrowser; exit 4; }
+xdotool windowactivate --sync "$win"
+if xdotool getwindowname "$win" | grep -qi workspace; then
+  xdotool key ctrl+l; xdotool type --delay 20 "https://$WORKSPACE.perimeter81.com/sign-in?redirectUrl=perimeter81://perimeter81.com/callback"
+  xdotool key Return; sleep 10
+fi
+shot 2-form
+# The email field has focus after load on this page; Tab moves to password.
+xdotool type --delay 40 "$EMAIL"; xdotool key Tab
+xdotool type --delay 40 "$PASSWORD"; xdotool key Return
+sleep 15
+# 3. The page hands perimeter81://...callback to the app (vpn-xdg-open), Chromium asks
+#    "Open Perimeter81?" once; Enter accepts the focused default only if it is "Open".
+shot 3-after
+# TODO after the first real login: the app's Connect button position, and the "Always allow"
+# checkbox on Chromium's protocol prompt, so this needs no guess.
+exit 0

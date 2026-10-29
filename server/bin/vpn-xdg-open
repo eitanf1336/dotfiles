@@ -1,0 +1,26 @@
+#!/bin/bash
+# vpn-xdg-open: xdg-open for the Technion VPN jump host (Perimeter81 app on display :81).
+# Installed on the server as ~/.local/share/vpn-jump/bin/xdg-open, first on vpn-p81.service's PATH,
+# so the app's "Sign In" opens a browser ON the virtual display (seen through http://localhost:7830)
+# with its own profile, never the kiosk's chromium. perimeter81:// callbacks go back to the app.
+LOG=~/.local/state/vpn-jump.log
+url=$1
+printf '%s xdg-open %s\n' "$(date '+%F %T')" "${url:0:200}" >>"$LOG"
+export DISPLAY=:81
+case "$url" in
+  perimeter81:*|com.perimeter81*|sonicwall:*|com.sonicwall*)
+    exec /opt/Perimeter81/perimeter81 "$url" ;;
+  http:*|https:*|file:*|data:*|about:*|'') ;;
+  *) exec /usr/bin/xdg-open "$url" ;;   # any other scheme: the system handler (never back into the browser)
+esac
+# A plain (non-snap) Chromium: the snap one cannot hand perimeter81:// callbacks back to the app.
+# Playwright's build is already on the server; the snap is only a fallback.
+chrome=$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux64/chrome 2>/dev/null | sort -V | tail -1)
+args=(--no-first-run --no-default-browser-check --window-size=1100,760 --window-position=90,20 "$url")
+if [ -x "$chrome" ]; then
+  # Ubuntu blocks the namespace sandbox for binaries without an AppArmor profile; use the setuid
+  # sandbox helper the Perimeter81 package already installs (keeps Chromium sandboxed).
+  export CHROME_DEVEL_SANDBOX=/opt/Perimeter81/chrome-sandbox
+  exec "$chrome" --user-data-dir="$HOME/.local/share/vpn-jump/browser-profile" "${args[@]}"
+fi
+exec /snap/bin/chromium --user-data-dir="$HOME/snap/chromium/common/vpn-jump-profile" "${args[@]}"

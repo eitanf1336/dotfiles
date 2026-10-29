@@ -1,0 +1,89 @@
+#!/bin/bash
+# vpn-watch: the Technion VPN jump host's watchdog (server, run by vpn-watch.timer every 2 min).
+#  1. Keeps the server's DNS alive: the Perimeter81 helper DNATs every DNS packet to its own
+#     proxy on 127.0.0.1:5354, which answers SERVFAIL when not logged in (broke the whole
+#     server's DNS on 29 Oct 2026). Three nat OUTPUT RETURN rules exempt systemd-resolved and
+#     loopback; they are re-added here if a reboot or the helper drops them.
+#  2. Checks srv3 is reachable (route 132.68.0.0/16 present AND TCP 132.68.161.39:22 answers).
+#     Down: try ~/bin/vpn-relogin (zero-click, only if credentials are stored), else pop a laptop
+#     notification + WhatsApp "My Claude": "Technion VPN dropped: open localhost:7830 and log in".
+#     Once per outage, then a reminder every 2 h. Recovery is logged and popped.
+# Off switch (rollback, the laptop owns the VPN again): touch ~/.config/vpn-jump/off
+set -u
+STATE="$HOME/.local/state"; mkdir -p "$STATE"
+LOG="$STATE/vpn-jump.log"; ST="$STATE/vpn-watch.state"
+SRV3=132.68.161.39
+REMIND=$((2*3600))
+log() { printf '%s watch %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+dns_guard() {   # our three RETURN rules must exist AND sit above the helper's DNAT (it may re-insert at the top)
+  local rules r out first_dnat last_ret bad=0
+  rules=("-p udp --dport 53 -m owner --uid-owner systemd-resolve -j RETURN"
+         "-p tcp --dport 53 -m owner --uid-owner systemd-resolve -j RETURN"
+         "-d 127.0.0.0/8 -p udp --dport 53 -j RETURN")
+  out=$(sudo -n iptables -t nat -S OUTPUT 2>/dev/null) || return 0
+  for r in "${rules[@]}"; do
+    # shellcheck disable=SC2086
+    sudo -n iptables -t nat -C OUTPUT $r 2>/dev/null || bad=1
+  done
+  first_dnat=$(grep -n -- '--to-destination 127.0.0.1:5354' <<<"$out" | head -1 | cut -d: -f1)
+  last_ret=$(grep -n -- '--dport 53 .*-j RETURN' <<<"$out" | tail -1 | cut -d: -f1)
+  [ -n "$first_dnat" ] && [ "${last_ret:-0}" -gt "$first_dnat" ] && bad=1
+  [ $bad = 0 ] && return 0
+  for r in "${rules[@]}"; do
+    # shellcheck disable=SC2086
+    while sudo -n iptables -t nat -D OUTPUT $r 2>/dev/null; do :; done
+  done
+  for r in "${rules[@]}"; do
+    # shellcheck disable=SC2086
+    sudo -n iptables -t nat -I OUTPUT 1 $r
+  done
+  log "dns-guard: (re)placed the DNS RETURN rules above the Perimeter81 DNAT"
+}
+
+say() {   # laptop popup + WhatsApp to My Claude, best effort
+  log "ALERT: $*"
+  timeout 8 notify-send -u critical "Technion VPN" "$*" 2>/dev/null || true
+  timeout 12 python3 - "$*" <<'PY' 2>/dev/null || true
+import json, sys, urllib.request
+body = json.dumps({"recipient": "120363410856554324@g.us",
+                   "message": "🤖🤖🤖\nTechnion VPN: " + sys.argv[1] + "\n🤖🤖🤖"}).encode()
+req = urllib.request.Request("http://localhost:8080/api/send", data=body,
+                             headers={"Content-Type": "application/json"})
+urllib.request.urlopen(req, timeout=10).read()
+PY
+}
+
+up() {
+  ip route | grep -q '^132.68.0.0/16' || return 1
+  timeout 8 bash -c "exec 3<>/dev/tcp/$SRV3/22" 2>/dev/null
+}
+
+dns_guard
+[ -e "$HOME/.config/vpn-jump/off" ] && exit 0
+
+now=$(date +%s)
+read -r state since last_alert 2>/dev/null <"$ST" || { state=unknown; since=$now; last_alert=0; }
+if up; then
+  if [ "$state" = down ]; then
+    mins=$(( (now - since) / 60 ))
+    log "back up after ${mins} min"
+    timeout 8 notify-send "Technion VPN" "srv3 reachable again through the server (down ${mins} min)" 2>/dev/null || true
+  fi
+  echo "up $now 0" >"$ST"; exit 0
+fi
+
+[ "$state" != down ] && { since=$now; last_alert=0; log "DOWN (route $(ip route | grep -c '^132.68.0.0/16'), tcp srv3:22 no)"; }
+LAST="$STATE/vpn-relogin.last"   # at most one robot login try per 15 min, so it never fights a human in the tab
+if [ -x "$HOME/bin/vpn-relogin" ] && [ -r "$HOME/.config/vpn-jump/credentials" ] && \
+   [ -z "$(find "$LAST" -mmin -15 2>/dev/null)" ]; then
+  touch "$LAST"
+  "$HOME/bin/vpn-relogin" >>"$LOG" 2>&1; rc=$?
+  log "vpn-relogin rc=$rc"
+  if [ $rc = 0 ] && sleep 20 && up; then log "relogin worked"; echo "up $now 0" >"$ST"; exit 0; fi
+fi
+if (( now - last_alert >= REMIND )); then
+  say "Technion VPN dropped: open localhost:7830 and log in (srv3 unreachable through the server)"
+  last_alert=$now
+fi
+echo "down $since $last_alert" >"$ST"

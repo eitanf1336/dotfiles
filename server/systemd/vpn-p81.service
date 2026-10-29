@@ -1,0 +1,17 @@
+[Unit]
+Description=Technion VPN jump: the Perimeter81 (Harmony SASE) app on display :81. ONE OWNER: do not connect the laptop's app at the same time
+Requires=vpn-xvfb.service
+After=vpn-xvfb.service vpn-wm.service network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=DISPLAY=:81
+Environment=PATH=%h/.local/share/vpn-jump/bin:%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/bin/sleep 4
+ExecStart=/opt/Perimeter81/perimeter81
+Environment=BROWSER=%h/.local/share/vpn-jump/bin/xdg-open
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target
