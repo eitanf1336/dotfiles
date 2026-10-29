@@ -4,9 +4,10 @@
 #     proxy on 127.0.0.1:5354, which answers SERVFAIL when not logged in (broke the whole
 #     server's DNS on 29 Oct 2026). Three nat OUTPUT RETURN rules exempt systemd-resolved and
 #     loopback; they are re-added here if a reboot or the helper drops them.
-#  2. Checks srv3 is reachable (route 132.68.0.0/16 present AND TCP 132.68.161.39:22 answers).
-#     Down: try ~/bin/vpn-relogin (zero-click, only if credentials are stored), else pop a laptop
-#     notification + WhatsApp "My Claude": "Technion VPN dropped: open localhost:7830 and log in".
+#  2. Checks srv3 is reachable (the kernel routes 132.68.161.39 via p81 AND TCP :22 answers).
+#     Down: try ~/bin/vpn-relogin (click-through: EU page, Microsoft SSO, Connect; max once per 15 min),
+#     and if that fails pop a laptop notification + WhatsApp "My Claude": "Technion VPN dropped:
+#     open localhost:7830 and log in" (or "needs your phone" when Microsoft asks for MFA).
 #     Once per outage, then a reminder every 2 h. Recovery is logged and popped.
 # Off switch (rollback, the laptop owns the VPN again): touch ~/.config/vpn-jump/off
 set -u
@@ -55,7 +56,9 @@ PY
 }
 
 up() {
-  ip route | grep -q '^132.68.0.0/16' || return 1
+  # the EU "Technion-Users" network is a FULL tunnel (0.0.0.0/1 + 128.0.0.0/1 dev p81), not 132.68.0.0/16,
+  # so ask the kernel which device srv3 goes out on
+  ip route get "$SRV3" 2>/dev/null | grep -q ' dev p81 ' || return 1
   timeout 8 bash -c "exec 3<>/dev/tcp/$SRV3/22" 2>/dev/null
 }
 
@@ -73,17 +76,18 @@ if up; then
   echo "up $now 0" >"$ST"; exit 0
 fi
 
-[ "$state" != down ] && { since=$now; last_alert=0; log "DOWN (route $(ip route | grep -c '^132.68.0.0/16'), tcp srv3:22 no)"; }
+[ "$state" != down ] && { since=$now; last_alert=0; log "DOWN (srv3 via: $(ip route get "$SRV3" 2>/dev/null | head -1 | grep -o 'dev [a-z0-9]*'), tcp srv3:22 no)"; }
 LAST="$STATE/vpn-relogin.last"   # at most one robot login try per 15 min, so it never fights a human in the tab
-if [ -x "$HOME/bin/vpn-relogin" ] && [ -r "$HOME/.config/vpn-jump/credentials" ] && \
-   [ -z "$(find "$LAST" -mmin -15 2>/dev/null)" ]; then
+msg="Technion VPN dropped: open localhost:7830 and log in (srv3 unreachable through the server)"
+if [ -x "$HOME/bin/vpn-relogin" ] && [ -z "$(find "$LAST" -mmin -15 2>/dev/null)" ]; then
   touch "$LAST"
   "$HOME/bin/vpn-relogin" >>"$LOG" 2>&1; rc=$?
   log "vpn-relogin rc=$rc"
-  if [ $rc = 0 ] && sleep 20 && up; then log "relogin worked"; echo "up $now 0" >"$ST"; exit 0; fi
+  if [ $rc = 0 ] && up; then log "relogin worked"; echo "up $now 0" >"$ST"; exit 0; fi
+  [ $rc = 5 ] && msg="Technion VPN needs you: Microsoft wants your phone (Authenticator) or password. Open localhost:7830"
 fi
 if (( now - last_alert >= REMIND )); then
-  say "Technion VPN dropped: open localhost:7830 and log in (srv3 unreachable through the server)"
+  say "$msg"
   last_alert=$now
 fi
 echo "down $since $last_alert" >"$ST"

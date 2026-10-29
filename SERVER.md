@@ -57,7 +57,7 @@ Eitan has two Linux machines on one Tailscale network:
   Log `~/.local/state/server-netwatch.log`, outages in `server-netwatch-outages.log`.
 - ServerScreen: `server-screen.service` (:7800) and the kiosk on the server's own display.
   Project stats reach it as: laptop `dashboard-laptop-push stats` (hourly; SurfStatus D1/KV via the laptop's wrangler, FocusRace Firebase; Eitan and tests dropped, rules in `TheDashboard/dashboard/collectors/projectstats.py`) -> `dash metric` on the server -> the screen reads The Dashboard. PolyArena was closed on 4 Oct 2026 and is gone from the screen and its money.
-- Technion VPN jump host (29 Oct 2026): the Perimeter81 app holds the VPN login on the server; `ssh srv3` on the laptop hops through it. See "Technion VPN jump host" below.
+- Technion VPN jump host (29 Oct 2026): the Perimeter81 / Harmony SASE app holds the VPN login on the server (the ONLY owner: the laptop app stays disconnected); `ssh srv3` on the laptop hops through it. Full tunnel: all server traffic exits via Technion. See "Technion VPN jump host" below.
 - Render farm: `cuteworld-farm.service` + the `farm` CLI (`farm day|night|status|queue|results`).
 - Apeirion launch recorder: `apeirion-launchrec.service` (scheduler, `launchwatch.mjs`) starts a transient `launchrec-<T0>-<id8>`
   unit 20 min before every SpaceX T-0: headless Chrome (Iris Xe, ANGLE gl-egl) films the live Apeirion page, `edit.py` cuts an
@@ -72,45 +72,65 @@ dev testbeds, desktop tools, `server-link`, `server-chats-sync`, `server-claude-
 
 ## Technion VPN jump host
 
-srv3 (132.68.161.39) is reachable only over the Technion VPN (Perimeter81 / Check Point "Harmony SASE",
-workspace `technion`, routes only 132.68.0.0/16). Technion WiFi blocks the VPN and the phone hotspot is
-unusable, so the VPN login lives on the SERVER (one owner) and the laptop reaches srv3 through it.
+srv3 (132.68.161.39) is reachable only over the Technion VPN (Check Point "Harmony SASE", formerly Perimeter81).
+Technion WiFi blocks the VPN and the phone hotspot is unusable, so the VPN login lives on the SERVER and the
+laptop reaches srv3 through it. Connected for the first time 29 Oct 2026 23:21.
 
+- **ONE OWNER: the server.** The laptop's Perimeter81 app stays installed (rollback) but must stay
+  DISCONNECTED from now on. Never connect both.
 - **What runs** (user units on the server, copies in `server/systemd/vpn-*`):
   `vpn-xvfb` (virtual display :81, 1280x800), `vpn-wm` (openbox), `vpn-vnc` (x11vnc on 127.0.0.1:5981, no password,
   localhost only), `vpn-novnc` (websockify + noVNC on **127.0.0.1:7830**), `vpn-p81` (the app,
   `/opt/Perimeter81/perimeter81`, same 10.0.3.933 .deb as the laptop, `~/Downloads/Perimeter81_10.0.3.933.deb`),
-  `vpn-watch.timer` (every 2 min, `server/bin/vpn-watch` -> server `~/bin/vpn-watch`).
-  The root helper `perimeter81helper.service` comes with the package.
-- **The screen**: http://localhost:7830 on the laptop (server-link port) opens the app's display in a browser tab.
-- **Login browser**: the app's "Sign In" opens a browser through `server/bin/vpn-xdg-open` (server
+  `vpn-watch.timer` (every 2 min, `server/bin/vpn-watch` -> server `~/bin/vpn-watch`), and the root
+  `perimeter81helper.service` from the package.
+- **The screen**: http://localhost:7830 on the laptop (server-link port) shows display :81 in a browser tab.
+- **The login** (the workspace is on the EU region; the US page `technion.perimeter81.com` says the account is
+  "not activated" and rejects the password):
+  https://technion.eu.sase.checkpoint.com/sign-in?redirectUrl=perimeter81://eu.sase.checkpoint.com/callback
+  -> "Sign in with Microsoft" (Technion SSO, login.microsoftonline.com/technion.ac.il) ->
+  `eitanfrenkel@campus.technion.ac.il` + his Technion password -> Microsoft Authenticator number match on his
+  phone ("Don't ask again for 30 days" ticked 29 Oct, so MFA is skipped until about 28 Nov 2026) -> Chrome's
+  "Open Perimeter81?" ("Always allow" ticked) -> Connect in the app, network **Technion-Users**.
+- **Re-login is a click-through**: `server/bin/vpn-relogin` (server `~/bin/vpn-relogin`, run by vpn-watch at most
+  once per 15 min, or by hand `ssh server vpn-relogin`) opens the EU page, clicks Sign in with Microsoft, presses
+  Enter on any Microsoft page, waits for the app's token, then clicks Connect. Microsoft keeps the browser signed
+  in (persistent cookie, valid to about Jan 2027), so it is normally zero-click (tested 29 Oct: callback -> new
+  token, tunnel stayed up). If Microsoft asks for the phone or the token never arrives, it exits 5 and vpn-watch
+  sends "Technion VPN needs you: Microsoft wants your phone (Authenticator) or password. Open localhost:7830"
+  (laptop popup + My Claude WhatsApp, once per outage, reminder every 2 h). Screenshots of each run in
+  `~/.local/state/vpn-relogin/`.
+- **The password lives only in Chrome's own password manager** in the dedicated profile
+  `~/.local/share/vpn-jump/chrome-profile` (Chrome stores it encrypted with `--password-store=basic`; no plain file,
+  never printed; protection is the server account's file permissions). It is saved by clicking Save on Chrome's
+  "Save password?" bubble at a human login; after that the Microsoft page autofills it.
+- **Login browser**: the app's links open through `server/bin/vpn-xdg-open` (server
   `~/.local/share/vpn-jump/bin/xdg-open`, first on vpn-p81's PATH): Google Chrome stable (official .deb,
-  `/opt/google/chrome`, installed 29 Oct 2026, updates via Google's apt repo) with its own profile
-  `~/.local/share/vpn-jump/chrome-profile`. Not the snap Chromium (it cannot hand the `perimeter81://...callback`
-  back to the app) and not Chrome for Testing (suspected of failing the page's invisible reCAPTCHA); those remain
-  only as fallbacks in the wrapper. Custom-scheme links reach the wrapper (tested), and it passes perimeter81:// to the app.
-- **How to (re)login**: open http://localhost:7830, click "Sign In to Harmony SASE" if the app shows it, workspace
-  `technion`, email `eitanfrenkel@campus.technion.ac.il` + password (plain email/password form with an invisible
-  reCAPTCHA), allow "Open Perimeter81" in the browser, then Connect in the app.
-  `vpn-watch` pops a laptop notification + My Claude WhatsApp "Technion VPN dropped: open localhost:7830 and log in"
-  when srv3 is unreachable (once per outage, reminder every 2 h). `server/bin/vpn-relogin` is a zero-click
-  skeleton that only runs if `~/.config/vpn-jump/credentials` (EMAIL=, PASSWORD=, mode 600) exists on the server;
-  it does not, by default.
-- **Session lifetime** (from the app's own settings log): access token 8 h, refresh token 24 h (another policy
-  says 14.6 days), `sessionExpirationPreferredTime` 03:00, `autoReconnect` user-settable (off by default),
-  `vpnAlwaysOn` and `connectOnLaunch` forced off by the Technion admin.
+  `/opt/google/chrome`, updates via Google's apt repo) with that profile. It hands `perimeter81://` callbacks
+  straight to the app and logs only scheme://host/path (callbacks carry tokens). Fallbacks in the wrapper:
+  Playwright's Chrome for Testing, then the snap Chromium (which cannot pass the callback on).
+  Note the app's own "Sign In" button opens the US page; use the EU URL above instead.
+- **App settings** (gear, bottom left): Connect on launch, Always-On VPN, Automatic Wi-Fi Security, Trusted
+  Wi-Fi, notifications and Automatic Updates are all "Set by Admin"; there is no auto-reconnect switch in the UI
+  (its policy value is off). Token lifetimes: access 8 h / 16 h, refresh 24 h / 14.6 days,
+  `sessionExpirationPreferredTime` 03:00. vpn-watch + vpn-relogin stand in for auto-reconnect.
+- **The tunnel is FULL** on this network: `0.0.0.0/1` + `128.0.0.0/1 dev p81` (tunnel address 10.250.88.x), so
+  ALL the server's internet leaves through Technion's gateway in Israel (public IP 212.59.64.200), not just
+  132.68.0.0/16. Tailscale keeps working. vpn-watch checks `ip route get 132.68.161.39` says `dev p81` plus a
+  TCP connect to srv3:22.
 - **DNS trap**: the helper DNATs ALL outgoing DNS to its proxy on 127.0.0.1:5354, which answers SERVFAIL while
   logged out; on 29 Oct 2026 that broke DNS for the whole server the moment the package was installed.
   `vpn-watch` keeps three nat OUTPUT RETURN rules (systemd-resolve's own queries, and anything to 127.0.0.0/8)
   above that DNAT, re-adding them after a reboot (timer fires 15 s after boot). Check: `sudo iptables -t nat -S OUTPUT`.
-- **Laptop side**: `~/.ssh/config` has `Match originalhost srv3 !exec "ip route | grep -q '^132.68.0.0/16'"` ->
-  `ProxyJump server`, so `ssh srv3` (and scp/rsync) goes direct when the laptop's own VPN is up and through the
-  server otherwise. The srv3 key stays on the laptop (passphrase + agent); the server only forwards TCP.
+- **Laptop side**: `~/.ssh/config` has `Match originalhost srv3 !exec "ip route get 132.68.161.39 2>/dev/null | grep -q ' dev p81 '"`
+  -> `ProxyJump server`: direct if the LAPTOP's own VPN carries srv3, through the server otherwise. The srv3 key
+  stays on the laptop (passphrase + agent); the server only forwards TCP. 29 Oct: `ssh srv3` 1.1 s, 10 MB in 1.9 s.
 - **Rollback** (laptop owns the VPN again): on the server
-  `touch ~/.config/vpn-jump/off; systemctl --user disable --now vpn-p81 vpn-watch.timer` (sign out in the app first
-  if possible), then connect the laptop's Perimeter81 app as before. Never have both connected at once.
-  Forward again: `rm ~/.config/vpn-jump/off; systemctl --user enable --now vpn-p81 vpn-watch.timer`.
-- Logs: `~/.local/state/vpn-jump.log` (watch + xdg-open lines) on the server; the app's own log is
+  `touch ~/.config/vpn-jump/off; systemctl --user disable --now vpn-p81 vpn-watch.timer` (Disconnect and sign out
+  in the app first, through localhost:7830), then connect the laptop's Perimeter81 app (EU workspace, Microsoft
+  sign-in). Never have both connected at once. Forward again: `rm ~/.config/vpn-jump/off;
+  systemctl --user enable --now vpn-p81 vpn-watch.timer`, then `ssh server vpn-relogin`.
+- Logs: `~/.local/state/vpn-jump.log` (watch, relogin, redacted xdg-open lines) on the server; the app's own log is
   `~/.config/Perimeter81/logs/gui.log`.
 
 ## Deploying a code change to something that runs on the server

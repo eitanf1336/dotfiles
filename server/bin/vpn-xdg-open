@@ -5,7 +5,8 @@
 # with its own profile, never the kiosk's chromium. perimeter81:// callbacks go back to the app.
 LOG=~/.local/state/vpn-jump.log
 url=$1
-printf '%s xdg-open %s\n' "$(date '+%F %T')" "${url:0:200}" >>"$LOG"
+# log only scheme://host/path: callbacks carry id_token/code in the query or fragment
+printf '%s xdg-open %s\n' "$(date '+%F %T')" "$(printf '%s' "$url" | sed -E 's/[?#].*/?<redacted>/' | cut -c1-200)" >>"$LOG"
 export DISPLAY=:81
 case "$url" in
   perimeter81:*|com.perimeter81*|sonicwall:*|com.sonicwall*)
@@ -16,7 +17,9 @@ esac
 # A plain (non-snap) browser: the snap Chromium cannot hand perimeter81:// callbacks back to the app.
 # 1st choice Google Chrome stable (official .deb, /opt/google/chrome): the login page's invisible
 # reCAPTCHA rejected Chrome for Testing ("Wrong username or password", 29 Oct 2026).
-args=(--no-first-run --no-default-browser-check --window-size=1100,760 --window-position=90,20 "$url")
+# --password-store=basic: Chrome's own encrypted store in the profile (no keyring on a headless box),
+# pinned so a keyring appearing later never orphans the saved Technion password.
+args=(--password-store=basic --no-first-run --no-default-browser-check --window-size=1100,760 --window-position=90,20 "$url")
 if [ -x /opt/google/chrome/google-chrome ]; then
   exec /opt/google/chrome/google-chrome --user-data-dir="$HOME/.local/share/vpn-jump/chrome-profile" "${args[@]}"
 fi

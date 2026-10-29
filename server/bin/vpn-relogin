@@ -1,49 +1,78 @@
 #!/bin/bash
-# vpn-relogin: zero-click re-login of the Perimeter81 (Harmony SASE) app on the server's virtual
-# display :81. SKELETON, untested end to end: it needs stored credentials and the post-login
-# screen layout, neither of which exists yet (29 Oct 2026).
-#   Credentials (only if Eitan says yes): ~/.config/vpn-jump/credentials, mode 600, lines
-#     EMAIL=...
-#     PASSWORD=...
-#   Without that file it exits 3 and vpn-watch falls back to the "open localhost:7830" popup.
-# Exit: 0 = it clicked through a login, 3 = no credentials, 4 = screens not where expected.
-# The login web page has a reCAPTCHA; if it ever shows a challenge this cannot pass it.
+# vpn-relogin: click-through re-login of the Perimeter81 / Check Point Harmony SASE app on the server's
+# virtual display :81 (seen at http://localhost:7830). Run by vpn-watch when srv3 is unreachable
+# (at most once per 15 min), or by hand: `ssh server vpn-relogin`.
+#
+# The real flow (29 Oct 2026): Technion's workspace is on the EU region,
+#   https://technion.eu.sase.checkpoint.com/sign-in?redirectUrl=perimeter81://eu.sase.checkpoint.com/callback
+# -> "Sign in with Microsoft" (Technion SSO, login.microsoftonline.com) -> Chrome hands the
+# perimeter81:// callback to the app ("Always allow" ticked) -> Connect (network Technion-Users).
+# Microsoft remembers the browser (ESTSAUTHPERSISTENT cookie, "stay signed in") and MFA is skipped
+# for 30 days, so usually no typing at all. If Microsoft wants the password, Chrome's own password
+# manager (vpn-jump profile, never a plain file) autofills it and Enter submits. If it wants the
+# phone (Authenticator number match), this gives up with exit 5 and vpn-watch tells Eitan.
+# No credentials live in this script or anywhere outside Chrome's store.
+# Exit: 0 srv3 reachable, 4 app/browser not where expected, 5 needs a human (phone or password).
 set -u
-CRED="$HOME/.config/vpn-jump/credentials"
-[ -r "$CRED" ] || { echo "vpn-relogin: no credentials, need a human at localhost:7830"; exit 3; }
-# shellcheck disable=SC1090
-. "$CRED"
-: "${EMAIL:?}" "${PASSWORD:?}"
-export DISPLAY=:81 PATH="$HOME/.local/share/vpn-jump/bin:$PATH"
-WORKSPACE=technion
-shot() { xwd -root -silent | convert xwd:- "$HOME/.local/state/vpn-relogin-$1.png" 2>/dev/null; }
+export DISPLAY=:81 PATH="$HOME/.local/share/vpn-jump/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
+EU_URL="https://technion.eu.sase.checkpoint.com/sign-in?redirectUrl=perimeter81://eu.sase.checkpoint.com/callback"
+APPLOG="$HOME/.config/Perimeter81/logs/gui.log"
+SHOTS="$HOME/.local/state/vpn-relogin"; mkdir -p "$SHOTS"
+SRV3=132.68.161.39
+say() { echo "$(date '+%F %T') relogin $*"; }
+shot() { xwd -root -silent | convert xwd:- "$SHOTS/$1.png" 2>/dev/null; }
+srv3_up() { ip route get "$SRV3" 2>/dev/null | grep -q ' dev p81 ' && timeout 8 bash -c "exec 3<>/dev/tcp/$SRV3/22" 2>/dev/null; }
+app_win() { xdotool search --onlyvisible --name '^Perimeter81$' 2>/dev/null | head -1; }
+chrome_win() { xdotool search --onlyvisible --class google-chrome 2>/dev/null | tail -1; }
+jwt_count() { grep -a -c '"type":"RECEIVE_JWT_TOKEN_AND_TENANT"' "$APPLOG" 2>/dev/null || echo 0; }
+logged_in() {   # the app's own log: was the last auth event a token (in) or a FULL_LOGOUT (out)?
+  grep -a -o -E '"type":"(FULL_LOGOUT|RECEIVE_JWT_TOKEN_AND_TENANT)"' "$APPLOG" 2>/dev/null | tail -1 | grep -q JWT
+}
+proxy_state() { grep -a -o -E '"RECEIVE_PROXY_STATE","payload":\{"state":"[a-z]+"' "$APPLOG" 2>/dev/null | tail -1 | grep -o -E '[a-z]+"$' | tr -d '"'; }
 
-# 1. The app window (800x600). On its signed-out screen the "Sign In to Harmony SASE" button
-#    sits at (+195,+397) from the window's corner; it opens the browser via vpn-xdg-open.
-app=$(xdotool search --onlyvisible --class Perimeter81 2>/dev/null | head -1)
-[ -n "$app" ] || { systemctl --user restart vpn-p81; sleep 15; app=$(xdotool search --onlyvisible --class Perimeter81 | head -1); }
-[ -n "$app" ] || { echo "vpn-relogin: no app window"; exit 4; }
-eval "$(xdotool getwindowgeometry --shell "$app")"   # X Y WIDTH HEIGHT
-shot 1-app
-xdotool mousemove $((X+195)) $((Y+397)) click 1
-sleep 12
+srv3_up && { say "srv3 already reachable"; exit 0; }
 
-# 2. The browser: workspace page (only the first time), then email + password.
-win=$(xdotool search --onlyvisible --name "Check Point" 2>/dev/null | tail -1)
-[ -n "$win" ] || { echo "vpn-relogin: no sign-in page"; shot 2-nobrowser; exit 4; }
-xdotool windowactivate --sync "$win"
-if xdotool getwindowname "$win" | grep -qi workspace; then
-  xdotool key ctrl+l; xdotool type --delay 20 "https://$WORKSPACE.perimeter81.com/sign-in?redirectUrl=perimeter81://perimeter81.com/callback"
-  xdotool key Return; sleep 10
+# 1. The app must be running (window 800x600, normally at 240,100).
+if [ -z "$(app_win)" ]; then
+  say "no app window, restarting vpn-p81"; systemctl --user restart vpn-p81; sleep 25
 fi
-shot 2-form
-# The email field has focus after load on this page; Tab moves to password.
-xdotool type --delay 40 "$EMAIL"; xdotool key Tab
-xdotool type --delay 40 "$PASSWORD"; xdotool key Return
-sleep 15
-# 3. The page hands perimeter81://...callback to the app (vpn-xdg-open), Chromium asks
-#    "Open Perimeter81?" once; Enter accepts the focused default only if it is "Open".
-shot 3-after
-# TODO after the first real login: the app's Connect button position, and the "Always allow"
-# checkbox on Chromium's protocol prompt, so this needs no guess.
-exit 0
+app=$(app_win); [ -n "$app" ] || { say "still no app window"; shot no-app; exit 4; }
+
+# 2. Signed out: sign in through the EU page in the vpn-jump Chrome profile.
+if ! logged_in; then
+  before=$(jwt_count)
+  say "signed out, opening the EU sign-in page"
+  xdg-open "$EU_URL" >/dev/null 2>&1; sleep 15
+  w=$(chrome_win); [ -n "$w" ] || { say "no Chrome window"; shot no-chrome; exit 4; }
+  xdotool windowactivate --sync "$w"; eval "$(xdotool getwindowgeometry --shell "$w")"
+  shot 1-signin
+  xdotool mousemove $((X+547)) $((Y+267)) click 1      # "Sign in with Microsoft" (window 1100x760)
+  for i in 1 2 3 4; do                                  # Microsoft: silent SSO, or autofilled password + Enter
+    sleep 12
+    [ "$(jwt_count)" -gt "$before" ] && break
+    t=$(xdotool getwindowname "$w" 2>/dev/null)
+    case "$t" in
+      *"Sign in to your account"*|*"Microsoft"*) shot "2-microsoft-$i"; xdotool windowactivate --sync "$w"; xdotool key Return ;;
+    esac
+  done
+  if [ "$(jwt_count)" -le "$before" ]; then
+    say "no token after the Microsoft step: needs the phone or the password"; shot 3-stuck; exit 5
+  fi
+  say "signed in"; sleep 8
+  w=$(chrome_win); [ -n "$w" ] && { xdotool windowactivate --sync "$w"; xdotool key ctrl+l; xdotool type "about:blank"; xdotool key Return; }  # drop the token URL
+fi
+
+# 3. Signed in but not connected: Home, then the big Connect button (same spot as Disconnect).
+if [ "$(proxy_state)" != connected ] || ! srv3_up; then
+  app=$(app_win); xdotool windowactivate --sync "$app"; eval "$(xdotool getwindowgeometry --shell "$app")"
+  xdotool mousemove $((X+71)) $((Y+117)) click 1; sleep 2   # Home
+  shot 4-home
+  if [ "$(proxy_state)" != connected ]; then
+    say "clicking Connect (state was $(proxy_state))"
+    xdotool mousemove $((X+480)) $((Y+366)) click 1        # Connect
+    sleep 25
+  fi
+fi
+shot 5-after
+if srv3_up; then say "srv3 reachable"; exit 0; fi
+say "still no srv3 after Connect"; exit 4
