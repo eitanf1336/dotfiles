@@ -84,11 +84,11 @@ unusable, so the VPN login lives on the SERVER (one owner) and the laptop reache
   The root helper `perimeter81helper.service` comes with the package.
 - **The screen**: http://localhost:7830 on the laptop (server-link port) opens the app's display in a browser tab.
 - **Login browser**: the app's "Sign In" opens a browser through `server/bin/vpn-xdg-open` (server
-  `~/.local/share/vpn-jump/bin/xdg-open`, first on vpn-p81's PATH). It uses Playwright's Chrome for Testing
-  (`~/.cache/ms-playwright/chromium-*/`, sandboxed with the package's setuid `/opt/Perimeter81/chrome-sandbox`)
-  with its own profile `~/.local/share/vpn-jump/browser-profile`, because the snap Chromium cannot hand the
-  `perimeter81://...callback` back to the app. If a Playwright update ever removes that build, the login
-  falls back to the snap and the callback breaks: reinstall Playwright's chromium or point the wrapper at another non-snap Chrome.
+  `~/.local/share/vpn-jump/bin/xdg-open`, first on vpn-p81's PATH): Google Chrome stable (official .deb,
+  `/opt/google/chrome`, installed 29 Oct 2026, updates via Google's apt repo) with its own profile
+  `~/.local/share/vpn-jump/chrome-profile`. Not the snap Chromium (it cannot hand the `perimeter81://...callback`
+  back to the app) and not Chrome for Testing (suspected of failing the page's invisible reCAPTCHA); those remain
+  only as fallbacks in the wrapper. Custom-scheme links reach the wrapper (tested), and it passes perimeter81:// to the app.
 - **How to (re)login**: open http://localhost:7830, click "Sign In to Harmony SASE" if the app shows it, workspace
   `technion`, email `eitanfrenkel@campus.technion.ac.il` + password (plain email/password form with an invisible
   reCAPTCHA), allow "Open Perimeter81" in the browser, then Connect in the app.

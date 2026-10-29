@@ -13,13 +13,16 @@ case "$url" in
   http:*|https:*|file:*|data:*|about:*|'') ;;
   *) exec /usr/bin/xdg-open "$url" ;;   # any other scheme: the system handler (never back into the browser)
 esac
-# A plain (non-snap) Chromium: the snap one cannot hand perimeter81:// callbacks back to the app.
-# Playwright's build is already on the server; the snap is only a fallback.
-chrome=$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux64/chrome 2>/dev/null | sort -V | tail -1)
+# A plain (non-snap) browser: the snap Chromium cannot hand perimeter81:// callbacks back to the app.
+# 1st choice Google Chrome stable (official .deb, /opt/google/chrome): the login page's invisible
+# reCAPTCHA rejected Chrome for Testing ("Wrong username or password", 29 Oct 2026).
 args=(--no-first-run --no-default-browser-check --window-size=1100,760 --window-position=90,20 "$url")
+if [ -x /opt/google/chrome/google-chrome ]; then
+  exec /opt/google/chrome/google-chrome --user-data-dir="$HOME/.local/share/vpn-jump/chrome-profile" "${args[@]}"
+fi
+# Fallbacks: Playwright's Chrome for Testing (setuid sandbox from the Perimeter81 package), then the snap.
+chrome=$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux64/chrome 2>/dev/null | sort -V | tail -1)
 if [ -x "$chrome" ]; then
-  # Ubuntu blocks the namespace sandbox for binaries without an AppArmor profile; use the setuid
-  # sandbox helper the Perimeter81 package already installs (keeps Chromium sandboxed).
   export CHROME_DEVEL_SANDBOX=/opt/Perimeter81/chrome-sandbox
   exec "$chrome" --user-data-dir="$HOME/.local/share/vpn-jump/browser-profile" "${args[@]}"
 fi
