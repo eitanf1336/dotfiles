@@ -10,7 +10,7 @@
 # Microsoft remembers the browser (ESTSAUTHPERSISTENT cookie, "stay signed in") and MFA is skipped
 # for 30 days, so usually no typing at all. If Microsoft wants the password, Chrome's own password
 # manager (vpn-jump profile, never a plain file) autofills it and Enter submits. If it wants the
-# phone (Authenticator number match), this gives up with exit 5 and vpn-watch tells Eitan.
+# phone, vpn-mslogin switches to the code method (vpn-totp); only if that fails does this exit 5 and vpn-watch tells Eitan.
 # No credentials live in this script or anywhere outside Chrome's store.
 # Exit: 0 srv3 reachable, 4 app/browser not where expected, 5 needs a human (phone or password).
 set -u
@@ -47,14 +47,11 @@ if ! logged_in; then
   xdotool windowactivate --sync "$w"; eval "$(xdotool getwindowgeometry --shell "$w")"
   shot 1-signin
   xdotool mousemove $((X+547)) $((Y+267)) click 1      # "Sign in with Microsoft" (window 1100x760)
-  for i in 1 2 3 4; do                                  # Microsoft: silent SSO, or autofilled password + Enter
-    sleep 12
-    [ "$(jwt_count)" -gt "$before" ] && break
-    t=$(xdotool getwindowname "$w" 2>/dev/null)
-    case "$t" in
-      *"Sign in to your account"*|*"Microsoft"*) shot "2-microsoft-$i"; xdotool windowactivate --sync "$w"; xdotool key Return ;;
-    esac
-  done
+  # Microsoft step: vpn-mslogin reads the page through Chrome's debugging port and walks it: account picker,
+  # Chrome-saved password, "Approve sign in request" -> "Use a verification code" with the code from vpn-totp
+  # (the authenticator method added 30 Oct 2026, secret sealed on this machine), "Stay signed in" -> Yes.
+  vpn-mslogin 150 | sed "s/^/  /"
+  for i in 1 2 3; do [ "$(jwt_count)" -gt "$before" ] && break; sleep 5; done
   if [ "$(jwt_count)" -le "$before" ]; then
     say "no token after the Microsoft step: needs the phone or the password"; shot 3-stuck; exit 5
   fi

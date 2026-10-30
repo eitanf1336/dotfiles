@@ -1,0 +1,11 @@
+#!/bin/bash
+# vpn-totp-store <file-with-secret>: seal the TOTP secret for vpn-totp and remove the plain file.
+# Tries systemd-creds (bound to this machine's key, --user scope), falls back to a 600 file.
+set -euo pipefail
+src=$1; d=$HOME/.config/vpn-jump; mkdir -p "$d"; chmod 700 "$d"
+if systemd-creds encrypt --user --name=vpn-totp "$src" "$d/totp.cred" 2>/dev/null; then
+  chmod 600 "$d/totp.cred"; rm -f "$d/totp.secret"; echo "sealed with systemd-creds: $d/totp.cred"
+else
+  install -m 600 "$src" "$d/totp.secret"; echo "stored as a 600 file: $d/totp.secret (systemd-creds not available)"
+fi
+rm -f "$src"

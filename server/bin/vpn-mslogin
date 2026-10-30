@@ -1,0 +1,50 @@
+#!/bin/bash
+# vpn-mslogin: walk the Microsoft (Technion SSO) sign-in that is open in the vpn-jump Chrome, by reading the
+# page through Chrome's localhost debugging port (cdp.js) instead of guessing from the window title.
+# Handles: account picker, password (Chrome's own saved password, filled by a real click + Enter, never from a
+# file), "Approve sign in request" (switches to "Use a verification code" and types the code from vpn-totp,
+# ticks "Don't ask again for 30 days"), "Stay signed in?" (Yes). Stops when the page leaves login.microsoftonline.com
+# or after $1 seconds (default 120). Exit 0 left Microsoft (signed in), 5 stuck (needs a human), 4 no page.
+# Nothing secret is printed: the code is a 30 second one-time code and is passed inside the page only.
+set -u
+export DISPLAY=:81 PATH="$HOME/.local/share/vpn-jump/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
+export CDP_URL=login.microsoftonline.com
+C=$HOME/.local/share/vpn-jump/bin/cdp.js
+limit=${1:-120}; t0=$(date +%s); last=""
+say() { echo "$(date '+%F %T') mslogin $*"; }
+text() { $C eval 'document.body.innerText.replace(/\s+/g," ").slice(0,600)' 2>/dev/null; }
+click_text() {   # click_text <text the element starts with>: buttons, links, role=button divs, account tiles
+  local t; t=$(printf '%s' "$1" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')
+  $C eval "(()=>{const t=$t; const e=[...document.querySelectorAll('button,a,input[type=submit],[role=button],div.table-row,div.tile')].find(e=>((e.innerText||e.value||'').trim()).startsWith(t)); if(!e) return 'none'; e.click(); return 'ok'})()" 2>/dev/null
+}
+while :; do
+  (( $(date +%s) - t0 > limit )) && { say "timeout on: ${last:0:80}"; exit 5; }
+  url=$($C eval 'location.href' 2>/dev/null) || { say "no Microsoft page"; exit 4; }
+  case "$url" in *login.microsoftonline.com*) ;; *) say "left Microsoft: ${url:0:60}"; exit 0 ;; esac
+  p=$(text); last=$p
+  case "$p" in
+    *"Pick an account"*)
+      click_text "eitanfrenkel@campus" >/dev/null; sleep 4 ;;
+    *"Enter password"*)
+      w=$(xdotool search --onlyvisible --class google-chrome | tail -1); xdotool windowactivate --sync "$w"
+      eval "$(xdotool getwindowgeometry --shell "$w")"
+      r=$($C eval '(()=>{const r=document.querySelector("input[type=password]").getBoundingClientRect();return Math.round(r.x+r.width/2)+","+Math.round(r.y+r.height/2)})()')
+      xdotool mousemove $((X+${r%,*})) $((Y+87+${r#*,})) click 1; sleep 1.5
+      n=$($C eval 'document.querySelector("input[type=password]").value.length')
+      [ "${n:-0}" -gt 0 ] || { say "password not filled by Chrome (save it once by hand at localhost:7830)"; exit 5; }
+      xdotool key Return; sleep 6 ;;
+    *"Approve sign in request"*|*"Enter the number"*)
+      click_text "I can't use my Microsoft Authenticator app right now" >/dev/null; sleep 3 ;;
+    *"Verify your identity"*)
+      click_text "Use a verification code" >/dev/null; sleep 3 ;;
+    *"Enter code"*|*"verification code"*)
+      code=$(vpn-totp) || { say "no code (vpn-totp)"; exit 5; }
+      $C eval "(()=>{const i=document.querySelector('input[name=otc], input#idTxtBx_SAOTCC_OTC, input[type=tel], input[type=text]'); const s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set; i.focus(); s.call(i,'$code'); i.dispatchEvent(new Event('input',{bubbles:true})); const cb=document.querySelector('input#idChkBx_SAOTCC_TD, input[type=checkbox]'); if(cb&&!cb.checked) cb.click(); const b=document.querySelector('input#idSubmit_SAOTCC_Continue, input[type=submit], button[type=submit]'); b.click(); return 'ok'})()" >/dev/null
+      sleep 6 ;;
+    *"Stay signed in"*)
+      $C eval '(()=>{const b=document.querySelector("input#idSIButton9, input[type=submit]"); b.click(); return "ok"})()' >/dev/null; sleep 4 ;;
+    *"incorrect"*|*"didn't work"*|*"Something went wrong"*)
+      say "Microsoft error: ${p:0:120}"; exit 5 ;;
+    *) sleep 3 ;;
+  esac
+done

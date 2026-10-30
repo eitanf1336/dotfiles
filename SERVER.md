@@ -92,14 +92,25 @@ laptop reaches srv3 through it. Connected for the first time 29 Oct 2026 23:21.
   `eitanfrenkel@campus.technion.ac.il` + his Technion password -> Microsoft Authenticator number match on his
   phone ("Don't ask again for 30 days" ticked 29 Oct, so MFA is skipped until about 28 Nov 2026) -> Chrome's
   "Open Perimeter81?" ("Always allow" ticked) -> Connect in the app, network **Technion-Users**.
-- **Re-login is a click-through**: `server/bin/vpn-relogin` (server `~/bin/vpn-relogin`, run by vpn-watch at most
-  once per 15 min, or by hand `ssh server vpn-relogin`) opens the EU page, clicks Sign in with Microsoft, presses
-  Enter on any Microsoft page, waits for the app's token, then clicks Connect. Microsoft keeps the browser signed
-  in (persistent cookie, valid to about Jan 2027), so it is normally zero-click (tested 29 Oct: callback -> new
-  token, tunnel stayed up). If Microsoft asks for the phone or the token never arrives, it exits 5 and vpn-watch
-  sends "Technion VPN needs you: Microsoft wants your phone (Authenticator) or password. Open localhost:7830"
-  (laptop popup + My Claude WhatsApp, once per outage, reminder every 2 h). Screenshots of each run in
-  `~/.local/state/vpn-relogin/`.
+- **Re-login is automatic, phone-free (30 Oct 2026)**: `server/bin/vpn-relogin` (server `~/bin/vpn-relogin`, run by
+  vpn-watch at most once per 15 min, or by hand `ssh server vpn-relogin`) opens the EU page, clicks Sign in with
+  Microsoft, then hands the Microsoft pages to `vpn-mslogin`, which reads them through Chrome's localhost debugging
+  port 9333 (`vpn-cdp.js`, the port is set in `vpn-xdg-open`) and walks: account picker -> password (Chrome's saved
+  one, filled by a real click, Enter) -> "Approve sign in request" -> "I can't use my Authenticator" -> "Use a
+  verification code" -> the 6-digit code from `vpn-totp` -> "Stay signed in" Yes. Then the app's token arrives and
+  it clicks Connect. The 30-day "don't ask again" tick did NOT hold (Technion forces a fresh sign-in; 29 Oct night
+  it asked again at 07:26 next morning), hence the code method. If anything is off it exits 5 and vpn-watch sends
+  "Technion VPN needs you ... Open localhost:7830" (laptop popup + My Claude WhatsApp, once per outage, reminder
+  every 2 h). Screenshots of each run in `~/.local/state/vpn-relogin/`. UNTESTED end to end as of 30 Oct 10:50
+  (Eitan declined the sign-out test); first real try is the next VPN drop.
+- **The code authenticator**: a second "authenticator app" method on his Microsoft account (added 30 Oct 2026 09:28,
+  one phone tap of his). Its secret exists only on the server, sealed by `systemd-creds encrypt --user` into
+  `~/.config/vpn-jump/totp.cred` (bound to that machine's key: a copied file decrypts nowhere else; no plain copy
+  anywhere, never printed). `vpn-totp` prints the current code; `vpn-totp-store <file>` seals a new secret.
+  Default sign-in method is still "notification", so his phone also buzzes at each server login; he can switch it
+  to "code" himself at mysignins.microsoft.com/security-info (Kit's classifier refused that account change).
+  Security cost, said plainly: the server now holds both factors (Chrome's password store + the sealed code secret),
+  so root on the server equals his Technion login; the server is Tailscale-only with key auth.
 - **The password lives only in Chrome's own password manager** in the dedicated profile
   `~/.local/share/vpn-jump/chrome-profile` (Chrome stores it encrypted with `--password-store=basic`; no plain file,
   never printed; protection is the server account's file permissions). It is saved by clicking Save on Chrome's

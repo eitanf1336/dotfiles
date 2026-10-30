@@ -21,7 +21,7 @@ esac
 # pinned so a keyring appearing later never orphans the saved Technion password.
 args=(--password-store=basic --no-first-run --no-default-browser-check --window-size=1100,760 --window-position=90,20 "$url")
 if [ -x /opt/google/chrome/google-chrome ]; then
-  exec /opt/google/chrome/google-chrome --user-data-dir="$HOME/.local/share/vpn-jump/chrome-profile" "${args[@]}"
+  exec /opt/google/chrome/google-chrome --user-data-dir="$HOME/.local/share/vpn-jump/chrome-profile" --remote-debugging-port=9333 "${args[@]}"
 fi
 # Fallbacks: Playwright's Chrome for Testing (setuid sandbox from the Perimeter81 package), then the snap.
 chrome=$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux64/chrome 2>/dev/null | sort -V | tail -1)
