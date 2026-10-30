@@ -101,8 +101,9 @@ laptop reaches srv3 through it. Connected for the first time 29 Oct 2026 23:21.
   it clicks Connect. The 30-day "don't ask again" tick did NOT hold (Technion forces a fresh sign-in; 29 Oct night
   it asked again at 07:26 next morning), hence the code method. If anything is off it exits 5 and vpn-watch sends
   "Technion VPN needs you ... Open localhost:7830" (laptop popup + My Claude WhatsApp, once per outage, reminder
-  every 2 h). Screenshots of each run in `~/.local/state/vpn-relogin/`. UNTESTED end to end as of 30 Oct 10:50
-  (Eitan declined the sign-out test); first real try is the next VPN drop.
+  every 2 h). Screenshots of each run in `~/.local/state/vpn-relogin/`. TESTED end to end 30 Oct 2026 18:45 (laptop time) on the first real drop: the
+  walker had stalled on the "Verify your identity" option list because Microsoft's tiles ignore a synthetic .click();
+  click_text now does a real xdotool click at the element (fallback .click()); re-login then took 3 minutes, no phone.
 - **The code authenticator**: a second "authenticator app" method on his Microsoft account (added 30 Oct 2026 09:28,
   one phone tap of his). Its secret exists only on the server, sealed by `systemd-creds encrypt --user` into
   `~/.config/vpn-jump/totp.cred` (bound to that machine's key: a copied file decrypts nowhere else; no plain copy

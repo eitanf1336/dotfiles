@@ -15,6 +15,19 @@ say() { echo "$(date '+%F %T') mslogin $*"; }
 text() { $C eval 'document.body.innerText.replace(/\s+/g," ").slice(0,600)' 2>/dev/null; }
 click_text() {   # click_text <text the element starts with>: buttons, links, role=button divs, account tiles
   local t; t=$(printf '%s' "$1" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')
+  # A real mouse click at the element (Microsoft's option tiles ignore a synthetic .click(): 30 Oct 2026 the
+  # "Verify your identity" page sat for 2 minutes with 'ok' returned and nothing selected); .click() is the fallback.
+  local r w
+  r=$($C eval "(()=>{const t=$t; const e=[...document.querySelectorAll('button,a,input[type=submit],[role=button],div.table-row,div.tile')].find(e=>((e.innerText||e.value||'').trim()).startsWith(t)); if(!e) return 'none'; e.scrollIntoView({block:'center'}); const b=e.getBoundingClientRect(); return Math.round(b.x+b.width/2)+','+Math.round(b.y+b.height/2)})()" 2>/dev/null)
+  case "$r" in
+    none|"") echo none; return 1 ;;
+  esac
+  w=$(xdotool search --onlyvisible --class google-chrome | tail -1)
+  if [ -n "$w" ]; then
+    xdotool windowactivate --sync "$w" 2>/dev/null
+    eval "$(xdotool getwindowgeometry --shell "$w")"
+    xdotool mousemove $((X+${r%,*})) $((Y+87+${r#*,})) click 1 && { echo ok; return 0; }
+  fi
   $C eval "(()=>{const t=$t; const e=[...document.querySelectorAll('button,a,input[type=submit],[role=button],div.table-row,div.tile')].find(e=>((e.innerText||e.value||'').trim()).startsWith(t)); if(!e) return 'none'; e.click(); return 'ok'})()" 2>/dev/null
 }
 while :; do
