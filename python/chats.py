@@ -3139,6 +3139,17 @@ def remote_trust(host, cwd):
         remote_run(host, f"python3 -c {shlex.quote(_REMOTE_TRUST_PY)} {shlex.quote(cwd)}", 20)
 
 
+def _remote_attach_cmd(host, cmd):
+    """The command that attaches a chat on another machine. mosh when both sides
+    have it (1 Nov 2026: from the Technion network Tailscale relays through
+    Frankfurt, 260 ms per keystroke over ssh; mosh echoes locally), else ssh -t.
+    mosh quotes the command itself, so the shell string goes through as one arg."""
+    import shutil
+    if shutil.which("mosh"):
+        return ["mosh", host, "--", "sh", "-c", cmd]
+    return ["ssh", "-t", host, cmd]
+
+
 def open_remote_chat(app, c, action):
     """Open / resume / fork / stop a chat that lives on another machine. Same
     behaviour as the local paths, over ssh: attach is `ssh -t host claude attach`,
@@ -3195,7 +3206,7 @@ def open_remote_chat(app, c, action):
                 _json_set(SUPERSEDED_STORE, c["id"], new_full)
     print(f"  Attaching on {host}: press Ctrl+Z to leave it running and come back.\n")
     set_window_title(short)
-    run_child(["ssh", "-t", host, f"{env}claude attach {short}"])
+    run_child(_remote_attach_cmd(host, f"{env}claude attach {short}"))
 
 
 def _remote_bg_cmd(launch):
@@ -3795,7 +3806,7 @@ def main():
                         _json_set(PROJECT_TAGS_STORE, full, app.active_project)
                 print("  Attaching: press Ctrl+Z to leave it running and come back.\n")
                 set_window_title(short)
-                run_child(["ssh", "-t", host, f"{env}claude attach {short}"])
+                run_child(_remote_attach_cmd(host, f"{env}claude attach {short}"))
                 continue
             print(f"\n▶ Creating a new background chat"
                   f"{f' in {run_cwd}' if run_cwd else ''}"
