@@ -3,8 +3,8 @@
 
 mosh 1.4 drops SGR 2 (faint/dim), so Claude Code's grey prompt suggestion
 showed up as normal bright text, looking like typed input. This sits between
-the program and mosh-server and rewrites every SGR so that dim (2) becomes
-bright-black (90) and "normal intensity" (22) also resets the colour (39).
+the program and mosh-server and rewrites every SGR so that dim (2) becomes a light grey
+(256-colour 246) and "normal intensity" (22) also resets the colour (39).
 Everything else passes through untouched. Resizes and exit status are forwarded.
 """
 import fcntl
@@ -37,7 +37,7 @@ def fix_params(m):
             i += n
             continue
         if p == b"2":
-            out.append(b"90")
+            out.append(b"38;5;246")
         elif p == b"22":
             out.extend([b"22", b"39"])
         else:
