@@ -3146,7 +3146,9 @@ def _remote_attach_cmd(host, cmd):
     mosh quotes the command itself, so the shell string goes through as one arg."""
     import shutil
     if shutil.which("mosh"):
-        return ["mosh", host, "--", "sh", "-c", cmd]
+        # mosh drops "dim" text (SGR 2), so the grey prompt suggestion looked
+        # like typed input; mosh-dimfix on the host turns dim into grey.
+        return ["mosh", host, "--", "/home/eitan/bin/mosh-dimfix", "sh", "-c", cmd]
     return ["ssh", "-t", host, cmd]
 
 

@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""mosh-dimfix CMD [ARGS...]: run CMD in a pty and turn "dim" text into grey.
+
+mosh 1.4 drops SGR 2 (faint/dim), so Claude Code's grey prompt suggestion
+showed up as normal bright text, looking like typed input. This sits between
+the program and mosh-server and rewrites every SGR so that dim (2) becomes
+bright-black (90) and "normal intensity" (22) also resets the colour (39).
+Everything else passes through untouched. Resizes and exit status are forwarded.
+"""
+import fcntl
+import os
+import pty
+import re
+import select
+import signal
+import struct
+import sys
+import termios
+import tty
+
+SGR = re.compile(rb"\x1b\[([0-9;:]*)m")
+# An escape sequence that may have been cut at the end of a read.
+TAIL = re.compile(rb"\x1b(\[[0-9;:?]*)?$")
+
+
+def fix_params(m):
+    raw = m.group(1)
+    if not raw:
+        return m.group(0)
+    parts = raw.split(b";")
+    out, i = [], 0
+    while i < len(parts):
+        p = parts[i]
+        if p in (b"38", b"48") and i + 1 < len(parts):
+            n = 3 if parts[i + 1] == b"5" else 5 if parts[i + 1] == b"2" else 1
+            out.extend(parts[i:i + n])
+            i += n
+            continue
+        if p == b"2":
+            out.append(b"90")
+        elif p == b"22":
+            out.extend([b"22", b"39"])
+        else:
+            out.append(p)
+        i += 1
+    return b"\x1b[" + b";".join(out) + b"m"
+
+
+def winsize(fd):
+    try:
+        return fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+    except OSError:
+        return None
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit("usage: mosh-dimfix CMD [ARGS...]")
+    pid, master = pty.fork()
+    if pid == 0:
+        os.execvp(sys.argv[1], sys.argv[1:])
+
+    stdin, stdout = sys.stdin.fileno(), sys.stdout.fileno()
+    ws = winsize(stdin)
+    if ws:
+        fcntl.ioctl(master, termios.TIOCSWINSZ, ws)
+
+    def on_winch(*_):
+        w = winsize(stdin)
+        if w:
+            fcntl.ioctl(master, termios.TIOCSWINSZ, w)
+            os.kill(pid, signal.SIGWINCH)
+
+    signal.signal(signal.SIGWINCH, on_winch)
+    old = None
+    if os.isatty(stdin):
+        old = termios.tcgetattr(stdin)
+        tty.setraw(stdin)
+    carry = b""
+    try:
+        while True:
+            try:
+                r, _, _ = select.select([master, stdin], [], [])
+            except InterruptedError:
+                continue
+            if master in r:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                data = carry + data
+                carry = b""
+                t = TAIL.search(data)
+                if t and len(data) - t.start() < 64:
+                    carry = data[t.start():]
+                    data = data[:t.start()]
+                os.write(stdout, SGR.sub(fix_params, data))
+            if stdin in r:
+                data = os.read(stdin, 65536)
+                if not data:
+                    break
+                os.write(master, data)
+        if carry:
+            os.write(stdout, carry)
+    finally:
+        if old:
+            termios.tcsetattr(stdin, termios.TCSAFLUSH, old)
+    _, status = os.waitpid(pid, 0)
+    sys.exit(os.waitstatus_to_exitcode(status))
+
+
+if __name__ == "__main__":
+    main()
