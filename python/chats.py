@@ -3148,7 +3148,10 @@ def _remote_attach_cmd(host, cmd):
     if shutil.which("mosh"):
         # mosh drops "dim" text (SGR 2), so the grey prompt suggestion looked
         # like typed input; mosh-dimfix on the host turns dim into grey.
-        return ["mosh", host, "--", "/home/eitan/bin/mosh-dimfix", "sh", "-c", cmd]
+        # --predict-overwrite: inserting predictions shoved the grey suggestion
+        # right and flashed it as typed text until the server repainted.
+        return ["mosh", "--predict-overwrite", host, "--",
+                "/home/eitan/bin/mosh-dimfix", "sh", "-c", cmd]
     return ["ssh", "-t", host, cmd]
 
 
