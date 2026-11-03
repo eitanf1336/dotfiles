@@ -225,7 +225,7 @@ def pull_remote(ledger, since):
                     f.write(account)
             if files:
                 r = subprocess.run(
-                    ["rsync", "-a", "-e", ssh, "--files-from=-",
+                    ["rsync", "-a", "--append", "--bwlimit=96", "-e", ssh, "--files-from=-",   # append-only files; cap so a catch-up never starves interactive server chats over the Tailscale relay (3 Nov 2026)
                      f"{host}:{rdir}/", dest + "/"],
                     input="\n".join(files), capture_output=True, text=True, timeout=600)
                 if r.returncode not in (0, 23, 24):   # 23/24 = a file vanished mid-copy (the arena CLI deletes its own)

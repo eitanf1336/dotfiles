@@ -4,6 +4,7 @@
 #     proxy on 127.0.0.1:5354, which answers SERVFAIL when not logged in (broke the whole
 #     server's DNS on 29 Oct 2026). Three nat OUTPUT RETURN rules exempt systemd-resolved and
 #     loopback; they are re-added here if a reboot or the helper drops them.
+#  1b. split_tunnel: the VPN carries only Technion traffic (see the function).
 #  2. Checks srv3 is reachable (the kernel routes 132.68.161.39 via p81 AND TCP :22 answers).
 #     Down: try ~/bin/vpn-relogin (click-through: EU page, Microsoft SSO, Connect; max once per 15 min),
 #     and if that fails pop a laptop notification + WhatsApp "My Claude": "Technion VPN dropped:
@@ -42,6 +43,28 @@ dns_guard() {   # our three RETURN rules must exist AND sit above the helper's D
   log "dns-guard: (re)placed the DNS RETURN rules above the Perimeter81 DNAT"
 }
 
+split_tunnel() {   # Eitan, 3 Nov 2026: the VPN is ONLY for Technion (srv1/2/3). The app sets a full tunnel
+  # (0.0.0.0/1 + 128.0.0.0/1 dev p81), which also dragged Tailscale through it: no direct laptop link,
+  # 400-800 ms relayed chats. So: (a) Tailscale's own packets (fwmark 0x80000) always use the home router
+  # (table 181), even in the minutes before (b) runs again after a reconnect; (b) swap the full tunnel for
+  # Technion 132.68.0.0/16 + the VPN's DNS server; (c) only *.technion.ac.il names go to the VPN's DNS.
+  local gw dns d
+  gw=$(ip route show default dev wlo1 2>/dev/null | awk '{print $3; exit}')
+  if [ -n "$gw" ]; then
+    sudo -n ip route replace default via "$gw" dev wlo1 table 181 2>/dev/null
+    ip rule show | grep -q 'lookup 181' || sudo -n ip rule add fwmark 0x80000/0xff0000 lookup 181 priority 5208
+  fi
+  ip link show p81 >/dev/null 2>&1 || return 0
+  ip route show dev p81 | grep -qE '^(0\.0\.0\.0|128\.0\.0\.0)/1' || return 0
+  sudo -n ip route replace 132.68.0.0/16 dev p81
+  dns=$(resolvectl dns p81 2>/dev/null | sed 's/.*://')
+  for d in $dns; do sudo -n ip route replace "$d/32" dev p81 2>/dev/null; done
+  sudo -n ip route del 0.0.0.0/1 dev p81 2>/dev/null
+  sudo -n ip route del 128.0.0.0/1 dev p81 2>/dev/null
+  sudo -n resolvectl default-route p81 false 2>/dev/null
+  log "split-tunnel: VPN now carries only 132.68.0.0/16 + its DNS ($dns); the rest exits the home router"
+}
+
 say() {   # laptop popup + WhatsApp to My Claude, best effort
   log "ALERT: $*"
   timeout 8 notify-send -u critical "Technion VPN" "$*" 2>/dev/null || true
@@ -63,6 +86,7 @@ up() {
 }
 
 dns_guard
+split_tunnel
 [ -e "$HOME/.config/vpn-jump/off" ] && exit 0
 
 now=$(date +%s)

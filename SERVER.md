@@ -57,7 +57,7 @@ Eitan has two Linux machines on one Tailscale network:
   Log `~/.local/state/server-netwatch.log`, outages in `server-netwatch-outages.log`.
 - ServerScreen: `server-screen.service` (:7800) and the kiosk on the server's own display.
   Project stats reach it as: laptop `dashboard-laptop-push stats` (hourly; SurfStatus D1/KV via the laptop's wrangler, FocusRace Firebase; Eitan and tests dropped, rules in `TheDashboard/dashboard/collectors/projectstats.py`) -> `dash metric` on the server -> the screen reads The Dashboard. PolyArena was closed on 4 Oct 2026 and is gone from the screen and its money.
-- Technion VPN jump host (29 Oct 2026): the Perimeter81 / Harmony SASE app holds the VPN login on the server (the ONLY owner: the laptop app stays disconnected); `ssh srv3` on the laptop hops through it. Full tunnel: all server traffic exits via Technion. See "Technion VPN jump host" below.
+- Technion VPN jump host (29 Oct 2026): the Perimeter81 / Harmony SASE app holds the VPN login on the server (the ONLY owner: the laptop app stays disconnected); `ssh srv3` on the laptop hops through it. Split tunnel since 3 Nov 2026: the app sets a full tunnel, `vpn-watch` swaps it for Technion only (132.68.0.0/16 + the VPN's DNS, *.technion.ac.il names only) and pins Tailscale's own packets to the home router (ip rule fwmark 0x80000 -> table 181). The full tunnel had dragged Tailscale through the VPN: 400-800 ms server chats. See "Technion VPN jump host" below.
 - Render farm: `cuteworld-farm.service` + the `farm` CLI (`farm day|night|status|queue|results`).
 - Apeirion launch recorder: `apeirion-launchrec.service` (scheduler, `launchwatch.mjs`) starts a transient `launchrec-<T0>-<id8>`
   unit 20 min before every SpaceX T-0: headless Chrome (Iris Xe, ANGLE gl-egl) films the live Apeirion page, `edit.py` cuts an
@@ -82,7 +82,7 @@ laptop reaches srv3 through it. Connected for the first time 29 Oct 2026 23:21.
   `vpn-xvfb` (virtual display :81, 1280x800), `vpn-wm` (openbox), `vpn-vnc` (x11vnc on 127.0.0.1:5981, no password,
   localhost only), `vpn-novnc` (websockify + noVNC on **127.0.0.1:7830**), `vpn-p81` (the app,
   `/opt/Perimeter81/perimeter81`, same 10.0.3.933 .deb as the laptop, `~/Downloads/Perimeter81_10.0.3.933.deb`),
-  `vpn-watch.timer` (every 2 min, `server/bin/vpn-watch` -> server `~/bin/vpn-watch`), and the root
+  `vpn-watch.timer` (every 2 min, `server/bin/vpn-watch` -> server `~/bin/vpn-watch`; also re-applies the split tunnel), and the root
   `perimeter81helper.service` from the package.
 - **The screen**: http://localhost:7830 on the laptop (server-link port) shows display :81 in a browser tab.
 - **The login** (the workspace is on the EU region; the US page `technion.perimeter81.com` says the account is
@@ -218,3 +218,23 @@ Late grandpa Chaim's ThinkPad E570 (GTX 950M), Ubuntu 26.04 on its NVMe since 2 
 - **/tmp scratch cleanup (26 Sep 2026):** server crontab entry `# claude-scratch-clean` deletes files older than 2 h under /tmp/claude-1000/*MinecraftArena-runs* every hour (xx:17). /tmp is tmpfs, and the arena bots' headless claude sessions leaked 2.5 GB of cached camera frames into RAM. The Minecraft chat confirmed nothing reads them after a chapter (15-25 min).
 - **zram swappiness 180 (26 Sep 2026):** /etc/sysctl.d/99-zram-swappiness.conf on the server so idle pages compress into the 7.7 GB zram before renders get frozen. Undo: delete the file and `sudo sysctl vm.swappiness=60`.
 - **Root reserve 5% -> 2% (29 Oct 2026):** the server's disk hit 100% (0 bytes free for user services; MinecraftArena alone is 106 GB, `runs/` 68 GB) while installing the VPN jump host. `sudo tune2fs -m 2 /dev/nvme0n1p2` freed ~7 GB for users without deleting anything. Undo: `sudo tune2fs -m 5 /dev/nvme0n1p2`. The real fix is clearing old MinecraftArena runs/out (his call).
+
+## Laptop <-> server link (why server chats can lag)
+
+- Home internet is behind the ISP's carrier NAT (router WAN `100.84.23.159`, outside UDP `147.235.196.120`), so a
+  router port forward or UPnP can never make the server reachable from outside. TechPublic WiFi is a strict
+  (symmetric) NAT. Together: from the Technion, Tailscale is ALWAYS relayed through a DERP in Germany, about
+  150-250 ms per round trip at best, worse when TechPublic is lossy. Check with `tailscale ping 100.85.207.11`.
+- Never let a bulk copy hog that relay: the transcript mirrors (`server-chats-sync`, `quota-budget`) use
+  `rsync --append --bwlimit=96`. A big copy at full speed made every keystroke in a server chat wait behind it.
+- The only real fixes (not done): a public IP from the home ISP (then UPnP gives a direct link), or a small
+  public VPS near Israel as a Tailscale peer relay.
+- If `ssh server` hangs but `ssh -o ControlPath=none server` works, the shared master is wedged:
+  `systemctl --user restart ssh-mux-server`.
+
+## If the server dies: its chats are already on the laptop
+
+`server-chats-sync` mirrors every server transcript to `~/.claude/remote/server/projects/<dir>/<id>.jsonl` every 15 s
+(read-only, MinecraftArena bot runs skipped). To revive one on the laptop: copy the file into
+`~/.claude/projects/<same dir>/`, then `cd <its cwd> && claude --resume <id>`.
+
