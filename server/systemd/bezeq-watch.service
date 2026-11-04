@@ -1,0 +1,10 @@
+[Unit]
+Description=Chat with Bezeq on WhatsApp until the home line gets a public IP (temporary, 4 Nov 2026)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/bin/bezeq-watch
+TimeoutStartSec=600

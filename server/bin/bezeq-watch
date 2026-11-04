@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""bezeq-watch: get the home line off Bezeq's CGNAT (Eitan, 4 Nov 2026), unattended.
+
+Why: home internet sits behind Bezeq's carrier NAT (router WAN 100.84.x), so from TechPublic
+Tailscale is always relayed through Germany and server chats lag. A public IP (dynamic is
+enough, free) lets UPnP give a direct link. Nothing else needs setting up after that.
+
+Runs every minute from bezeq-watch.timer on the server:
+  1. New messages from Bezeq's WhatsApp bot/agent (or a long silence) -> ask `claude -p` (Sonnet)
+     what to answer -> send it. Never agrees to anything that costs money.
+  2. When it needs a detail (ID number, name, address ...), it asks Eitan in his WhatsApp chat with
+     HIMSELF ("Message yourself"; NOT My Claude, which other chats use). His plain replies there
+     are read back in as answers.
+  3. Every 10 min: is the router's outside address public yet (tailscale debug portmap)? If yes:
+     tell Eitan, stop the timer. That is the whole job.
+State: ~/.local/state/bezeq-watch/ (log.jsonl conversation, facts.md Eitan's answers, state.json).
+Off switch: systemctl --user disable --now bezeq-watch.timer
+"""
+import datetime as dt
+import ipaddress
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.request
+
+HOME = os.path.expanduser("~")
+DB = f"{HOME}/code/whatsapp-mcp/whatsapp-bridge/store/messages.db"
+ST = f"{HOME}/.local/state/bezeq-watch"
+LOG, FACTS, STATE = f"{ST}/log.jsonl", f"{ST}/facts.md", f"{ST}/state.json"
+BEZEQ_SEND = "972506777700"
+BEZEQ_CHATS = ("260129257709598@lid", "972506777700@s.whatsapp.net")
+SELF_SEND = "972584498447"
+SELF_CHATS = ("193729012973593@lid", "972584498447@s.whatsapp.net")
+TAG = "🤖 Bezeq:"
+MAX_CALLS_PER_DAY = 40
+IDLE_NUDGE_S = 2 * 3600  # repeat silence checks this often
+
+os.makedirs(ST, exist_ok=True)
+os.chmod(ST, 0o700)
+
+
+def now():
+    return time.time()
+
+
+def load_state():
+    try:
+        return json.load(open(STATE))
+    except Exception:
+        return {"seen_bezeq": "", "seen_self": "", "calls": {}, "last_ip_check": 0,
+                "last_sent": 0, "last_idle_call": 0, "done": False, "waiting_on_eitan": False}
+
+
+def save_state(s):
+    tmp = STATE + ".tmp"
+    json.dump(s, open(tmp, "w"), indent=1, ensure_ascii=False)
+    os.replace(tmp, STATE)
+
+
+def log(kind, text, **kw):
+    with open(LOG, "a") as f:
+        f.write(json.dumps({"t": dt.datetime.now().isoformat(timespec="seconds"), "kind": kind,
+                            "text": text, **kw}, ensure_ascii=False) + "\n")
+
+
+def send(to, msg):
+    body = json.dumps({"recipient": to, "message": msg}).encode()
+    req = urllib.request.Request("http://localhost:8080/api/send", data=body,
+                                 headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req, timeout=20).read()
+
+
+def new_msgs(chats, since, from_me):
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+    q = (f"select timestamp, content, media_type from messages where chat_jid in "
+         f"({','.join('?' * len(chats))}) and is_from_me=? and timestamp>? order by timestamp")
+    rows = con.execute(q, (*chats, 1 if from_me else 0, since)).fetchall()
+    con.close()
+    return rows
+
+
+def router_is_public():
+    try:
+        out = subprocess.run(["sudo", "-n", "timeout", "25", "tailscale", "debug", "portmap"],
+                             capture_output=True, text=True, timeout=40).stdout
+    except Exception:
+        return None
+    m = re.findall(r"external=([0-9.]+):\d+", out)
+    if not m:
+        return None
+    ip = ipaddress.ip_address(m[-1])
+    return (not ip.is_private) and ip not in ipaddress.ip_network("100.64.0.0/10"), str(ip)
+
+
+BRIEF = """You are handling a WhatsApp chat with Bezeq (Israeli ISP) customer service, on behalf of
+Eitan Frenkel, a home internet customer. Write to Bezeq in short, polite, natural Hebrew.
+
+GOAL: get the home internet line off CGNAT and onto a public IPv4 address. A DYNAMIC public IP is
+enough. The router today gets a 100.84.x.x WAN address (carrier NAT). Free only.
+
+HARD RULES:
+- Never agree to anything that costs money (no paid static IP, no plan change, no paid technician,
+  no new equipment, no upgrades or offers). If they say it only comes with a fee, ask whether a free
+  dynamic public IP / CGNAT removal is possible; if truly not, politely decline and set done_failed.
+- Never invent personal details. Use only what is in FACTS. If Bezeq needs something not in FACTS,
+  put a short question for Eitan in ask_eitan (in English, plain, one line) and, if helpful, tell
+  Bezeq briefly that you are checking (e.g. "רגע, אני בודק ואחזור עם הפרטים").
+- If the bot shows a menu, pick the option closest to internet / technical support / talk to a
+  representative. Asking for a human representative ("נציג אנושי") is fine.
+- A router restart or remote router configuration by Bezeq is fine. Agree to it.
+- Don't repeat yourself. If they already said it is done, reply thanks and set bezeq_says_done.
+- If nothing new needs saying (e.g. they said to wait), reply with "" and explain in note.
+
+Output ONLY one JSON object, no prose, no code fence:
+{"reply": "<Hebrew text to send to Bezeq, or empty>",
+ "ask_eitan": "<one-line English question for Eitan, or empty>",
+ "bezeq_says_done": false, "done_failed": false,
+ "note": "<one short English line on what is happening>"}
+"""
+
+
+def ask_model(state, trigger):
+    day = dt.date.today().isoformat()
+    state["calls"] = {day: state["calls"].get(day, 0)}
+    if state["calls"][day] >= MAX_CALLS_PER_DAY:
+        log("limit", f"daily model-call cap {MAX_CALLS_PER_DAY} reached")
+        return None
+    state["calls"][day] += 1
+    convo = []
+    if os.path.exists(LOG):
+        for line in open(LOG):
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if e["kind"] in ("bezeq", "us", "eitan", "asked"):
+                who = {"bezeq": "BEZEQ", "us": "US (sent to Bezeq)", "eitan": "EITAN (answer to us)",
+                       "asked": "WE ASKED EITAN"}[e["kind"]]
+                convo.append(f"[{e['t']}] {who}: {e['text']}")
+    facts = open(FACTS).read() if os.path.exists(FACTS) else "(nothing yet)"
+    prompt = (BRIEF + "\n\nFACTS (from Eitan):\n" + facts + "\n\nCONVERSATION SO FAR (oldest first):\n"
+              + "\n".join(convo[-80:]) + f"\n\nTRIGGER: {trigger}\nNow output the JSON.")
+    try:
+        r = subprocess.run(["claude", "-p", "--model", "sonnet", prompt], capture_output=True,
+                           text=True, timeout=300, cwd=ST)
+    except Exception as e:
+        log("error", f"claude failed: {e}")
+        return None
+    m = re.search(r"\{.*\}", r.stdout, re.S)
+    if not m:
+        log("error", f"no JSON from claude: {r.stdout[-300:]} {r.stderr[-200:]}")
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        log("error", f"bad JSON: {m.group(0)[:300]}")
+        return None
+
+
+def act(state, d):
+    if not d:
+        return
+    log("note", d.get("note", ""))
+    if d.get("reply"):
+        send(BEZEQ_SEND, d["reply"])
+        log("us", d["reply"])
+        state["last_sent"] = now()
+    if d.get("ask_eitan"):
+        send(SELF_SEND, f"{TAG} {d['ask_eitan']}\n(just reply here)")
+        log("asked", d["ask_eitan"])
+        state["waiting_on_eitan"] = True
+    if d.get("done_failed"):
+        send(SELF_SEND, f"{TAG} Bezeq won't do it for free. Note: {d.get('note', '')}. I stopped.")
+        finish(state, "failed")
+    if d.get("bezeq_says_done"):
+        state["bezeq_said_done"] = now()
+        state["last_ip_check"] = 0  # check right away
+
+
+def finish(state, how):
+    state["done"] = how
+    save_state(state)
+    log("finish", how)
+    subprocess.run(["systemctl", "--user", "disable", "--now", "bezeq-watch.timer"])
+    subprocess.run([f"{HOME}/bin/server-now", "bezeq", "--clear"], capture_output=True)
+
+
+def main():
+    state = load_state()
+    if state.get("done"):
+        return
+    if not state["seen_bezeq"]:  # first run: the opening message was sent by hand at 16:16 on 4 Nov
+        state["seen_bezeq"] = "2026-11-04 16:00:00+02:00"
+        state["seen_self"] = dt.datetime.now().astimezone().isoformat(sep=" ", timespec="seconds")
+        state["last_sent"] = now()
+        if not os.path.exists(LOG):
+            log("us", "שלום, אני לקוח אינטרנט של בזק בבית. החיבור שלי נמצא מאחורי CGNAT (הנתב מקבל כתובת "
+                      "100.84.x.x), ואני צריך כתובת IP ציבורית כדי להתחבר למחשב בבית מבחוץ. אפשר בבקשה "
+                      "להוציא את החיבור מ-CGNAT ולתת כתובת IP ציבורית? כתובת דינמית מספיקה, לא צריך IP "
+                      "קבוע בתשלום. תודה!")
+
+    # 3. the goal check
+    if now() - state["last_ip_check"] > 600:
+        state["last_ip_check"] = now()
+        r = router_is_public()
+        if r and r[0]:
+            send(SELF_SEND, f"{TAG} Done: the home router now has a public address ({r[1]}). "
+                            "Server chats can go direct now; nothing for you to do.")
+            finish(state, "public:" + r[1])
+            return
+        if r:
+            state["router_ip"] = r[1]
+
+    trigger = []
+    # 2. Eitan's answers in his self-chat (ignore our own tagged messages)
+    for ts, content, media in new_msgs(SELF_CHATS, state["seen_self"], True):
+        state["seen_self"] = ts
+        if content and not content.startswith(TAG) and not content.startswith("🤖"):
+            log("eitan", content)
+            with open(FACTS, "a") as f:
+                f.write(f"- {content}\n")
+            os.chmod(FACTS, 0o600)
+            trigger.append("Eitan answered: " + content)
+            state["waiting_on_eitan"] = False
+    # 1. Bezeq
+    for ts, content, media in new_msgs(BEZEQ_CHATS, state["seen_bezeq"], False):
+        state["seen_bezeq"] = ts
+        text = content or f"[message with no text{', ' + media if media else ''}; maybe buttons/list]"
+        log("bezeq", text)
+        trigger.append("New message from Bezeq.")
+    # silence: first look after 20 min, then every 2 h until something moves
+    gap = 1200 if state["last_idle_call"] < state["last_sent"] else IDLE_NUDGE_S
+    if not trigger and not state["waiting_on_eitan"] and now() - state["last_sent"] > 1200 \
+            and now() - state["last_idle_call"] > gap:
+        state["last_idle_call"] = now()
+        trigger.append(f"No reply from Bezeq for {int((now() - state['last_sent']) / 3600)} h.")
+    if trigger:
+        subprocess.run([f"{HOME}/bin/server-now", "bezeq", "working", "chatting with Bezeq for a public IP",
+                        "--ttl", "2h"], capture_output=True)
+        act(state, ask_model(state, " ".join(trigger)))
+    save_state(state)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        log("error", repr(e))
+        sys.exit(1)
