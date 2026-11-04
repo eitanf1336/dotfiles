@@ -232,7 +232,7 @@ Late grandpa Chaim's ThinkPad E570 (GTX 950M), Ubuntu 26.04 on its NVMe since 2 
 - If `ssh server` hangs but `ssh -o ControlPath=none server` works, the shared master is wedged:
   `systemctl --user restart ssh-mux-server`.
 
-- **bezeq-watch (temporary, 4 Nov 2026):** `bezeq-watch.timer` (every minute) runs `server/bin/bezeq-watch`, which chats
+- **bezeq-watch (STOPPED 4 Nov 2026, Eitan handles Bezeq himself; timer disabled):** `bezeq-watch.timer` (every minute) runs `server/bin/bezeq-watch`, which chats
   with Bezeq's WhatsApp (972506777700) via `claude -p --model sonnet` to get the home line off CGNAT (free public IP),
   asks Eitan in his WhatsApp self-chat (never My Claude) when it needs a detail, and disables itself once
   `tailscale debug portmap` shows a public router address. State + conversation: `~/.local/state/bezeq-watch/`.
