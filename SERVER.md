@@ -228,7 +228,8 @@ Late grandpa Chaim's ThinkPad E570 (GTX 950M), Ubuntu 26.04 on its NVMe since 2 
 - Never let a bulk copy hog that relay: the transcript mirrors (`server-chats-sync`, `quota-budget`) use
   `rsync --append --bwlimit=96`. A big copy at full speed made every keystroke in a server chat wait behind it.
 - The only real fixes (not done): a public IP from the home ISP (then UPnP gives a direct link), or a small
-  public VPS near Israel as a Tailscale peer relay.
+  public VPS near Israel as a Tailscale peer relay. Asked Bezeq 4 Nov 2026: no free CGNAT removal, only a
+  fixed IP at 15.10 NIS/month; Eitan spends no money on this, so declined. Oracle free tier sign-up failed for him.
 - If `ssh server` hangs but `ssh -o ControlPath=none server` works, the shared master is wedged:
   `systemctl --user restart ssh-mux-server`.
 
