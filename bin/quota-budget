@@ -424,7 +424,27 @@ def tick(rebuild=None):
     save(LEDGER, ledger)
     save(SEEN, seen)
     save(STATUS, compute_status(ledger))
+    push_status()
     return 0
+
+
+def push_status():
+    """Copy status.json to every host so the hook THERE can block too (the
+    server's chats were never budgeted before 4 Nov 2026: no status, no block).
+    The remote hook treats a status older than STALE_AFTER as stale and never
+    blocks on it, so a dead link fails open, as before."""
+    hosts = load(HOSTS, {"server": ".claude/projects"})
+    for host in hosts:
+        try:
+            with open(STATUS, "rb") as f:
+                subprocess.run(
+                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                     "-o", "ControlPath=none", host,
+                     "mkdir -p ~/.claude/quota-budget && cat > ~/.claude/quota-budget/status.json.tmp"
+                     " && mv ~/.claude/quota-budget/status.json.tmp ~/.claude/quota-budget/status.json"],
+                    stdin=f, timeout=30, capture_output=True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- math

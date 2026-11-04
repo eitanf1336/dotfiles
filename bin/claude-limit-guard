@@ -17,6 +17,8 @@ from datetime import datetime
 STOP_AT   = float(os.environ.get("CLG_STOP_AT", "95"))
 WARN_AT   = float(os.environ.get("CLG_WARN_AT", "90"))
 BLIND_AT  = int(os.environ.get("CLG_BLIND_AT", "4"))   # consecutive failed reads before shouting
+RATE_PTS      = float(os.environ.get("CLG_RATE_PTS", "8"))      # weekly points ...
+RATE_WINDOW_H = float(os.environ.get("CLG_RATE_WINDOW_H", "3")) # ... within this many hours = burn alarm
 DIR       = os.path.expanduser("~/.claude/limits-guard")
 PAUSE     = os.path.join(DIR, "PAUSE")
 STATE     = os.path.join(DIR, "state.json")
@@ -104,9 +106,33 @@ def main():
            f"Agents pause automatically at {STOP_AT:.0f}%.\n\n\U0001F916\U0001F916\U0001F916")
         log(f"warned at {week}%")
 
+    # Burn-rate alarm (4 Nov 2026): on 1 Nov the weekly bar went 75% -> 94% in
+    # six hours while the 90/95 thresholds were still far off. A fast climb is
+    # the signal, whatever the level, so shout early with who is spending.
+    now = datetime.now().timestamp()
+    hist = [h for h in state.get("hist", []) if now - h[0] <= RATE_WINDOW_H * 3600]
+    hist.append([now, week])
+    rate_alerted = float(state.get("rate_alerted", 0))
+    rise = week - min(h[1] for h in hist)
+    if rise >= RATE_PTS and now - rate_alerted > RATE_WINDOW_H * 3600:
+        rate_alerted = now
+        try:
+            top = subprocess.run(["quota-budget", "top"], capture_output=True, text=True,
+                                 timeout=60).stdout.strip().splitlines()[:3]
+        except Exception:
+            top = []
+        who = "\n".join("- " + " ".join(t.split()[:1] + t.split()[4:5]).replace("/home/eitan/", "~/")
+                        for t in top) or "- (quota-budget top failed)"
+        wa(f"\U0001F916\U0001F916\U0001F916\n\nQuota BURN alarm: weekly usage rose {rise:.0f} points "
+           f"in the last {RATE_WINDOW_H:g}h (now {week:.0f}%). Biggest spenders this week:\n{who}\n\n"
+           f"Check `quota-budget top` and stop whatever is running unattended.\n\n"
+           f"\U0001F916\U0001F916\U0001F916")
+        log(f"BURN alarm: +{rise}% in {RATE_WINDOW_H}h, now {week}%")
+
     if week != last:
         log(f"weekly={week}%")
-    json.dump({"last": week, "warned": warned, "fails": 0}, open(STATE, "w"))
+    json.dump({"last": week, "warned": warned, "fails": 0, "hist": hist,
+               "rate_alerted": rate_alerted}, open(STATE, "w"))
     return 0
 
 
