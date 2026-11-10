@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# gpt: ask ChatGPT (via the Codex CLI, signed in with Eitan's ChatGPT plan) and print only the answer.
+#   gpt "question"            one-shot, read-only, no files touched
+#   echo text | gpt "review"  stdin is appended to the prompt
+#   gpt -m <model> "q"        pick a model
+#   gpt --here "q"            let it read the current directory (still read-only)
+# Login lives in ~/.codex (re-login: codex login --device-auth). Usage left: codex, then /status.
+set -euo pipefail
+
+model=() here=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -m|--model) model=(-m "$2"); shift 2 ;;
+        --here) here=1; shift ;;
+        -h|--help) sed -n 2,8p "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) break ;;
+    esac
+done
+[[ $# -eq 0 ]] && { echo "usage: gpt [-m model] [--here] \"question\"" >&2; exit 2; }
+
+prompt="$*"
+if [[ ! -t 0 ]]; then
+    prompt+=$'\n\n'"$(cat)"
+fi
+
+out=$(mktemp); trap 'rm -f "$out"' EXIT
+dir=$PWD
+[[ $here -eq 0 ]] && dir=$(mktemp -d) && trap 'rm -f "$out"; rmdir "$dir" 2>/dev/null' EXIT
+
+if ! codex exec --skip-git-repo-check --ephemeral -s read-only -C "$dir" "${model[@]}" \
+        -o "$out" "$prompt" </dev/null >"$out.log" 2>&1; then
+    cat "$out.log" >&2; rm -f "$out.log"; exit 1
+fi
+rm -f "$out.log"
+cat "$out"; [[ -n $(tail -c1 "$out") ]] && echo; true
