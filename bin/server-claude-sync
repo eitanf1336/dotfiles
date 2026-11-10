@@ -5,7 +5,7 @@
 ssh -o ConnectTimeout=8 server true 2>/dev/null || exit 0
 R="rsync -a --timeout=60"
 $R -L ~/.claude/CLAUDE.md ~/.claude/statusline.sh ~/.claude/settings.json server:.claude/
-$R --delete ~/.claude/skills ~/.claude/commands ~/.claude/prompts server:.claude/
+$R --delete --exclude 'moodle-context/config*.ini' ~/.claude/skills ~/.claude/commands ~/.claude/prompts server:.claude/
 $R --exclude .git ~/.claude/kit/ server:.claude/kit/
 M=.claude/projects/-home-eitan/memory/
 $R --update ~/"$M" server:"$M"
