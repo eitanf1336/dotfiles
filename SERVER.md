@@ -104,6 +104,13 @@ laptop reaches srv3 through it. Connected for the first time 29 Oct 2026 23:21.
   every 2 h). Screenshots of each run in `~/.local/state/vpn-relogin/`. TESTED end to end 30 Oct 2026 18:45 (laptop time) on the first real drop: the
   walker had stalled on the "Verify your identity" option list because Microsoft's tiles ignore a synthetic .click();
   click_text now does a real xdotool click at the element (fallback .click()); re-login then took 3 minutes, no phone.
+- **Drops, what they are and what heals them (15 Nov 2026)**: (1) Technion ends every VPN session after 8 hours
+  (`accessTokenExpire` in the app log): unavoidable, `vpn-relogin` signs in again, about 4 minutes, no phone.
+  (2) The home wifi (`Tofi`) vanished twice for 2 minutes (`ssid-not-found` in the NetworkManager log); the app then
+  sits on "disconnected" with a valid login. `vpn-watch` now clicks Connect on every run in that case (fast path, no
+  15 minute wait), closes the dead sign-in tabs the robot login leaves behind (`prune-tabs`: 317 tabs had eaten
+  13 GB), and alerts Eitan only when Microsoft wants him or an outage passes 10 minutes. A wired link for the server
+  would remove cause (2).
 - **The code authenticator**: a second "authenticator app" method on his Microsoft account (added 30 Oct 2026 09:28,
   one phone tap of his). Its secret exists only on the server, sealed by `systemd-creds encrypt --user` into
   `~/.config/vpn-jump/totp.cred` (bound to that machine's key: a copied file decrypts nowhere else; no plain copy

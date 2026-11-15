@@ -98,6 +98,40 @@ up() {
   timeout 8 bash -c "exec 3<>/dev/tcp/$SRV3/22" 2>/dev/null
 }
 
+APPLOG="$HOME/.config/Perimeter81/logs/gui.log"
+logged_in() {   # the app's own log: was the last auth event a token (in) or a FULL_LOGOUT (out)? (as vpn-relogin)
+  grep -a -o -E '"type":"(FULL_LOGOUT|RECEIVE_JWT_TOKEN_AND_TENANT)"' "$APPLOG" 2>/dev/null | tail -1 | grep -q JWT
+}
+proxy_state() { grep -a -o -E '"RECEIVE_PROXY_STATE","payload":\{"state":"[a-z]+"' "$APPLOG" 2>/dev/null | tail -1 | grep -o -E '[a-z]+"$' | tr -d '"'; }
+
+prune_tabs() {   # 15 Nov 2026: every robot login left its Microsoft tabs open in the vpn-jump Chrome: 317 tabs,
+  # about 13 GB, the server ran out of memory and swap. Called only while srv3 is reachable (no login in
+  # flight, nobody in the tab): closes the dead sign-in tabs, always keeps one page so the window stays.
+  local n
+  n=$(timeout 30 python3 - <<'PY' 2>/dev/null
+import json, urllib.request
+B = "http://127.0.0.1:9333"
+pages = [t for t in json.load(urllib.request.urlopen(B + "/json/list", timeout=5)) if t.get("type") == "page"]
+dead = [t for t in pages if t.get("url", "").startswith(("https://login.microsoftonline.com/", "https://login.live.com/",
+        "https://technion.eu.sase.checkpoint.com/", "about:blank", "chrome://newtab"))]
+if len(dead) == len(pages):
+    dead = dead[1:]
+closed = 0
+if len(pages) > 3:
+    for t in dead:
+        for method in ("GET", "PUT"):
+            try:
+                urllib.request.urlopen(urllib.request.Request(B + "/json/close/" + t["id"], method=method), timeout=5).read()
+                closed += 1
+                break
+            except Exception:
+                pass
+print(closed)
+PY
+)
+  [ "${n:-0}" -gt 0 ] 2>/dev/null && log "prune-tabs: closed $n dead sign-in tabs in the vpn-jump Chrome"
+}
+
 dns_guard
 dns_fallback
 split_tunnel
@@ -111,20 +145,28 @@ if up; then
     log "back up after ${mins} min"
     timeout 8 notify-send "Technion VPN" "srv3 reachable again through the server (down ${mins} min)" 2>/dev/null || true
   fi
+  prune_tabs
   echo "up $now 0" >"$ST"; exit 0
 fi
 
 [ "$state" != down ] && { since=$now; last_alert=0; log "DOWN (srv3 via: $(ip route get "$SRV3" 2>/dev/null | head -1 | grep -o 'dev [a-z0-9]*'), tcp srv3:22 no)"; }
 LAST="$STATE/vpn-relogin.last"   # at most one robot login try per 15 min, so it never fights a human in the tab
 msg="Technion VPN dropped: open localhost:7830 and log in (srv3 unreachable through the server)"
-if [ -x "$HOME/bin/vpn-relogin" ] && [ -z "$(find "$LAST" -mmin -15 2>/dev/null)" ]; then
-  touch "$LAST"
+# 15 Nov 2026: two of the day's drops were the home wifi vanishing for 2 minutes; the app then sits on
+# "disconnected" with its login still valid, and all it needs is the Connect click. No sign-in tab is involved,
+# so there is nobody to fight: retry on every run (2 min), not once per 15 min. ("reconnecting" is left to the app.)
+fast=0; rc=0
+if logged_in && [ "$(proxy_state)" = disconnected ] && ip route show default dev wlo1 2>/dev/null | grep -q .; then fast=1; fi
+if [ -x "$HOME/bin/vpn-relogin" ] && { [ $fast = 1 ] || [ -z "$(find "$LAST" -mmin -15 2>/dev/null)" ]; }; then
+  [ $fast = 1 ] && log "fast path: signed in, tunnel disconnected, clicking Connect" || touch "$LAST"
   "$HOME/bin/vpn-relogin" >>"$LOG" 2>&1; rc=$?
   log "vpn-relogin rc=$rc"
   if [ $rc = 0 ] && up; then log "relogin worked"; echo "up $now 0" >"$ST"; exit 0; fi
   [ $rc = 5 ] && msg="Technion VPN needs you: Microsoft wants your phone (Authenticator) or password. Open localhost:7830"
 fi
-if (( now - last_alert >= REMIND )); then
+# a short blip heals by itself (the Connect click, or the 8-hourly re-login): tell Eitan only when Microsoft
+# wants him (rc 5) or the outage has lasted 10 minutes
+if { [ $rc = 5 ] || (( now - since >= 600 )); } && (( now - last_alert >= REMIND )); then
   say "$msg"
   last_alert=$now
 fi
