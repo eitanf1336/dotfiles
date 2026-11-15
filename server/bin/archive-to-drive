@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# archive-to-drive DRIVE_DIR LOCAL_PARENT ITEM...
+# For each ITEM (a file or folder inside LOCAL_PARENT): make sure DRIVE_DIR/ITEM.tar.zst
+# exists and holds exactly the same files (count + total bytes, read back FROM Drive),
+# uploading it first if missing or wrong. Only then delete the local ITEM.
+# Written 2026-11-15 to clear the server disk (MinecraftArena, CuteWorld).
+set -uo pipefail
+DRIVE=$1; PARENT=$2; shift 2
+LOG=$HOME/.local/state/archive-to-drive.log
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG"; }
+local_sig()  { (cd "$PARENT" && find "$1" -type f -printf '%s\n' | awk '{s+=$1;n++} END{print n+0, s+0}'); }
+remote_sig() { rclone cat "$DRIVE/$1.tar.zst" 2>/dev/null | zstd -dc 2>/dev/null | tar -tvf - 2>/dev/null \
+               | awk '$1 ~ /^-/ {s+=$3;n++} END{print n+0, s+0}'; }
+for it in "$@"; do
+    [[ -e "$PARENT/$it" ]] || { log "skip $it (gone locally)"; continue; }
+    want=$(local_sig "$it")
+    have=$(remote_sig "$it")
+    if [[ "$have" != "$want" ]]; then
+        log "upload $it (local $want, drive ${have:-none})"
+        (cd "$PARENT" && tar -cf - "$it" | zstd -T2 -3 -q | rclone rcat "$DRIVE/$it.tar.zst") || { log "UPLOAD FAILED $it"; continue; }
+        have=$(remote_sig "$it")
+    fi
+    if [[ "$have" == "$want" && "$want" != "0 0" ]]; then
+        rm -rf -- "$PARENT/$it" && log "VERIFIED+DELETED $it ($want) free=$(df -BG --output=avail / | tail -1 | tr -d ' ')"
+    else
+        log "MISMATCH $it local=$want drive=$have, kept"
+    fi
+done
+log "batch done"
