@@ -20,7 +20,9 @@ for it in "$@"; do
         (cd "$PARENT" && tar -cf - "$it" | zstd -T2 -3 -q | rclone rcat "$DRIVE/$it.tar.zst") || { log "UPLOAD FAILED $it"; continue; }
         have=$(remote_sig "$it")
     fi
-    if [[ "$have" == "$want" && "$want" != "0 0" ]]; then
+    if [[ "$have" == "$want" && "$want" != "0 0" && "$PARENT" -ef "$HOME/code/MyProjects" ]]; then
+        log "VERIFIED, NOT DELETED $it: whole project folder, needs his yes (delete rule)"
+    elif [[ "$have" == "$want" && "$want" != "0 0" ]]; then
         rm -rf -- "$PARENT/$it" && log "VERIFIED+DELETED $it ($want) free=$(df -BG --output=avail / | tail -1 | tr -d ' ')"
     else
         log "MISMATCH $it local=$want drive=$have, kept"
