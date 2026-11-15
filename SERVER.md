@@ -282,3 +282,11 @@ Late grandpa Chaim's ThinkPad E570 (GTX 950M), Ubuntu 26.04 on its NVMe since 2 
 (read-only, MinecraftArena bot runs skipped). To revive one on the laptop: copy the file into
 `~/.claude/projects/<same dir>/`, then `cd <its cwd> && claude --resume <id>`.
 
+
+## WiFi stability (15 Nov 2026)
+The server has the same Intel AX201 as the laptop. With WiFi power save on, it lost the AP (beacon loss,
+"ssid-not-found") for 1 to 2 minutes at a time, which froze every ssh/mosh session and dropped p81.
+Applied on the server: `/etc/NetworkManager/conf.d/zz-wifi-powersave-off.conf` (from `wifi/`, live via
+`iw dev wlo1 set power_save off`) and `/etc/modprobe.d/iwlwifi-server-stability.conf` (power_save=0,
+uapsd_disable=1, regdom IL; next boot). `disable_11ax` is NOT set: no firmware crashes seen on the server.
+If drops continue, check `sudo journalctl -k | grep -E "BEACON-LOSS|deauth|Microcode"` first; a cable is the real cure.
