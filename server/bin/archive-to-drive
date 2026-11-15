@@ -17,7 +17,12 @@ for it in "$@"; do
     have=$(remote_sig "$it")
     if [[ "$have" != "$want" ]]; then
         log "upload $it (local $want, drive ${have:-none})"
-        (cd "$PARENT" && tar -cf - "$it" | zstd -T2 -3 -q | rclone rcat "$DRIVE/$it.tar.zst") || { log "UPLOAD FAILED $it"; continue; }
+        # Stage to a local file: a streamed rcat cannot resume, and big runs failed mid-upload.
+        tmp="$HOME/.cache/archive-to-drive/$it.tar.zst"; mkdir -p "${tmp%/*}"
+        (cd "$PARENT" && tar -cf - "$it" | zstd -T2 -3 -q -o "$tmp" -f) \
+          && rclone copyto "$tmp" "$DRIVE/$it.tar.zst" --retries 5 \
+          || { rm -f "$tmp"; log "UPLOAD FAILED $it"; continue; }
+        rm -f "$tmp"
         have=$(remote_sig "$it")
     fi
     if [[ "$have" == "$want" && "$want" != "0 0" && "$PARENT" -ef "$HOME/code/MyProjects" ]]; then
