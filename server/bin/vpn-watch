@@ -65,6 +65,19 @@ split_tunnel() {   # Eitan, 3 Nov 2026: the VPN is ONLY for Technion (srv1/2/3).
   log "split-tunnel: VPN now carries only 132.68.0.0/16 + its DNS ($dns); the rest exits the home router"
 }
 
+dns_fallback() {   # 15 Nov 2026: with p81 gone its helper leaves wlo1 on the VPN's DNS (10.250.x), so the
+  # whole server loses DNS ("can't reach the API"); after a reconnect with a new VPN DNS the old one is
+  # dead too, so this runs with p81 up or down. Same check as the NM dispatcher hook 60-dns-fallback.
+  local cur want
+  cur=$(resolvectl dns wlo1 2>/dev/null | sed 's/.*://')
+  case " $cur " in *" 10.250."*) ;; *) return 0 ;; esac
+  want=$(nmcli -g IP4.DNS dev show wlo1 2>/dev/null | tr -d ' ' | tr '|' ' ')
+  [ -n "$want" ] || want="8.8.8.8 8.8.4.4"
+  # shellcheck disable=SC2086
+  sudo -n resolvectl dns wlo1 $want && sudo -n resolvectl flush-caches
+  log "dns-fallback: wlo1 had the VPN DNS was$cur, reset to $want"
+}
+
 say() {   # laptop popup + WhatsApp to My Claude, best effort
   log "ALERT: $*"
   timeout 8 notify-send -u critical "Technion VPN" "$*" 2>/dev/null || true
@@ -86,6 +99,7 @@ up() {
 }
 
 dns_guard
+dns_fallback
 split_tunnel
 [ -e "$HOME/.config/vpn-jump/off" ] && exit 0
 

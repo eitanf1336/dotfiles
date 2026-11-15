@@ -1,0 +1,16 @@
+#!/bin/bash
+# /etc/NetworkManager/dispatcher.d/60-dns-fallback (server, root). 15 Nov 2026.
+# When the Perimeter81 tunnel (p81) is gone, its helper leaves wlo1's DNS pointed at the
+# VPN's DNS server (10.250.68.1), which is unreachable without the tunnel: every name on
+# the server stops resolving and Claude says "can't reach the API". Whenever the network
+# changes, put wlo1 back on the DNS that DHCP gave it. Also when p81 IS up: a reconnect can
+# hand out a new VPN DNS (10.250.116.1) and the old one left on wlo1 is then dead too. VPN
+# names go through the p81 link's own DNS, so wlo1 never needs a 10.250.x server.
+# The same check runs every 2 min from ~/bin/vpn-watch as a backstop.
+cur=$(resolvectl dns wlo1 2>/dev/null | sed 's/.*://')
+case " $cur " in *" 10.250."*) ;; *) exit 0 ;; esac
+want=$(nmcli -g IP4.DNS dev show wlo1 2>/dev/null | tr -d ' ' | tr '|' ' ')
+[ -n "$want" ] || want="8.8.8.8 8.8.4.4"
+# shellcheck disable=SC2086
+resolvectl dns wlo1 $want && resolvectl flush-caches
+logger -t dns-fallback "wlo1 had the VPN DNS was$cur, reset to $want"

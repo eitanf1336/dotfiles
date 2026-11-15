@@ -290,3 +290,7 @@ Applied on the server: `/etc/NetworkManager/conf.d/zz-wifi-powersave-off.conf` (
 `iw dev wlo1 set power_save off`) and `/etc/modprobe.d/iwlwifi-server-stability.conf` (power_save=0,
 uapsd_disable=1, regdom IL; next boot). `disable_11ax` is NOT set: no firmware crashes seen on the server.
 If drops continue, check `sudo journalctl -k | grep -E "BEACON-LOSS|deauth|Microcode"` first; a cable is the real cure.
+DNS after a VPN drop (15 Nov 2026): the Perimeter81 helper leaves wlo1's DNS on the VPN's DNS server (10.250.x),
+dead once the tunnel drops or reconnects with a new one, so the server loses all DNS (Claude: "can't reach the API").
+Repaired automatically by `/etc/NetworkManager/dispatcher.d/60-dns-fallback` (source `server/networkmanager/`) on
+every network change and by `dns_fallback` in `vpn-watch` every 2 min: wlo1 goes back to the DHCP DNS.
