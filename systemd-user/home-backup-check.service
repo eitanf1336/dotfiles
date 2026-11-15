@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly restic repository check (home-backup check)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/home-backup check
+Nice=15
+IOSchedulingClass=idle

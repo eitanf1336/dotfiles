@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# chat-move <server|laptop> [session-id] [--cwd DIR] [--exclude PAT ...] [--force] [--dry-run] [--files-only]
+# Move a Claude Code chat to the other machine "as is": the project directory is rsynced to the SAME path,
+# the chat transcript (and its subagent transcripts) are copied into the same ~/.claude/projects slug, and
+# the chat is resumed there inside tmux (session name chat-<first 8 of the id>). It shows up on the
+# claude-c board like any other chat on that machine; open it from the board (B = permission checks off).
+# Session id: argument, else $CLAUDE_SESSION_ID, else the newest transcript of this project.
+#
+# SAFETY (after the 15 Nov 2026 wipe, when --delete erased 6 of 8 folders of a non-git parent dir):
+#  - never --delete: nothing on the receiving side is ever removed;
+#  - every file the copy overwrites is kept first in a dated folder OUTSIDE the tree on the receiver:
+#    ~/.local/state/chat-move/backups/<date>-<id8>/<same path>;
+#  - a dry run (--itemize-changes) runs first and prints what would be added and overwritten; it ABORTS if
+#    the receiver has top-level entries the sender lacks (the sender is a partial copy) or if more than
+#    $CHAT_MOVE_MAX_OVERWRITE (default 25) files would be overwritten, unless --force is given;
+#  - a directory that is not inside a git repo is refused as the project root unless --cwd names it;
+#  - the excludes used for a move are remembered per chat (~/.local/state/chat-move/<session-id>.excludes
+#    on both machines) and reused when the chat moves back, so the way back is symmetric.
+#  --dry-run      show the summary and stop.
+#  --files-only   only copy the project directory (no transcript, no resume). Used by the tests.
+set -euo pipefail
+target=${1:-}; shift || true
+usage="usage: chat-move <server|laptop> [session-id] [--cwd DIR] [--exclude PAT ...] [--force] [--dry-run] [--files-only]"
+[ "$target" = server ] || [ "$target" = laptop ] || { echo "$usage"; exit 2; }
+sid=""; cwd=""; cwd_given=0; force=0; dry=0; files_only=0; user_excl=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --cwd) cwd=$2; cwd_given=1; shift 2;;
+    --exclude) user_excl+=("$2"); shift 2;;
+    --force) force=1; shift;;
+    --dry-run) dry=1; shift;;
+    --files-only) files_only=1; shift;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0;;
+    -*) echo "unknown option $1"; echo "$usage"; exit 2;;
+    *) sid=$1; shift;;
+  esac
+done
+state=${CHAT_MOVE_STATE:-$HOME/.local/state/chat-move}
+mkdir -p "$state"
+max_over=${CHAT_MOVE_MAX_OVERWRITE:-25}
+
+cwd=${cwd:-$PWD}
+cwd=$(cd "$cwd" && pwd -P)
+if root=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null); then :; else
+  if [ "$cwd_given" = 1 ]; then root=$cwd
+  else
+    echo "REFUSED: $cwd is not inside a git repo, so chat-move will not guess the project root."
+    echo "  Run it from inside the repo, or name the directory to copy with --cwd DIR (never a parent of several projects)."
+    exit 3
+  fi
+fi
+case "$root" in
+  /|"$HOME"|"$HOME/code") echo "REFUSED: $root is too broad to copy as one project."; exit 3;;
+  "$HOME"/*|/tmp/*) ;;
+  *) echo "REFUSED: $root is outside $HOME (and /tmp, for tests)."; exit 3;;
+esac
+
+if ! git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+  nrepo=$(find "$root" -mindepth 2 -maxdepth 2 -name .git 2>/dev/null | wc -l)
+  if [ "$nrepo" -gt 0 ] && [ "$force" = 0 ]; then
+    echo "REFUSED: $root is not a repo but holds $nrepo git repos: it looks like a parent of several projects."
+    echo "  Move the one repo the chat works in (--cwd that repo), or add --force after Eitan says yes."
+    exit 3
+  fi
+fi
+
+slug_dir() { echo "$1" | sed 's#/#-#g'; }
+proj_root=$HOME/.claude/projects
+find_jsonl() {
+  if [ -n "$sid" ]; then find "$proj_root" -maxdepth 2 -name "$sid.jsonl" | head -1; return; fi
+  [ -n "${CLAUDE_SESSION_ID:-}" ] && { find "$proj_root" -maxdepth 2 -name "$CLAUDE_SESSION_ID.jsonl" | head -1; return; }
+  d=$cwd
+  while [ "$d" != / ]; do
+    s=$proj_root/$(slug_dir "$d")
+    [ -d "$s" ] && { ls -t "$s"/*.jsonl 2>/dev/null | head -1; return; }
+    d=$(dirname "$d")
+  done
+}
+jsonl=""; slug=""
+if [ "$files_only" = 0 ]; then
+  jsonl=$(find_jsonl)
+  [ -n "$jsonl" ] && [ -f "$jsonl" ] || { echo "no transcript found (give the session id)"; exit 1; }
+  sid=$(basename "$jsonl" .jsonl); slug=$(basename "$(dirname "$jsonl")")
+fi
+
+# Excludes: always __pycache__/*.pyc, plus the ones given now, plus the ones remembered for this chat.
+memfile=""; [ -n "$sid" ] && memfile=$state/$sid.excludes
+pats=(__pycache__ '*.pyc')
+if [ -n "$memfile" ] && [ -f "$memfile" ]; then
+  while IFS= read -r p; do [ -n "$p" ] && pats+=("$p"); done < <(grep -v '^#' "$memfile")
+  echo "remembered excludes for this chat: $(grep -v '^#' "$memfile" | tr '\n' ' ')"
+fi
+pats+=("${user_excl[@]}")
+mapfile -t pats < <(printf '%s\n' "${pats[@]}" | awk '!seen[$0]++')
+excl=(); for p in "${pats[@]}"; do excl+=(--exclude "$p"); done
+is_excluded() { local e=$1 p; for p in "${pats[@]}"; do p=${p%/}; p=${p#/}; [[ $e == $p ]] && return 0; done; return 1; }
+
+stamp=$(date +%Y%m%d-%H%M%S)
+id8=${sid:0:8}; id8=${id8:-files}
+bdir=$state/backups/$stamp-$id8$root
+echo "${sid:+chat $sid  }project root $root -> $target:$root"
+
+ssh -o BatchMode=yes "$target" "mkdir -p '$(dirname "$root")'" || { echo "cannot reach $target"; exit 1; }
+
+# 1. Top-level check: entries on the receiver that the sender does not have mean this side is a partial copy.
+recv_only=()
+if ssh -o BatchMode=yes "$target" "test -d '$root'"; then
+  mapfile -t recv < <(ssh -o BatchMode=yes "$target" "ls -A '$root'")
+  for e in "${recv[@]}"; do
+    [ -e "$root/$e" ] || [ -L "$root/$e" ] || is_excluded "$e" || recv_only+=("$e")
+  done
+fi
+
+# 2. Dry run of the exact transfer.
+ropts=(-a --itemize-changes "${excl[@]}")
+items=$(rsync "${ropts[@]}" --dry-run "$root/" "$target:$root/")
+n_add=$(grep -cE '^(<f|cL)\+{9}' <<<"$items" || true)
+n_dir=$(grep -cE '^cd\+{9}' <<<"$items" || true)
+over=$(grep -E '^(<f|cL)' <<<"$items" | grep -vE '^(<f|cL)\+{9}' || true)
+n_over=$(grep -c . <<<"$over" || true)
+n_newer=0
+if [ "$n_over" -gt 0 ]; then   # the overwrites that --update would skip are the ones NEWER on the receiver
+  n_upd=$(rsync "${ropts[@]}" --update --dry-run "$root/" "$target:$root/" | grep -E '^(<f|cL)' | grep -cvE '^(<f|cL)\+{9}' || true)
+  n_newer=$((n_over - n_upd))
+fi
+echo "dry run: $n_add files to add, $n_dir new folders, $n_over files to OVERWRITE on $target ($n_newer of them newer there), nothing deleted"
+[ "$n_over" -gt 0 ] && { echo "  overwrites (old copies kept in $target:$bdir):"; cut -c13- <<<"$over" | head -15 | sed 's/^/    /'; [ "$n_over" -gt 15 ] && echo "    ... and $((n_over-15)) more"; }
+bad=0
+if [ ${#recv_only[@]} -gt 0 ]; then
+  echo "WARNING: $target has ${#recv_only[@]} top-level entries this side lacks (this side may be a partial copy):"
+  printf '    %s\n' "${recv_only[@]:0:15}"
+  bad=1
+fi
+if [ "$n_over" -gt "$max_over" ]; then echo "WARNING: $n_over overwrites is more than the limit of $max_over."; bad=1; fi
+if [ "$dry" = 1 ]; then echo "(dry run only, nothing copied)"; exit 0; fi
+if [ "$bad" = 1 ] && [ "$force" = 0 ]; then
+  echo "ABORTED: nothing was copied. Show this summary to Eitan; rerun with --force only after his yes."
+  exit 4
+fi
+
+# 3. The real transfer: no --delete, every overwritten file backed up outside the tree.
+rsync "${ropts[@]}" --backup --backup-dir="$bdir" "$root/" "$target:$root/" | { grep -cE '^(<f|cL)' || true; } | sed 's/^/files copied: /'
+
+# Remember the excludes on both machines so the way back is symmetric.
+if [ -n "$memfile" ]; then
+  { echo "# chat-move excludes for $sid, root $root, last move to $target $stamp"; printf '%s\n' "${pats[@]}" | grep -vxE '__pycache__|\*\.pyc' || true; } > "$memfile.tmp" && mv "$memfile.tmp" "$memfile"
+  ssh -o BatchMode=yes "$target" "mkdir -p '$state'" && rsync -a "$memfile" "$target:$state/"
+fi
+[ "$files_only" = 1 ] && { echo "files only: done"; exit 0; }
+
+start_dir=$(echo "$slug" | sed 's#^-#/#; s#-#/#g')
+[ -d "$start_dir" ] || start_dir=$cwd
+ssh -o BatchMode=yes "$target" "mkdir -p '$proj_root/$slug'"
+tb=$state/backups/$stamp-${sid:0:8}-transcript
+rsync -a --backup --backup-dir="$tb" "$jsonl" "$target:$proj_root/$slug/"
+[ -d "$(dirname "$jsonl")/$sid" ] && rsync -a --backup --backup-dir="$tb/$sid" "$(dirname "$jsonl")/$sid/" "$target:$proj_root/$slug/$sid/"
+name=chat-${sid:0:8}
+back=laptop; [ "$target" = laptop ] && back=server
+msg="You were moved to this machine ($target) with chat-move: same paths, same repo copy. Your old subagents are gone (their srv3 jobs are not). Continue from the handoff notes in robot_cameras/docs/handoff/ if they exist, else from the transcript. Moving back: chat-move $back $sid (it reuses this move's excludes)."
+ssh -o BatchMode=yes "$target" "tmux kill-session -t '$name' 2>/dev/null; tmux new-session -d -s '$name' -c '$start_dir' \"claude --resume '$sid' '$msg'\""
+sleep 3
+ssh -o BatchMode=yes "$target" "tmux capture-pane -p -t '$name' | grep -v '^$' | tail -4" || true
+echo "resumed on $target in tmux '$name'  (attach: ssh -t $target tmux attach -t $name; or open it from the claude-c board)"
+echo "NOW on the old machine: stop this chat, so the two copies do not both act (one owner per thing)."

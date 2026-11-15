@@ -1,0 +1,49 @@
+# Regenerable on any machine (a bare name matches that path component at any depth)
+node_modules
+.venv
+venv
+*-venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.gradle
+.next
+.turbo
+.parcel-cache
+.cache
+# Browser and Electron caches (under .config)
+Cache
+Code Cache
+GPUCache
+CacheStorage
+DawnCache
+DawnGraphiteCache
+DawnWebGPUCache
+GrShaderCache
+ShaderCache
+component_crx_cache
+# Claude Code caches
+/home/eitan/.claude/shell-snapshots
+/home/eitan/.claude/paste-cache
+/home/eitan/.claude/telemetry
+/home/eitan/.claude/statsig
+/home/eitan/.claude/debug
+/home/eitan/.claude/plugins/cache
+# Server only: installers, toolchains, caches, and data already archived to Drive by archive-to-drive
+/home/eitan/snap
+/home/eitan/.npm
+/home/eitan/go
+/home/eitan/.foundry
+/home/eitan/Downloads
+/home/eitan/p3build
+/home/eitan/.local/share/Trash
+/home/eitan/.local/share/claude
+/home/eitan/.local/share/uv
+/home/eitan/.local/share/pnpm
+/home/eitan/.claude/remote
+/home/eitan/code/MyProjects/MinecraftArena/runs
+/home/eitan/code/MyProjects/MinecraftArena/out
+# restic's own cache
+/home/eitan/.cache/restic

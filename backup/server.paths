@@ -1,0 +1,2 @@
+# What the server backs up: its whole home, minus server.excludes.
+/home/eitan

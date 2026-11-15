@@ -5,7 +5,15 @@
 ssh -o ConnectTimeout=8 server true 2>/dev/null || exit 0
 R="rsync -a --timeout=60"
 $R -L ~/.claude/CLAUDE.md ~/.claude/statusline.sh ~/.claude/settings.json server:.claude/
-$R --delete --exclude 'moodle-context/config*.ini' ~/.claude/skills ~/.claude/commands ~/.claude/prompts server:.claude/
+# Skills/commands/prompts mirror the laptop exactly (--delete), but since 15 Nov 2026 every file the
+# mirror removes or replaces on the server is kept there in ~/.local/state/server-claude-sync/replaced/<date>/,
+# and a near-empty skills dir here (a wipe, a bad restore) is never mirrored over the server's copy.
+if [ "$(ls -A ~/.claude/skills 2>/dev/null | wc -l)" -ge 5 ]; then
+  $R --delete --backup --backup-dir="/home/eitan/.local/state/server-claude-sync/replaced/$(date +%F)" \
+     --exclude 'moodle-context/config*.ini' ~/.claude/skills ~/.claude/commands ~/.claude/prompts server:.claude/
+fi
+# Hooks named in settings.json must exist on the server too (copy, no delete).
+$R -L ~/.claude/hooks/ server:.claude/hooks/
 $R --exclude .git ~/.claude/kit/ server:.claude/kit/
 M=.claude/projects/-home-eitan/memory/
 $R --update ~/"$M" server:"$M"

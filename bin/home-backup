@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# home-backup: daily encrypted, deduplicated backups of this machine to Google Drive with restic.
+# Written 15 Nov 2026 after an rsync --delete wiped 6 of 8 research folders on the laptop.
+#
+#   home-backup run           back up now, then apply retention (7 daily, 4 weekly, 6 monthly). The timer runs this.
+#   home-backup check         verify the repository (metadata + a 1% sample of the data). Weekly timer.
+#   home-backup dry-run       show what a backup would add, upload nothing.
+#   home-backup status        latest snapshots, last success, hold state.
+#   home-backup start-first   laptop only: lift the hold and start the first full backup now.
+#   home-backup restore-test  back up a small throwaway folder, restore it, compare (proves the repo works).
+#   home-backup restic ARGS   run any restic command against this machine's repository.
+#
+# Profile = this machine: "laptop" (eitan-u) or "server" (eitan-vivobook-server).
+# Config:  ~/.config/restic/<profile>.env   (RESTIC_REPOSITORY, RESTIC_PASSWORD_FILE, RESTIC_CACHE_DIR, RCLONE_PROGRAM, LIMIT_UPLOAD)
+# Lists:   <this repo>/backup/<profile>.paths and <profile>.excludes (linux-setup)
+# Hold:    ~/.config/restic/<profile>.HOLD makes "run" a no-op (used on the laptop until the disk undelete is over).
+# Failure: popup (notify-send), word "failed" for project "backup-<profile>" on the server screen, and the log
+#          ~/.local/state/home-backup/<profile>.log
+set -uo pipefail
+case "$(hostname)" in
+  eitan-u) P=laptop;;
+  eitan-vivobook-server) P=server;;
+  *) echo "home-backup: unknown machine $(hostname)"; exit 2;;
+esac
+P=${HOME_BACKUP_PROFILE:-$P}
+HERE=$(dirname "$(readlink -f "$0")")
+LISTS=${HOME_BACKUP_LISTS:-$HERE/../backup}
+CONF=$HOME/.config/restic
+STATE=$HOME/.local/state/home-backup
+mkdir -p "$STATE"
+LOG=$STATE/$P.log
+[ -f "$CONF/$P.env" ] || { echo "missing $CONF/$P.env"; exit 2; }
+set -a; . "$CONF/$P.env"; set +a
+export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE RESTIC_CACHE_DIR
+[ -n "${RESTIC_CACHE_DIR:-}" ] && mkdir -p "$RESTIC_CACHE_DIR"
+RO=(-o "rclone.program=${RCLONE_PROGRAM:-rclone}" --pack-size "${PACK_SIZE:-64}")
+[ -n "${LIMIT_UPLOAD:-}" ] && RO+=(--limit-upload "$LIMIT_UPLOAD")
+R() { restic "${RO[@]}" "$@"; }
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG"; }
+
+alert() {   # one visible signal per failure: popup + server screen word (expires after 26 h)
+  local msg="$P backup: $1"
+  log "ALERT $msg"
+  command -v notify-send >/dev/null && notify-send -u critical "Backup failed" "$msg (log: $LOG)" 2>/dev/null
+  command -v server-now >/dev/null && server-now "backup-$P" failed "$msg" --ttl 26h >/dev/null 2>&1
+  echo "$(date +%s) $msg" > "$STATE/$P.failed"
+}
+ok() { rm -f "$STATE/$P.failed"; command -v server-now >/dev/null && server-now "backup-$P" --clear >/dev/null 2>&1; true; }
+
+lock() { exec 9>"$STATE/$P.lock"; flock -n 9 || { log "another home-backup is running; skipped"; exit 0; }; }
+
+paths_args() {
+  PATHS=(); while IFS= read -r l; do [[ -z "$l" || "$l" == \#* ]] && continue; [ -e "$l" ] && PATHS+=("$l"); done < "$LISTS/$P.paths"
+  [ ${#PATHS[@]} -gt 0 ] || { alert "no backup paths exist"; exit 1; }
+}
+
+cmd=${1:-status}; shift || true
+case "$cmd" in
+  run)
+    lock
+    if [ -f "$CONF/$P.HOLD" ]; then log "held ($CONF/$P.HOLD exists): no backup run. $(head -1 "$CONF/$P.HOLD")"; exit 0; fi
+    paths_args
+    command -v server-now >/dev/null && server-now "backup-$P" backing-up --ttl 12h >/dev/null 2>&1
+    log "backup start: ${PATHS[*]}"
+    out=$(nice -n 15 ionice -c3 restic "${RO[@]}" backup --one-file-system --exclude-caches --exclude-file "$LISTS/$P.excludes" \
+          --tag auto --host "$P" "${PATHS[@]}" 2>&1); rc=$?
+    printf '%s\n' "$out" | grep -vE '^\[|^ETA' | tail -15 >> "$LOG"
+    # rc 3 = some files could not be read (snapshot still made); treat as a warning, not a failure
+    if [ $rc -ne 0 ] && [ $rc -ne 3 ]; then alert "restic backup exited $rc: $(printf '%s\n' "$out" | tail -1)"; exit 1; fi
+    [ $rc -eq 3 ] && log "warning: some files were unreadable (see above)"
+    R forget --host "$P" --tag auto --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune >> "$LOG" 2>&1 \
+      || { alert "retention (forget --prune) failed"; exit 1; }
+    date +%s > "$STATE/$P.last-success"; ok; log "backup done"
+    ;;
+  check)
+    lock
+    out=$(R check --read-data-subset=1% 2>&1); rc=$?
+    printf '%s\n' "$out" | tail -5 >> "$LOG"
+    [ $rc -eq 0 ] || { alert "restic check failed: $(printf '%s\n' "$out" | tail -1)"; exit 1; }
+    if [ ! -f "$CONF/$P.HOLD" ]; then
+      last=$(cat "$STATE/$P.last-success" 2>/dev/null || echo 0)
+      [ $(( $(date +%s) - last )) -gt $((3*86400)) ] && { alert "no successful backup for more than 3 days"; exit 1; }
+    fi
+    log "check ok"
+    ;;
+  dry-run)
+    paths_args
+    nice -n 15 ionice -c3 restic "${RO[@]}" backup --dry-run --one-file-system --exclude-caches --exclude-file "$LISTS/$P.excludes" \
+      --host "$P" "${PATHS[@]}" "$@" 2>&1 | grep -vE '^\[|^ETA' | tail -20
+    ;;
+  status)
+    echo "profile $P  repo $RESTIC_REPOSITORY  cache ${RESTIC_CACHE_DIR:-default}"
+    [ -f "$CONF/$P.HOLD" ] && echo "HOLD: $(head -1 "$CONF/$P.HOLD")"
+    [ -f "$STATE/$P.last-success" ] && echo "last success: $(date -d @"$(cat "$STATE/$P.last-success")" '+%F %T')" || echo "last success: never"
+    [ -f "$STATE/$P.failed" ] && echo "LAST FAILURE: $(cut -d' ' -f2- "$STATE/$P.failed")"
+    R snapshots --compact --latest 5 2>&1 | tail -12
+    ;;
+  start-first)
+    [ "$P" = laptop ] || { echo "start-first is for the laptop"; exit 2; }
+    rm -f "$CONF/$P.HOLD"
+    systemctl --user start --no-block home-backup.service && echo "first full laptop backup started; follow it with: tail -f $LOG"
+    ;;
+  restore-test)
+    t=$(mktemp -d /tmp/home-backup-test.XXXXXX); mkdir -p "$t/src/sub"
+    for i in 1 2 3; do head -c 200000 /dev/urandom > "$t/src/sub/f$i.bin"; done; echo "hello $(date)" > "$t/src/note.txt"
+    R backup --host "$P-restore-test" --tag restore-test "$t/src" >/dev/null 2>&1 || { echo "FAIL backup"; exit 1; }
+    R restore latest --host "$P-restore-test" --tag restore-test --target "$t/out" >/dev/null 2>&1 || { echo "FAIL restore"; exit 1; }
+    if diff -r "$t/src" "$t/out$t/src" >/dev/null; then echo "restore-test PASS: 4 files backed up to $RESTIC_REPOSITORY and restored byte-identical"; rc=0
+    else echo "restore-test FAIL: restored files differ"; rc=1; fi
+    rm -r -- "$t"; exit $rc
+    ;;
+  restic) R "$@";;
+  *) sed -n '2,20p' "$0"; exit 2;;
+esac

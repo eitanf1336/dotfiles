@@ -1,0 +1,11 @@
+# What the laptop backs up (one path per line; missing paths are skipped). Excludes in laptop.excludes.
+/home/eitan/code
+/home/eitan/.claude
+/home/eitan/bin
+/home/eitan/.config
+/home/eitan/.ssh
+/home/eitan/.local/bin
+/home/eitan/fleet-staging
+/home/eitan/Documents
+/home/eitan/Desktop
+/home/eitan/Pictures

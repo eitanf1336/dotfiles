@@ -210,6 +210,43 @@ Late grandpa Chaim's ThinkPad E570 (GTX 950M), Ubuntu 26.04 on its NVMe since 2 
   SERVER panel and Running now list from a local `server-screen-local` (:7801). Files: `server/grandpa/`.
   `kiosk-watchdog.timer` there runs `kiosk-watchdog grandpa` (same 3 min rule, watches the grandpa role).
 
+## Never mass delete (after the 15 Nov 2026 wipe)
+
+- On 15 Nov 2026 `chat-move laptop`, run on the server from the non-git `~/code/Technion/Research`, took that folder as the
+  project root and ran `rsync --delete` from a partial copy: 6 of the laptop's 8 folders there were wiped.
+- `chat-move` now lives in `bin/chat-move` (`~/bin/chat-move` is a symlink on both machines). It never deletes, keeps every
+  file it overwrites in `~/.local/state/chat-move/backups/<date>-<id8>/` on the receiver, dry-runs first and ABORTS if the
+  receiver has top-level entries the sender lacks or more than 25 files would be overwritten (`--force` only after his yes),
+  refuses a non-git root unless `--cwd` names it (and refuses a non-git parent of several repos even then), and remembers the
+  excludes per chat so the way back is symmetric. Tests: `tests/test-chat-move.sh` (run on the server, throwaway trees in /tmp).
+- `~/.claude/hooks/delete-guard.py` (source `claude/hooks/delete-guard.py`, PreToolUse on Bash, both machines; hooks are now
+  copied by `server-claude-sync`) blocks `rsync --delete*`, `rclone sync/bisync/purge`, `git clean -f` with `-d`/`-x`, and
+  `rm -r` of `~`, `~/code`, `~/code/*`, `~/code/*/*`, unless the command carries `# I-CHECKED-DRY-RUN`. Tests: `claude/hooks/test-delete-guard.sh`.
+- `server-claude-sync` still mirrors skills/commands/prompts with `--delete`, but every file it removes or replaces on the server
+  is kept there in `~/.local/state/server-claude-sync/replaced/<date>/`, and it skips the mirror if the laptop's skills dir looks wiped.
+
+## Backups (since 15 Nov 2026)
+
+- `home-backup` (`bin/home-backup`, both machines) = restic (encrypted, deduplicated snapshots) to Google Drive through rclone:
+  laptop -> `gdrive:Backups/restic-laptop` (paths `backup/laptop.paths`: ~/code, ~/.claude, ~/bin, ~/.config, ~/.ssh,
+  ~/.local/bin, ~/fleet-staging, Documents, Desktop, Pictures; excludes `backup/laptop.excludes`),
+  server -> `gdrive:Backups/restic-server` (its whole home minus `backup/server.excludes`).
+- Timers (units in `systemd-user/` and `server/systemd/`): `home-backup.timer` daily (laptop 13:00, server 03:30, Persistent),
+  `home-backup-check.timer` weekly (`restic check` with a 1% data sample; alerts if no successful backup for 3 days).
+  Retention: 7 daily, 4 weekly, 6 monthly.
+- Passwords: `~/.config/restic/laptop.pass` and `~/.config/restic/server.pass` (0600). BOTH files are on BOTH machines,
+  so either machine can open either repository. A third copy belongs in his password manager.
+- Profiles: `~/.config/restic/<laptop|server>.env` (repo, password file, cache dir, rclone path, upload cap 3000 KiB/s on the server).
+  The server uses rclone 1.74 at `~/.local/lib/rclone-1.74/rclone` (copied from the laptop): the system rclone 1.60 hangs as restic's backend.
+- A failed run shows a popup and the word `failed` for `backup-laptop` / `backup-server` in the server screen's Running now list
+  (26 h). Log `~/.local/state/home-backup/<profile>.log`; `home-backup status` shows snapshots and the last success.
+- Restore: `home-backup restic restore latest --host laptop --include /home/eitan/code/X --target /tmp/restore`
+  (or `home-backup restic mount /tmp/m`). Proof the repo works: `home-backup restore-test`.
+- Laptop HOLD (15 Nov 2026): `~/.config/restic/laptop.HOLD` makes the daily laptop run a no-op while a disk-level undelete may
+  still run on /home, and restic's cache sits in RAM (`RESTIC_CACHE_DIR=/tmp/restic-cache` in `laptop.env`). `home-backup start-first`
+  lifts the hold and starts the first full run; afterwards set the cache to `/home/eitan/.cache/restic`.
+- git bundle of `robot_knot_tying` (all refs, 15 Nov 2026): server `~/backups/git-bundles/`, Drive `Backups/git-bundles/`.
+
 ## Plans, history, rollbacks
 
 `~/fleet-staging/SERVER-PLAN.md` (the plan), `~/fleet-staging/PROGRESS.md` (what moved, with rollbacks),
