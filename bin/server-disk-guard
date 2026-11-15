@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# server-disk-guard: keep the server's disk from ever filling up again.
+#
+# Why: the root disk hit 100% twice. On 29 Oct 2026 (found by hand during the
+# VPN install) and again on 15 Nov 2026, when it silently killed the WhatsApp
+# bot from 05:09 to 13:45: whatsmeow could not store a sender key ("database
+# or disk is full"), every reply failed, and wa-monitor crash-looped 63k times.
+# Every process check said "active" the whole time.
+#
+# What it does, every 10 minutes (server-disk-guard.timer):
+#   1. Below PRUNE_GB free: deletes only things that regenerate on their own
+#      (journal beyond 300M, apt cache, uv/pip caches, Trash, Claude Code
+#      versions no process is running). Never touches project data.
+#   2. Still below WARN_GB: tells Eitan in My Claude (while WhatsApp can still
+#      send) + a laptop popup, with the biggest folders. Once a day.
+#   3. Below CRIT_GB: the same, every 2 hours, marked CRITICAL.
+# Log: ~/.local/state/server-disk-guard/log
+
+set -uo pipefail
+export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
+
+PRUNE_GB=${PRUNE_GB:-20}
+WARN_GB=${WARN_GB:-20}
+CRIT_GB=${CRIT_GB:-8}
+STATE="$HOME/.local/state/server-disk-guard"
+LOG="$STATE/log"
+mkdir -p "$STATE"
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+[[ -f "$LOG" && $(stat -c%s "$LOG") -gt 500000 ]] && { tail -n 1000 "$LOG" >"$LOG.t" && mv "$LOG.t" "$LOG"; }
+
+free_gb() { df -BG --output=avail / | tail -1 | tr -dc '0-9'; }
+
+before=$(free_gb)
+if (( before < PRUNE_GB )); then
+    sudo -n journalctl --vacuum-size=300M >/dev/null 2>&1
+    sudo -n apt-get clean >/dev/null 2>&1
+    rm -rf "$HOME/.cache/uv" "$HOME/.cache/pip" 2>/dev/null
+    rm -rf "$HOME/.local/share/Trash/files/"* "$HOME/.local/share/Trash/info/"* 2>/dev/null
+    # Claude Code versions: keep the current target and anything a live process runs.
+    vdir="$HOME/.local/share/claude/versions"
+    if [[ -d "$vdir" ]]; then
+        keep=$(readlink -f "$HOME/.local/bin/claude" 2>/dev/null)
+        inuse=$(for p in /proc/[0-9]*; do readlink -f "$p/exe" 2>/dev/null; done | grep "^$vdir/" | sort -u)
+        for v in "$vdir"/*; do
+            [[ "$v" == "$keep" ]] && continue
+            grep -qxF "$v" <<<"$inuse" && continue
+            rm -rf "$v" && log "pruned old claude version $(basename "$v")"
+        done
+    fi
+    after=$(free_gb)
+    log "low disk: ${before}G free, pruned caches, now ${after}G"
+else
+    after=$before
+fi
+
+(( after >= WARN_GB )) && exit 0
+
+if (( after < CRIT_GB )); then level=CRITICAL; every=7200; else level=LOW; every=86400; fi
+stamp="$STATE/last-alert-$level"
+last=$(stat -c %Y "$stamp" 2>/dev/null || echo 0)
+(( $(date +%s) - last < every )) && exit 0
+
+top=$(du -xh --max-depth=3 "$HOME" 2>/dev/null | sort -rh | awk 'NR>1 && NR<=7 {sub("'"$HOME"'/","~/",$2); printf "%s %s, ", $1, $2}' | sed 's/, $//')
+msg="Server disk $level: only ${after}G free. When it hits 0 the WhatsApp bot and every service on the server stop working. Biggest: $top"
+log "ALERT: $msg"
+touch "$stamp"
+
+command -v notify-send >/dev/null && notify-send -u critical "Server disk $level" "$msg" 2>/dev/null
+python3 - "$msg" <<'PY' 2>/dev/null || log "WhatsApp alert failed"
+import json, sys, urllib.request
+body = json.dumps({"recipient": "120363410856554324@g.us",
+                   "message": "🤖 server-disk-guard: " + sys.argv[1]}).encode()
+urllib.request.urlopen(urllib.request.Request("http://localhost:8080/api/send", data=body,
+                       headers={"Content-Type": "application/json"}), timeout=15).read()
+PY
+exit 0

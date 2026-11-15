@@ -457,4 +457,22 @@ if [[ -s "$ASSIST_REG" ]] && grep -q '"enabled"[[:space:]]*:[[:space:]]*true' "$
     fi
 fi
 
+# --- 8. Are sends actually going out? ---------------------------------------
+# 2026-11-15: the disk filled and every send failed for 8.5 hours ("failed to
+# store sender key ... database or disk is full") while every unit was active
+# and the link was fine. Checking the job means checking the bridge's own
+# verdict on each send. Rate-limited to one alert per 30 minutes.
+fails=$(journalctl --user -u "$BRIDGE_UNIT" --since "-10min" --no-pager 2>/dev/null | grep -c "Message sent false")
+oks=$(journalctl --user -u "$BRIDGE_UNIT" --since "-10min" --no-pager 2>/dev/null | grep -c "Message sent true")
+if (( fails >= 2 && oks == 0 )); then
+    reason=$(journalctl --user -u "$BRIDGE_UNIT" --since "-10min" --no-pager 2>/dev/null | grep "Message sent false" | tail -1 | sed 's/.*Error sending message: //' | cut -c1-160)
+    sm="$STATE_DIR/.doctor-sendfail"
+    if (( $(date +%s) - $(stat -c %Y "$sm" 2>/dev/null || echo 0) > 1800 )); then
+        touch "$sm"
+        hint=""; grep -qi "disk is full\|no space" <<<"$reason" && hint=" The server disk is FULL: run server-disk-guard, then free space (df -h /)."
+        notify "WhatsApp sends are FAILING ($fails in 10 min, none succeeded): $reason.$hint"
+    fi
+    log "SENDFAIL: $fails failed, 0 ok: $reason"
+fi
+
 exit 0
