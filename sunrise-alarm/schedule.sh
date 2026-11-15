@@ -51,7 +51,7 @@ EOF
     systemctl --user disable --now sunrise-alarm.timer 2>/dev/null
     gsettings set org.gnome.desktop.screensaver lock-enabled true
     gsettings set org.gnome.desktop.screensaver ubuntu-lock-on-suspend true 2>/dev/null || true
-    gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'suspend'
+    gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'  # never idle-suspend on mains (see logind/README.md)
     gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'suspend'
     pkexec "$DIR/install_wake.sh" remove || echo "WARN: could not remove RTC wake"
     echo "--- disarmed ---"
