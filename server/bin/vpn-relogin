@@ -41,6 +41,9 @@ app=$(app_win); [ -n "$app" ] || { say "still no app window"; shot no-app; exit 
 # 2. Signed out: sign in through the EU page in the vpn-jump Chrome profile.
 if ! logged_in; then
   before=$(jwt_count)
+  # 16 Nov 2026: stale sign-in tabs first (vpn-mslogin reads the first Microsoft tab it finds; a stale one made it
+  # report "password not filled" for 4.5 hours)
+  n=$(vpn-prune-tabs all); [ "${n:-0}" -gt 0 ] 2>/dev/null && say "closed $n stale sign-in tabs"
   say "signed out, opening the EU sign-in page"
   xdg-open "$EU_URL" >/dev/null 2>&1; sleep 15
   w=$(chrome_win); [ -n "$w" ] || { say "no Chrome window"; shot no-chrome; exit 4; }

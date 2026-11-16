@@ -32,7 +32,9 @@ click_text() {   # click_text <text the element starts with>: buttons, links, ro
 }
 while :; do
   (( $(date +%s) - t0 > limit )) && { say "timeout on: ${last:0:80}"; exit 5; }
-  url=$($C eval 'location.href' 2>/dev/null) || { say "no Microsoft page"; exit 4; }
+  # the Microsoft page may still be loading after the "Sign in with Microsoft" click: wait up to 45 s for it
+  # (16 Nov 2026: with no stale Microsoft tab open this gave up at once, "no Microsoft page")
+  url=$($C eval 'location.href' 2>/dev/null) || { (( $(date +%s) - t0 > 45 )) && { say "no Microsoft page"; exit 4; }; sleep 3; continue; }
   case "$url" in *login.microsoftonline.com*) ;; *) say "left Microsoft: ${url:0:60}"; exit 0 ;; esac
   p=$(text); last=$p
   case "$p" in
@@ -42,8 +44,14 @@ while :; do
       w=$(xdotool search --onlyvisible --class google-chrome | tail -1); xdotool windowactivate --sync "$w"
       eval "$(xdotool getwindowgeometry --shell "$w")"
       r=$($C eval '(()=>{const r=document.querySelector("input[type=password]").getBoundingClientRect();return Math.round(r.x+r.width/2)+","+Math.round(r.y+r.height/2)})()')
-      xdotool mousemove $((X+${r%,*})) $((Y+87+${r#*,})) click 1; sleep 1.5
-      n=$($C eval 'document.querySelector("input[type=password]").value.length')
+      # Chrome shows the saved password at once but hides it from the page until a real click has landed, and
+      # that took over 1.5 s on 16 Nov 2026 ("password not filled" for hours): click, then look for up to 10 s
+      n=0
+      for i in 1 2 3 4 5; do
+        xdotool mousemove $((X+${r%,*})) $((Y+87+${r#*,})) click 1; sleep 2
+        n=$($C eval 'document.querySelector("input[type=password]").value.length' 2>/dev/null)
+        [ "${n:-0}" -gt 0 ] 2>/dev/null && break
+      done
       [ "${n:-0}" -gt 0 ] || { say "password not filled by Chrome (save it once by hand at localhost:7830)"; exit 5; }
       xdotool key Return; sleep 6 ;;
     *"Approve sign in request"*|*"Enter the number"*)
