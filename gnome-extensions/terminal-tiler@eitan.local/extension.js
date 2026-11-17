@@ -1089,6 +1089,10 @@ export default class TerminalTilerExtension extends Extension {
             }
         }
 
+        if (!this._regrouping)
+            for (const w of arr)
+                this._noteHome(w, monitor);
+
         const wa = this._workArea(monitor);
         const n = arr.length;
         const cols = this._settings.get_string('orientation') !== 'rows';
@@ -1250,6 +1254,33 @@ export default class TerminalTilerExtension extends Extension {
         this._regroup();
     }
 
+    // A screen is named by its geometry, not its index: indices are
+    // renumbered whenever a screen leaves or comes back, the geometry of a
+    // returning screen is the same as before it left.
+    _monitorKeys() {
+        return Main.layoutManager.monitors.map(
+            g => `${g.x},${g.y},${g.width}x${g.height}`);
+    }
+
+    // Index of the screen this terminal belongs on, or -1 if it has no home
+    // yet or its home screen is not connected right now.
+    _homeIndex(win) {
+        return win._ttHome ? this._monitorKeys().indexOf(win._ttHome) : -1;
+    }
+
+    // Remember `m` as this terminal's home. Only while its old home is still
+    // connected (or it has none): when its screen has left, Mutter parks it on
+    // a survivor, and that must not overwrite where it really lives, or it
+    // can never be sent back when the screen returns from a suspend.
+    _noteHome(win, m) {
+        const keys = this._monitorKeys();
+        if (m < 0 || m >= keys.length)
+            return;
+        if (win._ttHome && !keys.includes(win._ttHome))
+            return;
+        win._ttHome = keys[m];
+    }
+
     // Re-home every managed terminal into the batch of the monitor it is
     // ACTUALLY on, then re-flow every batch.
     //
@@ -1269,6 +1300,16 @@ export default class TerminalTilerExtension extends Extension {
             return;
         const cols = this._settings.get_string('orientation') !== 'rows';
         const rehomed = new Map();
+        const monOf = new Map();
+
+        // Did the set of screens change since the last regroup? Then a window
+        // sitting off its home screen was put there by Mutter (its screen left
+        // during a suspend or unplug), not by him, and goes back if home is
+        // here again. Otherwise where it is now is where he wants it.
+        const sig = this._monitorKeys().join(' ');
+        const screensChanged = this._lastMonSig !== undefined &&
+            sig !== this._lastMonSig;
+        this._lastMonSig = sig;
 
         // Hidden layers parked on a monitor that no longer exists follow their
         // windows to the last screen that does.
@@ -1297,6 +1338,15 @@ export default class TerminalTilerExtension extends Extension {
                 // gives it a real monitor again.
                 if (m < 0 || m >= nMon)
                     m = Math.max(0, Math.min(key, nMon - 1));
+                const home = this._homeIndex(win);
+                if (screensChanged && home >= 0 && home !== m &&
+                    !this._settling.has(win)) {
+                    win.move_to_monitor(home);
+                    m = home;
+                } else if (!this._settling.has(win)) {
+                    this._noteHome(win, m);
+                }
+                monOf.set(win, m);
                 let dst = rehomed.get(m);
                 if (!dst)
                     rehomed.set(m, dst = []);
@@ -1316,7 +1366,7 @@ export default class TerminalTilerExtension extends Extension {
         for (const win of this._maxed.values()) {
             if (!this._isAlive(win))
                 continue;
-            const m = win.get_monitor();
+            const m = monOf.get(win) ?? win.get_monitor();
             if (rehomed.get(m)?.includes(win))
                 maxed.set(m, win);
         }
