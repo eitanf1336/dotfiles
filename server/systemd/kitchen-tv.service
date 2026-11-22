@@ -1,0 +1,13 @@
+[Unit]
+Description=Kitchen TV photo frame (photos from Drive "Kitchen TV" when Mute is pressed twice on the kitchen Samsung remote)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -u %h/code/MyLittleProjects/KitchenTV/kitchen_tv.py run
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
