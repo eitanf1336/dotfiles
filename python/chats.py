@@ -3145,6 +3145,16 @@ def _remote_attach_cmd(host, cmd):
     Frankfurt, 260 ms per keystroke over ssh; mosh echoes locally), else ssh -t.
     mosh quotes the command itself, so the shell string goes through as one arg."""
     import shutil
+    # A dead mosh client (laptop slept, terminal closed, network moved) leaves
+    # its mosh-server and `claude attach` running on the host forever, still
+    # hooked to the chat, and the next attach to that chat hangs (15 Nov 2026).
+    # So every open first clears old clients of the SAME chat: one he can no
+    # longer see. The chat itself keeps running; only stale viewers go.
+    m = re.search(r"claude attach (\S+)$", cmd)
+    if m:
+        cmd = (f"pkill -f {shlex.quote('^claude attach ' + m.group(1) + '$')}; "
+               "sleep 0.3; " + cmd)
+    cmd = cmd.replace("tmux attach -t ", "tmux attach -d -t ")
     if shutil.which("mosh"):
         # mosh drops "dim" text (SGR 2), so the grey prompt suggestion looked
         # like typed input; mosh-dimfix on the host turns dim into grey.
@@ -3167,6 +3177,38 @@ def open_remote_chat(app, c, action):
     title = app.display_title(c)
     short = short_id(c["id"], app._agents)
     live = c["id"] in app.live_ids
+    # A chat moved with /to-server runs as a plain `claude --resume` inside tmux
+    # session chat-<8 chars> on the host (kind: interactive, no short id), so
+    # `claude attach` / `claude stop` can't reach it: open and stop it via tmux.
+    tmux = None
+    if live and rec.get("kind") == "interactive" and not rec.get("id"):
+        name = "chat-" + c["id"].split("-")[0]
+        if remote_run(host, f"tmux has-session -t {shlex.quote(name)}", 15).returncode == 0:
+            tmux = name
+    if tmux and action in ("stop", "bypass"):
+        print(f"\n■ Stopping on {host}: {title[:55]} …")
+        r = remote_run(host, f"tmux kill-session -t {shlex.quote(tmux)}", 30)
+        print("  stopped." if r.returncode == 0 else f"  couldn't confirm: {(r.stderr or r.stdout).strip()[:120]}")
+        if action == "stop":
+            time.sleep(0.7)
+            return
+        for _ in range(15):
+            if c["id"] not in remote_agents_now(host, env):
+                break
+            time.sleep(1.0)
+        live = False
+    elif tmux and action != "fork":
+        print(f"\n▶ Attaching on {host} (tmux {tmux}): {title[:55]}")
+        print("  Press Ctrl+Z to leave it running and come back.\n")
+        set_window_title(short)
+        # Ctrl+Z inside tmux would just reach claude as a byte, so the relay
+        # catches it locally; then detach the tmux client on the host so the
+        # remote side (and mosh-server) exits instead of lingering.
+        run_child_relay(_remote_attach_cmd(host, f"tmux attach -t {shlex.quote(tmux)}"))
+        remote_run(host, f"tmux detach-client -s {shlex.quote(tmux)}", 15)
+        return
+    elif tmux:
+        live = False  # fork: start a new background copy beside the tmux one
     if action == "stop":
         print(f"\n■ Stopping on {host}: {title[:55]} …")
         r = remote_run(host, f"{env}claude stop {short}", 30)
