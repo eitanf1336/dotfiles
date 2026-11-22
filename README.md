@@ -28,6 +28,8 @@ In `python/`:
 ### `chats.py` (launched as `claude-c`)
 A board/TUI for organizing Claude Code chats into categories (In Progress / Later / Done) with live status. State persists to JSON next to the script. Launched via `bin/claude-custom`.
 
+Copies of one chat (same project, same name, shared message history) show as one row, the one typed in last; `a` shows the older ones. A shared name alone never folds anything, and badged or PAUSED chats never fold. After editing, run `uv run --script tests/chats-fold/test_fold.py`, then install by hand: the file runs from `~/.claude/chats/chats.py` on the laptop and on the server (no sync copies it).
+
 ### `projcolor.py`
 Gives every project its own color so you can tell at a glance which one the terminal in front of you belongs to. The pick looks random but is a stable hash of the project, skipping shades other projects already took, and is stored in `~/.claude/chats/project_colors.json` (`c` in the board's projects panel picks a different one). The color shows in the `claude-c` header chip, the rules framing the list, and each row's `[tag]`; inside a chat it tints the text cursor and leads the status line. Optional background tinting is off by default.
 

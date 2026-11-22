@@ -34,6 +34,7 @@ Keys:
                sorts to the TOP of its category, so an accidental move stays in
                plain sight instead of sinking into a big pile.
   u            undo the last category move (revert the chat to where it was)
+  a            show (or fold again) the older copies of same-named chats
   /            find a chat by name and jump to it, anywhere on the board — press
                / again to cycle to the next match. Reaches chats in collapsed
                sections (it expands the section it lands in).
@@ -53,13 +54,17 @@ it and the status line leads with a matching chip.
   Ctrl+R       reload this script (pick up edits without restarting)
   q            quit
 
-Nothing leaves this board on its own unless it is filed **Done**. Reopening a
+Copies of one chat show once: chats in a project with the same name AND shared
+history fold behind the one you typed in last, in any category ('a' shows them).
+A shared name alone never folds anything, and a badged or PAUSED chat never folds.
+
+Apart from that, nothing leaves this board unless filed **Done**. Reopening a
 finished chat starts a fresh background session, and Claude itself splits a full
 chat into a new session when it auto-compacts; the board links each of those to
 the chat it came from. It only FOLDS the older entry away when that chat is
 filed Done — anything In Progress / To Test / Later / Failed / Done — Not
-Committed / Uncategorized stays on the board next to its continuation, marked
-'⤷'. Unfinished work is never hidden automatically, and no chat file is ever
+Committed / Uncategorized whose continuation has another name stays next to it,
+marked '⤷'. No chat file is ever
 deleted except by you, with 'd', after confirming. (The one knob:
 AUTO_FOLD_CATEGORIES near the top of this file.)
 
@@ -83,6 +88,7 @@ Command line:
 import contextlib
 import curses
 import fcntl
+import hashlib
 import json
 import shlex
 import locale
@@ -277,8 +283,8 @@ CATEGORIES = [
 ]
 DISPLAY_ORDER = [UNCATEGORIZED] + CATEGORIES
 
-# The ONLY categories a chat may be auto-folded (hidden behind its continuation)
-# from. Everything else — In Progress, To Test, Later, Failed, Uncategorized, and
+# The ONLY categories a chat may be folded from behind a continuation that has a
+# DIFFERENT name (same-named copies fold in any category, see Lineage). Everything else — In Progress, To Test, Later, Failed, Uncategorized, and
 # "Done — Not Committed" (its work isn't safe on a branch yet) — stays on the
 # board forever unless YOU delete it with 'd'. The board never removes unfinished
 # work on its own; a duplicate row is cheap, a chat you can't find is not.
@@ -644,6 +650,137 @@ def latest_titles(path):
     except Exception:
         pass
     return custom, ai
+
+
+# --- same-named copies -----------------------------------------------------
+# Resume, fork and auto-continue each mint a new session id that starts with
+# copied messages, message uuids included. A shared uuid therefore proves two
+# rows are one chat, whoever made the copy and whether or not a link was saved.
+# The name alone proves nothing: about 1000 bot runs here share a first line.
+# Only a record's own uuid is matched (it is written right before timestamp),
+# never a "uuid" field inside some tool's result.
+_OWN_UUID_RE = re.compile(rb'"uuid": ?"([0-9a-f-]{36})", ?"timestamp"')
+_NOT_TYPED = ("<task-notification", "[SYSTEM", "Another Claude session",
+              "<agent-message", COMPACT_MARKER)
+
+
+class Lineage:
+    """Which same-named chats are copies, and which one was typed in last.
+
+    Both answers are cached on disk, so a board start or auto-reload does not
+    re-read a gigabyte of transcripts."""
+
+    def __init__(self):
+        self.file = HOME / ".cache" / "claude-c" / "lineage.json"
+        d = _load_json(self.file)
+        self.groups = d.get("groups", {})      # signature -> [component number]
+        self.activity = d.get("activity", {})  # path -> [offset, typed, last]
+        self.dirty = False
+
+    def components(self, members, links):
+        """Split same-named chats into the sets that really are one chat."""
+        members = sorted(members, key=lambda c: str(c["path"]))
+        h = hashlib.sha1()
+        for c in members:
+            try:
+                size = c["path"].stat().st_size
+            except OSError:
+                size = 0
+            # bit_length: look again each time a file doubles, so a transcript
+            # that was still being mirrored when first seen gets linked later.
+            h.update(f"{c['path']}:{size.bit_length()};".encode())
+        sig = h.hexdigest()
+        root = list(range(len(members)))
+
+        def find(i):
+            while root[i] != i:
+                root[i] = root[root[i]]
+                i = root[i]
+            return i
+
+        known = self.groups.get(sig)
+        if known is None or len(known) != len(members):
+            owner = {}
+            for i, c in enumerate(members):
+                try:
+                    with c["path"].open("rb") as fh:
+                        for line in fh:
+                            for u in _OWN_UUID_RE.findall(line):
+                                root[find(i)] = find(owner.setdefault(u, i))
+                except OSError:
+                    pass
+            self.groups[sig] = [find(i) for i in range(len(members))]
+            self.dirty = True
+        else:
+            root[:] = known
+        at = {c["id"]: i for i, c in enumerate(members)}
+        for c in members:  # a recorded continuation counts as proof too
+            seen, nxt = set(), links.get(c["id"])
+            while nxt and nxt not in seen:
+                seen.add(nxt)
+                if nxt in at:
+                    root[find(at[c["id"]])] = find(at[nxt])
+                nxt = links.get(nxt)
+        out = {}
+        for i, c in enumerate(members):
+            out.setdefault(find(i), []).append(c)
+        return [v for v in out.values() if len(v) > 1]
+
+    def recency(self, c):
+        """Sort key: when he last typed here, then the last message. File mtime
+        only breaks ties, because Claude touches idle transcripts all the time."""
+        key = str(c["path"])
+        off, typed, last = self.activity.get(key, (0, "", ""))
+        try:
+            size = c["path"].stat().st_size
+            if size < off:
+                off, typed, last = 0, "", ""
+            if size > off:
+                with c["path"].open("rb") as fh:
+                    fh.seek(off)
+                    for line in fh:
+                        if not line.endswith(b"\n"):
+                            break  # still being written
+                        off += len(line)
+                        try:
+                            d = json.loads(line)
+                            ts = d.get("timestamp") or ""
+                            kind = d.get("type")
+                        except Exception:
+                            continue
+                        if not ts or d.get("isSidechain"):
+                            continue
+                        text = ""
+                        if kind in ("user", "assistant"):
+                            last = max(last, ts)
+                        if kind == "user" and not (d.get("isMeta") or d.get("isCompactSummary")):
+                            text = _text_from_content((d.get("message") or {}).get("content"))
+                        elif kind == "attachment":  # typed while a turn was running
+                            a = d.get("attachment") or {}
+                            if a.get("commandMode") == "prompt":
+                                text = _text_from_content(a.get("prompt"))
+                        text = text.strip()
+                        if text and not _is_noise(text) and not text.startswith(_NOT_TYPED):
+                            typed = max(typed, ts)
+                self.activity[key] = [off, typed, last]
+                self.dirty = True
+        except OSError:
+            pass
+        return (typed or last, last, c["mtime"])
+
+    def save(self):
+        if not self.dirty:
+            return
+        try:
+            self.file.parent.mkdir(parents=True, exist_ok=True)
+            if len(self.groups) > 3000:  # old signatures; rebuilt when needed
+                self.groups = dict(list(self.groups.items())[-1500:])
+            tmp = self.file.with_suffix(f".tmp{os.getpid()}")
+            tmp.write_text(json.dumps({"groups": self.groups, "activity": self.activity}))
+            os.replace(tmp, self.file)
+            self.dirty = False
+        except OSError:
+            pass
 
 
 def parse_chat(path):
@@ -1424,10 +1561,14 @@ class App:
         self.superseded = set(self.superseded_map)  # old ids hidden after bg-resume
         self.kept_superseded = set()  # superseded but NOT Done -> shown anyway ('⤷')
         self._autolink_tried = set()  # compact children we've already tried to link
+        self.lineage = Lineage()
+        self.folded = {}           # older copy -> the same-named copy shown instead
+        self.show_older = False    # 'a'
         self._last_move = None     # (id, prev_cat, prev_ts) — for `u` undo
         self._search = ""          # last `/` query, so / repeats find the next hit
         self._chat_cache = {}   # path -> parsed chat dict (title/cwd are stable)
         self.all_chats = []
+        self.tags = load_project_tags()  # sessionId -> project key override (rescan needs it)
         self.rescan()           # populate self.all_chats from disk
         self.live = {}          # sessionId -> status icon key
         self.live_ids = set()   # sessions Claude treats as live agents
@@ -1449,7 +1590,6 @@ class App:
         # in the panel reveals them again, and 'h' unhides the selected one.
         self.hidden_projects = set(pj.get("hidden", []))
         self.show_hidden = bool(pj.get("show_hidden", False))
-        self.tags = load_project_tags()            # sessionId -> project key override
         if "active" not in pj:                      # first run -> default to home
             self.active_project = str(HOME)
         else:                                       # "__all__" means user chose All
@@ -1482,6 +1622,7 @@ class App:
         # exactly as they would by hand.
         self._auto_open = bool(auto_open and select_id)
         self._select_tries = 0   # the chat list can still be loading pass 1
+        self._fold_same_name()
 
     def _swallow_escape(self, first):
         """Consume the rest of an undecoded escape sequence (see _loop)."""
@@ -1513,7 +1654,7 @@ class App:
         finally:
             self.stdscr.timeout(350)
 
-    def display_title(self, chat):
+    def display_title(self, chat, seen=None):
         """What to show for a chat: your custom name > /rename title > its name
         when you last left it > Claude's auto name > first user message. Claude uses the short id as a placeholder
         name until it auto-names a fresh chat, so we skip id-like names."""
@@ -1536,7 +1677,7 @@ class App:
         # looked gone). Only a deliberate /rename overrides it.
         rec = self._agents.get(sid)
         return (_real(chat.get("custom_title"))
-                or _real(load_seen_titles().get(sid))
+                or _real((load_seen_titles() if seen is None else seen).get(sid))
                 or _real(rec.get("name") if rec else None)
                 or _real(self.cnames.get(sid))
                 or _real(chat.get("ai_title"))
@@ -1782,14 +1923,11 @@ class App:
         # on-disk continuation whose project key equals old's. Everything else
         # (dangling, still-being-born, cross-project) stays visible.
         #
-        # SELF-HEAL: separately, permanently prune from superseded.json any entry
-        # whose whole chain is BOTH absent on disk AND not a live agent — it's
-        # never coming back. The locked write-back means even OTHER running
-        # claude-c instances stop honoring the stale pointer within one ~2s tick.
+        # A link whose continuation has no file is kept, never pruned: it hides
+        # nothing meanwhile, and a server chat's file reaches the mirror long
+        # after the link is written. Pruning lost those links for good.
         smap = getattr(self, "superseded_map", {})
         tags = getattr(self, "tags", {})
-        live_ids = getattr(self, "live_ids", set())
-        have_live = getattr(self, "_agents_ts", 0) > 0  # queried agents at least once
         by_id = {c["id"]: c for c in cache.values()}    # only sessions with a file
 
         def pkey(cid):
@@ -1798,19 +1936,15 @@ class App:
 
         hidden = set()
         kept = set()   # superseded, but kept on the board because it isn't Done
-        dead = set()
         for old in smap:
             chain = set()
             nxt = smap.get(old)
             head_file = None       # first continuation in the chain that has a file
-            reached_live = False
             while nxt and nxt not in chain:
                 chain.add(nxt)
                 if nxt in by_id:
                     head_file = nxt
                     break
-                if nxt in live_ids:
-                    reached_live = True
                 nxt = smap.get(nxt)
             if head_file is not None:
                 # Only hide when old itself is on disk AND its continuation is in
@@ -1825,12 +1959,6 @@ class App:
                         hidden.add(old)
                     else:
                         kept.add(old)
-            elif have_live and not reached_live:
-                dead.add(old)                    # continuation gone for good -> prune
-        if dead:
-            # Locked write-back; harmless/idempotent if a peer prunes the same keys.
-            self.superseded_map = _json_update(
-                SUPERSEDED_STORE, lambda d: [d.pop(k, None) for k in dead])
         self.superseded = hidden
         self.kept_superseded = kept
         # A chat that moved to a server shows once: the server copy wins over the
@@ -1841,6 +1969,39 @@ class App:
              and (c.get("host") or c["id"] not in remote_ids)),
             key=lambda c: c["mtime"], reverse=True)
         return new_ids
+
+    def _fold_same_name(self):
+        """Work out self.folded. Writes no board state: categories, stars and
+        links stay as they are, so 'a' shows every copy exactly as it was."""
+        seen, groups = load_seen_titles(), {}
+        for c in self.all_chats:
+            name = " ".join(self.display_title(c, seen).split()).casefold()
+            groups.setdefault((project_key_for(c, self.tags), name), []).append(c)
+        groups = [g for g in groups.values() if len(g) > 1]
+        keep = set(load_badges()) | set(self.paused)  # role chats and parked chats
+        # A chat being opened by id (session restore) must be on the board.
+        want = None if self._positioned else self._want_select
+        folded = {}
+        for members in groups:
+            for copies in self.lineage.components(members, self.superseded_map):
+                newest = max(copies, key=self.lineage.recency)["id"]
+                for c in copies:
+                    sid = c["id"]
+                    if sid != newest and sid not in keep and not (want and sid.startswith(want)):
+                        folded[sid] = newest
+        self.folded = folded
+        self.lineage.save()
+
+    def unique_fork_name(self, title):
+        """'name ⑂N' with the first free N: a deliberate fork is a second chat,
+        so it gets its own name and does not fold."""
+        base = re.sub(r"\s*⑂\d*$", "", title).strip()
+        seen = load_seen_titles()
+        used = set(load_names().values()) | {self.display_title(c, seen) for c in self.all_chats}
+        n = 1
+        while f"{base} ⑂{n}" in used:
+            n += 1
+        return f"{base} ⑂{n}"
 
     def category_of(self, chat_id):
         return self.store.get(chat_id, UNCATEGORIZED)
@@ -2044,7 +2205,8 @@ class App:
                 detail = "show every chat"
             else:
                 cnt = sum(1 for c in self.all_chats
-                          if project_key_for(c, self.tags) == path)
+                          if project_key_for(c, self.tags) == path
+                          and (self.show_older or c["id"] not in self.folded))
                 if os.path.isabs(path):
                     detail = f"{path}   ({cnt})"
                 else:
@@ -2245,6 +2407,10 @@ class App:
             # shouting on the full board.
             cs = [c for c in cs
                   if c["id"] in self.starred or c["id"] in self.special]
+        if self.folded and not self.show_older:
+            # An older copy hides only while the copy replacing it is in this view.
+            here = {c["id"] for c in cs}
+            cs = [c for c in cs if self.folded.get(c["id"]) not in here]
         return cs
 
     def grouped(self):
@@ -2485,6 +2651,7 @@ class App:
                 if new_ids:
                     self.refresh_live(force=True)
                     self._live_ts = now
+                self._fold_same_name()
             if now - self._live_ts > 1.0:
                 self.refresh_live()
                 self._live_ts = now
@@ -2548,6 +2715,13 @@ class App:
             self.scroll = 0
         elif ch in (ord("u"), ord("U")):
             self._undo_move()
+        elif ch in (ord("a"),):
+            c = self.selected_chat(nav)
+            self.show_older = not self.show_older
+            if c:
+                self._reselect_id = c["id"] if self.show_older else self.folded.get(c["id"], c["id"])
+            self.message = ("Showing older copies  ·  a to fold them"
+                            if self.show_older else "Older copies folded")
         elif ch in (ord("/"),):
             self._search_jump(nav)
         elif ch in (ord("p"), ord("P")):
@@ -2563,12 +2737,12 @@ class App:
             if c:
                 new = self._read_line("Rename to: ", self.display_title(c))
                 if new is not None:
-                    if new == "":
-                        self.names = _json_set(NAMES_STORE, c["id"], None)
-                        self.message = "Name reset to default"
-                    else:
-                        self.names = _json_set(NAMES_STORE, c["id"], new)
-                        self.message = "Renamed"
+                    ids = [c["id"]]
+                    if not self.show_older:  # its folded copies are the same chat
+                        ids += [o for o, n in self.folded.items() if n == c["id"]]
+                    for sid in ids:
+                        self.names = _json_set(NAMES_STORE, sid, new or None)
+                    self.message = "Renamed" if new else "Name reset to default"
         elif ch in (ord("m"), ord("M")):
             c = self.selected_chat(nav)
             if c:
@@ -2731,7 +2905,7 @@ class App:
                 pass
         help1 = ("Enter open   / find   Space fold   n new   r rename   m move   "
                  "o mode   f fork   B bypass   x stop   s mark ★♡   ^S marked   1-6 file   u undo   "
-                 "d delete   P projects   ^R reload   q quit")
+                 "d delete   a older copies   P projects   ^R reload   q quit")
         self.stdscr.addstr(1, 0, help1[: w - 1], curses.color_pair(8) | curses.A_DIM)
         legend = "  ".join(f"{i+1}:{CATEGORIES[i]}" for i in range(6))
         self.stdscr.addstr(2, 0, legend[: w - 1], curses.A_DIM)
@@ -2824,6 +2998,10 @@ class App:
                 t = self.display_title(c)
                 if c.get("host"):  # runs on another machine (opens over ssh)
                     t = "[srv] " + t
+                older = [o for o, n in self.folded.items() if n == c["id"]]
+                if older and not self.show_older:
+                    busy = sum(self.live.get(o) == "running" for o in older)
+                    t += f"  (+{len(older)} older" + (f", {busy} running)" if busy else ")")
                 badge = load_badges().get(c["id"])
                 if badge:  # a role chat (a Cotube channel Claude, the manager): its badge leads the row
                     t = badge + "  " + t
@@ -3250,7 +3428,13 @@ def open_remote_chat(app, c, action):
             if not fork:
                 if app.names.get(c["id"]):
                     _json_set(NAMES_STORE, new_full, app.names[c["id"]])
+                if c["id"] in app.starred:
+                    _json_set(STARRED_STORE, new_full, True)
+                if c["id"] in app.special:
+                    _json_set(SPECIAL_STORE, new_full, True)
                 _json_set(SUPERSEDED_STORE, c["id"], new_full)
+            else:
+                _json_set(NAMES_STORE, new_full, app.unique_fork_name(title))
     print(f"  Attaching on {host}: press Ctrl+Z to leave it running and come back.\n")
     set_window_title(short)
     run_child(_remote_attach_cmd(host, f"{env}claude attach {short}"))
@@ -4081,6 +4265,8 @@ def main():
                     _json_set(SUPERSEDED_STORE, c["id"], new_full)
                     pending_resume = (c["id"], new_full, new_short)
                     chat_token_carry(c["id"], new_full, tok_flags)
+                else:
+                    _json_set(NAMES_STORE, new_full, app.unique_fork_name(title))
                 run_id = new_full
                 last_id = new_full
                 short = new_short
