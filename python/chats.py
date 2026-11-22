@@ -2903,9 +2903,9 @@ class App:
                 self.stdscr.addstr(0, x, chip, chip_attr)
             except curses.error:
                 pass
-        help1 = ("Enter open   / find   Space fold   n new   r rename   m move   "
+        help1 = ("Enter open   / find   Space fold   a older copies   n new   r rename   m move   "
                  "o mode   f fork   B bypass   x stop   s mark ★♡   ^S marked   1-6 file   u undo   "
-                 "d delete   a older copies   P projects   ^R reload   q quit")
+                 "d delete   P projects   ^R reload   q quit")
         self.stdscr.addstr(1, 0, help1[: w - 1], curses.color_pair(8) | curses.A_DIM)
         legend = "  ".join(f"{i+1}:{CATEGORIES[i]}" for i in range(6))
         self.stdscr.addstr(2, 0, legend[: w - 1], curses.A_DIM)
