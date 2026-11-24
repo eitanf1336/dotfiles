@@ -59,6 +59,16 @@ case "$cmd" in
   run)
     lock
     if [ -f "$CONF/$P.HOLD" ]; then log "held ($CONF/$P.HOLD exists): no backup run. $(head -1 "$CONF/$P.HOLD")"; exit 0; fi
+    # Never upload through a phone hotspot / metered link: a full-speed upload there
+    # bufferbloats the uplink to 1.5 s ping and every [srv] chat crawls (24 Nov 2026).
+    # Skip and retry in an hour; FORCE=1 overrides.
+    if [ -z "${FORCE:-}" ] && command -v nmcli >/dev/null \
+       && nmcli -t -f GENERAL.METERED dev show 2>/dev/null | grep -q ':yes'; then
+      log "metered connection (hotspot?): skipped, retrying in 1h"
+      command -v systemd-run >/dev/null && systemd-run --user --on-active=1h \
+        --unit="home-backup-retry-$(date +%s)" "$HOME/.local/bin/home-backup" run >/dev/null 2>&1
+      exit 0
+    fi
     paths_args
     command -v server-now >/dev/null && server-now "backup-$P" backing-up --ttl 12h >/dev/null 2>&1
     log "backup start: ${PATHS[*]}"
