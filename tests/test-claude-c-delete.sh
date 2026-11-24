@@ -61,8 +61,30 @@ m=json.load(open(sys.argv[1])); m["expires_at"]=time.time()-5; json.dump(m,open(
 P
 "$TOOL" purge >/dev/null 2>&1; check "expired copy is purged" "[ ! -e '$b' ]"
 
+# backups: the chat leaves every snapshot of this machine's restic repository
+if command -v restic >/dev/null && command -v home-backup >/dev/null; then
+  rm -rf "$C"; build
+  case "$(hostname)" in *-server) P=server;; *) P=laptop;; esac
+  mkdir -p "$T/.config/restic"; echo pw > "$T/.config/restic/$P.pass"
+  printf 'RESTIC_REPOSITORY=%s\nRESTIC_PASSWORD_FILE=%s\nRESTIC_CACHE_DIR=%s\n' "$T/repo" "$T/.config/restic/$P.pass" "$T/cache" > "$T/.config/restic/$P.env"
+  hb() { home-backup restic "$@"; }
+  hb init -q >/dev/null 2>&1; hb backup -q "$C" >/dev/null 2>&1; echo x >> "$C/projects/-x/$OTHER.jsonl"; hb backup -q "$C" >/dev/null 2>&1
+  lsall() { for s in $(hb snapshots --json | python3 -c 'import json,sys;print(" ".join(x["short_id"] for x in json.load(sys.stdin)))'); do hb ls "$s"; done; }
+  all="$(lsall)"
+  check "backup: chat is in the snapshots before" "echo \"\$all\" | grep -c $SID >/dev/null"
+  "$TOOL" --session "$SID" --peer-call >/dev/null
+  for i in $(seq 1 30); do systemctl --user list-units --all --no-legend 'claude-c-delete-scrub-*' | grep -q . || break; sleep 1; done
+  CLAUDE_C_DELETE_PRUNE_NOW=1 "$TOOL" scrub; rc=$?
+  check "backup: scrub finishes and empties its queue" "[ $rc = 0 ] && [ ! -e '$C/chat-trash/pending-scrub.json' ]"
+  all="$(lsall)"
+  check "backup: chat, older copy, job folder, old prompt history gone from every snapshot" "! echo \"\$all\" | grep -qE '$SID|$OLD|jobs/abcd1234|history.jsonl'"
+  check "backup: other chat still in both snapshots" "[ \$(echo \"\$all\" | grep -c '$OTHER.jsonl') = 2 ]"
+  check "backup: repository still healthy" "hb check >/dev/null 2>&1"
+  "$TOOL" restore aaaaaaaa --peer-call >/dev/null
+else echo "skip backup tests (no restic/home-backup here)"; fi
+
 # unknown chat, bad id
-"$TOOL" --session dddddddd-1111-2222-3333-444444444444 --peer-call >/dev/null; check "unknown chat: exit 1, no bundle" "[ $? = 1 ] && [ -z \"\$(ls '$C/chat-trash' | grep -v README)\" ]"
+"$TOOL" --session dddddddd-1111-2222-3333-444444444444 --peer-call >/dev/null; check "unknown chat: exit 1, no bundle" "[ $? = 1 ] && [ -z \"\$(ls '$C/chat-trash' | grep -v 'README\|pending')\" ]"
 "$TOOL" --session nope --peer-call >/dev/null; check "bad id refused" "[ $? = 2 ]"
 
 # live chat: a stand-in process registered as the session; deletion is handed

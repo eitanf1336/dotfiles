@@ -6,6 +6,7 @@
   claude-c-delete list             what can still be recovered, and for how long
   claude-c-delete restore <id>     put a deleted chat back (id or its first characters)
   claude-c-delete purge            drop copies older than 30 days (a daily timer runs this)
+  claude-c-delete scrub            take deleted chats out of this machine's backups (runs by itself)
 
 Meant for the /delete slash command. "Delete" means the chat leaves the board
 and every place Claude keeps it: the transcript, its sidecar folder, its job
@@ -16,6 +17,11 @@ other machine. Nothing is erased on the spot: it all moves into one bundle under
 
 PRIVACY: the trash is for recovery only. A Claude must not read, list, search
 or mention anything in it unless Eitan directly asks to recover a deleted chat.
+
+BACKUPS: a deleted chat is also taken out of this machine's restic backup
+(home-backup): every snapshot is rewritten without the chat's files, then the
+data is pruned. That is queued and done in the background, never while a backup
+runs, and retried by the daily timer until it has gone through.
 
 A chat that is running cannot be removed under its own feet, so from inside a
 chat the work is handed to a process of its own (a transient systemd unit, out
@@ -43,6 +49,8 @@ BOARD_DIR = HOME / ".claude" / "chats"
 CHATS_PY = BOARD_DIR / "chats.py"
 REMOTE_DIR = HOME / ".claude" / "remote"
 PENDING = TRASH / "pending-peer.json"
+SCRUB = TRASH / "pending-scrub.json"
+PROFILE = "server" if socket.gethostname().endswith("-server") else "laptop"
 KEEP_DAYS = 30
 DELAY = 4.0
 SID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -229,6 +237,141 @@ def title_of(sid, path):
     return "(untitled)"
 
 
+# ---------------------------------------------------------------- backups
+
+def backup_tool():
+    """home-backup, when this machine has a backup profile; else None."""
+    if not (HOME / ".config" / "restic" / f"{PROFILE}.env").is_file():
+        return None
+    hb = shutil.which("home-backup") or str(HOME / ".local" / "bin" / "home-backup")
+    return hb if os.path.exists(hb) else None
+
+
+def queue_scrub(sids, jobs=(), history=False):
+    if backup_tool() is None:
+        return
+    ensure_trash()
+    q = read_json(SCRUB, [])
+    for s in sids:
+        if SID_RE.match(s):
+            q.append({"sid": s, "jobs": sorted(jobs), "history": bool(history),
+                      "cfg": str(CFG), "stage": "rewrite", "at": time.time()})
+    write_json(SCRUB, q)
+
+
+def unqueue_scrub(sids):
+    q = read_json(SCRUB, [])
+    keep = [e for e in q if e.get("sid") not in sids]
+    if len(keep) != len(q):
+        if keep:
+            write_json(SCRUB, keep)
+        else:
+            SCRUB.unlink(missing_ok=True)
+
+
+def metered():
+    try:
+        out = subprocess.run(["nmcli", "-t", "-f", "GENERAL.METERED", "dev", "show"],
+                             capture_output=True, text=True, timeout=10).stdout
+        return ":yes" in out
+    except Exception:
+        return False
+
+
+def cmd_scrub():
+    """Rewrite the backup's snapshots without the queued chats, then prune.
+    Returns 0 when the queue is empty afterwards."""
+    q = read_json(SCRUB, [])
+    if not q:
+        return 0
+    hb = backup_tool()
+    if hb is None:
+        SCRUB.unlink(missing_ok=True)
+        return 0
+    import fcntl
+    state = HOME / ".local" / "state" / "home-backup"
+    state.mkdir(parents=True, exist_ok=True)
+    lock = open(state / f"{PROFILE}.lock", "w")       # the lock a backup run holds
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 1                                       # a backup is running: later
+
+    def restic(*args, timeout=3 * 3600):
+        return subprocess.run(["nice", "-n", "15", hb, "restic", *args], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=timeout, pass_fds=())
+
+    todo = [e for e in q if e.get("stage") == "rewrite"]
+    if todo:
+        allowed, excl = [], []
+        for e in todo:
+            excl += ["--exclude", e["sid"] + "*"]
+            allowed.append(e["sid"])
+            for j in e.get("jobs", []):
+                if re.match(r"^[0-9a-f]{8}$", j):
+                    path = f"{e['cfg']}/jobs/{j}"
+                    excl += ["--exclude", path]
+                    allowed.append(path)
+            if e.get("history"):
+                excl += ["--exclude", f"{e['cfg']}/history.jsonl"]
+                allowed.append(f"{e['cfg']}/history.jsonl")
+        try:
+            restic("unlock", timeout=600)          # only removes locks restic itself calls stale
+            dry = restic("rewrite", "--dry-run", *excl)
+            hit = [l[len("excluding "):] for l in dry.stdout.splitlines() if l.startswith("excluding ")]
+            # Safety: every path the rewrite would drop must be one of ours.
+            if dry.returncode != 0 or any(not any(a in h for a in allowed) for h in hit):
+                print(f"scrub: dry run refused (rc {dry.returncode}): {dry.stderr.strip()[-300:]}", file=sys.stderr)
+                return 1
+            if hit:
+                real = restic("rewrite", "--forget", *excl)
+                if real.returncode != 0:
+                    print(f"scrub: rewrite failed: {real.stderr.strip()[-300:]}", file=sys.stderr)
+                    return 1
+        except Exception as err:
+            print(f"scrub: {err!r}", file=sys.stderr)
+            return 1
+        for e in todo:
+            e["stage"] = "prune"
+        write_json(SCRUB, q)
+    # Pruning rewrites data packs: not on a metered link, and not before a first
+    # backup has completed (the chunks a failed run uploaded are what lets the
+    # next run resume).
+    force = os.environ.get("CLAUDE_C_DELETE_PRUNE_NOW") == "1"
+    if not force and (metered() or not (state / f"{PROFILE}.last-success").is_file()):
+        return 1
+    try:
+        pr = restic("prune", "--max-unused", "0", timeout=8 * 3600)
+        if pr.returncode != 0:
+            print(f"scrub: prune failed: {pr.stderr.strip()[-300:]}", file=sys.stderr)
+            return 1
+    except Exception as err:
+        print(f"scrub: {err!r}", file=sys.stderr)
+        return 1
+    SCRUB.unlink(missing_ok=True)
+    return 0
+
+
+def spawn_scrub():
+    if not read_json(SCRUB, []):
+        return
+    args = [sys.executable, os.path.abspath(__file__), "scrub"]
+    env = [f"--setenv=PATH={os.environ.get('PATH', '')}", f"--setenv=HOME={HOME}"]
+    for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_C_DELETE_PRUNE_NOW"):
+        if os.environ.get(k):
+            env.append(f"--setenv={k}={os.environ[k]}")
+    try:
+        r = subprocess.run(["systemd-run", "--user", "--collect", "--quiet", "--nice=15",
+                            f"--unit=claude-c-delete-scrub-{int(time.time())}", *env, *args],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
+        if r.returncode == 0:
+            return
+    except Exception:
+        pass
+    subprocess.Popen(args, start_new_session=True, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 # ---------------------------------------------------------------- delete
 
 def take_history(sids, bundle):
@@ -362,6 +505,9 @@ def do_delete(sid, bundle=None, sweep=0):
     found = {s: items_of(s) for s in sids}
     if bundle is None:
         mirrors = drop_mirrors(sids)
+        hist = CFG / "history.jsonl"
+        typed = hist.is_file() and any(s.encode() in hist.read_bytes() for s in sids)
+        queue_scrub(sids, [j.name for s in sids for j in job_dirs(s)], typed)
         if not any(found.values()):
             # Nothing here but (maybe) the board's entries for a chat that
             # lives on the other machine: keep those so a restore brings them back.
@@ -460,6 +606,7 @@ def finish(sid, delay, peer=True):
     if peer:
         sids = read_json(bundle / "manifest.json", {}).get("sessions", [sid])
         remember_pending(peer_delete(sids))
+    spawn_scrub()
     return 0
 
 
@@ -494,6 +641,7 @@ def cmd_delete(sid, peer=True):
         return 0
     here = any(items_of(s) for s in sids)
     bundle = do_delete(sid)
+    spawn_scrub()
     if not peer:
         return 0 if bundle is not None or here else 1
     failed = peer_delete(sids)
@@ -596,6 +744,7 @@ def cmd_restore(prefix, peer=True):
         return 1
     done, skipped, title = False, [], ""
     for b, m in hits:
+        unqueue_scrub(m.get("sessions", []))
         skipped += restore_bundle(b, m)
         done = True
         if not m.get("board_only"):
@@ -635,6 +784,7 @@ def cmd_purge():
         else:
             PENDING.unlink(missing_ok=True)
     print(f"Purged {n} expired chat cop{'y' if n == 1 else 'ies'}.")
+    cmd_scrub()
     return 0
 
 
@@ -649,6 +799,8 @@ def main(argv):
         return cmd_restore(argv[1], peer)
     if argv[:1] == ["purge"]:
         return cmd_purge()
+    if argv[:1] == ["scrub"]:
+        return cmd_scrub()
     if argv[:1] in (["-h"], ["--help"], ["help"]):
         print(__doc__.strip())
         return 0
