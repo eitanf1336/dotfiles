@@ -1,34 +1,86 @@
 #!/bin/bash
-# Recover the Intel AX201 when its firmware dies and takes the netdev with it.
-# Symptom: "Failed to run INIT ucode: -110" / "Hardware became unavailable
-# during restart." -> wlo1 disappears -> desktop reports no WiFi adapter.
-# A module reload brings it back, so a reboot is never needed.
+# Recover the Intel AX201 (CNVi, 0000:00:14.3) when its firmware dies and
+# takes the wl* netdev with it ("no WiFi adapter found").
+#
+# Each attempt, escalating:
+#   1. unload iwlmvm, then iwlwifi (iwlmvm holds iwlwifi; verified with lsmod)
+#   2. unbind + PCI function reset + remove + rescan of the WiFi device
+#   3. load iwlwifi, wait up to 20 s for a wl* interface
+# Retries back off (30s, 1m, 2m, 5m, 15m, then every 30m) instead of
+# hammering a dead chip forever. Recovery is logged with the kernel's reason.
+#
+# 24-25 Nov 2026 lesson: when the firmware fails "INIT ucode: -110" on a COLD
+# boot too, no software step helps (all of the above ran, the chip re-probed,
+# firmware still would not start). That state is written to /run/wifi-recover
+# so it is visible: it needs a full power drain or the card is failing.
 PCI=0000:00:14.3
+DEV=/sys/bus/pci/devices/$PCI
+STATE=/run/wifi-recover
+BACKOFF=(30 60 120 300 900 1800)
+
+log(){ logger -t wifi-recover -- "$*"; echo "wifi-recover: $*"; }
 have_wifi(){ ls /sys/class/net 2>/dev/null | grep -qE '^wl'; }
+loaded(){ lsmod | awk '{print $1}' | grep -qxE 'iwlmvm|iwlwifi'; }
 
-while :; do
-  if ! have_wifi; then
-    logger -t wifi-recover "wifi interface gone, reloading iwlwifi"
+unload(){
+  for try in 1 2 3; do
+    timeout 30 modprobe -r iwlmvm 2>/dev/null
     timeout 30 modprobe -r iwlwifi 2>/dev/null
+    loaded || return 0
     sleep 3
-    timeout 30 modprobe iwlwifi 2>/dev/null
-    sleep 8
+  done
+  log "could not unload: $(lsmod | grep -E '^(iwlmvm|iwlwifi) ' | awk '{print $1" used by ["$4"] refs "$3}' | tr '\n' ' ')"
+  return 1
+}
 
-    if ! have_wifi; then
-      logger -t wifi-recover "reload failed, trying PCI remove+rescan"
-      [ -e /sys/bus/pci/devices/$PCI/remove ] && echo 1 > /sys/bus/pci/devices/$PCI/remove
-      sleep 2
-      echo 1 > /sys/bus/pci/rescan
-      sleep 8
-    fi
+pci_cycle(){
+  [ -e "$DEV/driver" ] && echo "$PCI" > "$DEV/driver/unbind" 2>/dev/null
+  [ -e "$DEV/reset" ] && echo 1 > "$DEV/reset" 2>/dev/null
+  [ -e "$DEV/remove" ] && echo 1 > "$DEV/remove"
+  sleep 2
+  echo 1 > /sys/bus/pci/rescan
+  sleep 2
+  [ -e "$DEV" ] || log "PCI rescan did not bring $PCI back"
+}
 
-    if have_wifi; then
+wait_wifi(){ for _ in $(seq 20); do have_wifi && return 0; sleep 1; done; return 1; }
+
+attempt(){
+  unload
+  pci_cycle
+  loaded || timeout 30 modprobe iwlwifi
+  wait_wifi
+}
+
+fail=0
+while :; do
+  if have_wifi; then
+    if [ $fail -gt 0 ]; then
       systemctl restart NetworkManager
-      logger -t wifi-recover "recovered without reboot"
-    else
-      logger -t wifi-recover "RECOVERY FAILED, reboot required"
+      log "recovered after $fail attempt(s), no reboot needed"
+      fail=0
     fi
-    sleep 30
+    echo OK > $STATE
+    sleep 10
+    continue
   fi
-  sleep 10
+
+  why=$(journalctl -k -b -n 400 --no-pager -o cat 2>/dev/null \
+        | grep -E 'iwlwifi.*(INIT ucode|RT ucode|Microcode SW error|Hardware became unavailable|NMI_)' | tail -1)
+  fail=$((fail + 1))
+  log "wifi interface gone (attempt $fail). kernel: ${why:-no iwlwifi error found}"
+
+  if attempt; then
+    continue   # top of loop restarts NetworkManager and logs success
+  fi
+
+  wait=${BACKOFF[$((fail - 1))]:-${BACKOFF[-1]}}
+  if [ $fail -ge 3 ]; then
+    echo "DEAD since $(date '+%F %T'): firmware will not start after module reload + PCI reset. Needs a full power drain (shut down, unplug charger and dock, hold power 40 s) or the WiFi card is failing." > $STATE
+    [ $fail -eq 3 ] && log "chip will not boot its firmware even after a full reset; software cannot fix this. Needs a full power drain, or the card is failing. Retrying every ${BACKOFF[-1]}s."
+  else
+    echo "RECOVERING: attempt $fail failed" > $STATE
+  fi
+  log "attempt $fail failed, next try in ${wait}s"
+  sleep "$wait"
 done

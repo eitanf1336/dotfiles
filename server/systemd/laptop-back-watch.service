@@ -1,0 +1,7 @@
+[Unit]
+Description=One-shot: when the laptop comes back online, launch a Claude to fix and harden it
+
+[Service]
+Type=oneshot
+Environment=PATH=/home/eitan/bin:/home/eitan/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/eitan/bin/laptop-back-watch

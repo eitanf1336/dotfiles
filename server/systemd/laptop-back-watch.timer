@@ -1,0 +1,9 @@
+[Unit]
+Description=Check every minute whether the laptop is back online
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+
+[Install]
+WantedBy=timers.target

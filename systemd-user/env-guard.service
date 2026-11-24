@@ -1,0 +1,6 @@
+[Unit]
+Description=Move aside recent environment.d changes after a failed GNOME login
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/env-guard

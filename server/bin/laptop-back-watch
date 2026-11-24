@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# laptop-back-watch (Kit, 25 Nov 2026): Eitan's laptop died at ~21:20 on 24 Nov (an untested mutter
+# GPU env file from a laptop chat, then the AX201 WiFi chip vanished and wifi-recover did not save it).
+# Runs every minute from laptop-back-watch.timer on the server. The moment `ssh laptop` answers, it
+# pings My Claude, launches ONE Opus Claude (as unit laptop-fixer) to repair and harden the laptop,
+# posts that Claude's final report to My Claude, and disarms itself. One shot by design.
+# Off switch: systemctl --user disable --now laptop-back-watch.timer
+set -u
+ST=~/.local/state/laptop-back-watch
+GROUP=120363410856554324@g.us
+send() { python3 -c 'import json,sys;print(json.dumps({"recipient":sys.argv[1],"message":sys.argv[2]}))' "$GROUP" "$1" \
+  | curl -s -m 20 -X POST http://127.0.0.1:8080/api/send -H 'Content-Type: application/json' -d @- >/dev/null; }
+
+[ -f $ST/fired ] && exit 0
+ssh -o ConnectTimeout=8 -o BatchMode=yes laptop true 2>/dev/null || exit 0
+date '+%F %T' > $ST/fired
+systemctl --user disable laptop-back-watch.timer >/dev/null 2>&1
+send "🤖 Laptop is back online. Kit (Opus) is on it now: undoing the broken GPU setting, fixing WiFi, and hardening it so it doesn't repeat. I'll post the report here. You don't have to touch anything."
+server-now laptop-fixer working "repairing the laptop" --ttl 2h 2>/dev/null
+systemd-run --user --unit=laptop-fixer --collect -p RuntimeMaxSec=3600 \
+  bash -c "cd ~ && PATH=/home/eitan/.local/bin:$PATH timeout 3500 /home/eitan/.local/bin/claude -p --model opus --permission-mode bypassPermissions \"\$(cat $ST/brief.md)\" > $ST/report.txt 2> $ST/err.txt; \
+  r=\$(tail -c 3500 $ST/report.txt); [ -z \"\$r\" ] && r='🤖 The laptop fixer ended without a report. Log: ~/.local/state/laptop-back-watch/err.txt on the server.'; \
+  python3 -c 'import json,sys;print(json.dumps({\"recipient\":\"$GROUP\",\"message\":sys.argv[1]}))' \"\$r\" | curl -s -m 20 -X POST http://127.0.0.1:8080/api/send -H 'Content-Type: application/json' -d @- >/dev/null; \
+  server-now laptop-fixer --clear 2>/dev/null"

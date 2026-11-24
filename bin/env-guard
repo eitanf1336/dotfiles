@@ -1,0 +1,67 @@
+#!/bin/bash
+# env-guard: login safety net for ~/.config/environment.d.
+#
+# 24 Nov 2026: an untested mutter env file (90-mutter-multigpu.conf) made
+# gnome-shell abort ~20 s into every login, so the laptop could not be used.
+# This runs from OnFailure= of org.gnome.Shell@.service. If the shell died
+# within QUICK seconds of starting, every environment.d file changed in the
+# last day is moved to environment.d/disabled/ and its variables are dropped
+# from the user manager, so the NEXT login comes up clean. Nothing is deleted.
+#
+#   env-guard            act on the failed GNOME Shell unit (from OnFailure)
+#   env-guard --force    move recent files aside regardless of shell uptime
+#   ENV_GUARD_DIR=/tmp/x ENV_GUARD_DRY=1 env-guard --force   rehearse on a copy
+set -u
+DIR=${ENV_GUARD_DIR:-$HOME/.config/environment.d}
+QUICK=${ENV_GUARD_QUICK:-180}     # a shell that dies sooner than this = failed start
+DRY=${ENV_GUARD_DRY:-0}
+log(){ echo "env-guard: $*"; logger -t env-guard -- "$*" 2>/dev/null || true; }
+
+if [ "${1:-}" != --force ]; then
+  unit=$(systemctl --user list-units --all --plain --no-legend --state=failed \
+           'org.gnome.Shell@*.service' 2>/dev/null | awk 'NR==1{print $1}')
+  [ -n "$unit" ] || { log "no failed GNOME Shell unit, nothing to do"; exit 0; }
+  start_us=$(systemctl --user show -P ActiveEnterTimestampMonotonic "$unit")
+  now_us=$(awk '{printf "%d", $1*1000000}' /proc/uptime)
+  lived=$(( (now_us - ${start_us:-0}) / 1000000 ))
+  [ "${start_us:-0}" = 0 ] && lived=0
+  if [ "$lived" -ge "$QUICK" ]; then
+    log "$unit failed after ${lived}s (not a startup failure), leaving environment.d alone"
+    exit 0
+  fi
+  log "$unit died ${lived}s after start: treating it as a failed login"
+fi
+
+mapfile -t recent < <(find "$DIR" -maxdepth 1 -type f -name '*.conf' -mmin -1440 2>/dev/null | sort)
+if [ ${#recent[@]} -eq 0 ]; then
+  log "no environment.d file changed in the last day, nothing to move"
+  exit 0
+fi
+
+vars=()
+for f in "${recent[@]}"; do
+  while IFS= read -r v; do vars+=("$v"); done \
+    < <(sed -nE 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=.*/\1/p' "$f")
+  dest="$DIR/disabled/$(basename "$f")"
+  [ -e "$dest" ] && dest="$dest.$(date +%Y%m%d-%H%M%S)"
+  if [ "$DRY" = 1 ]; then
+    log "DRY: would move $f -> $dest"
+  else
+    mkdir -p "$DIR/disabled"
+    mv -- "$f" "$dest"
+    printf '%s  moved %s aside after a failed GNOME login (env-guard)\n' \
+      "$(date '+%F %T')" "$(basename "$f")" >> "$DIR/disabled/WHY.txt"
+    log "moved $f -> $dest"
+  fi
+done
+
+if [ ${#vars[@]} -gt 0 ]; then
+  if [ "$DRY" = 1 ]; then
+    log "DRY: would unset ${vars[*]}"
+  else
+    systemctl --user unset-environment "${vars[@]}"
+    log "unset ${vars[*]} in the user manager"
+  fi
+fi
+[ "$DRY" = 1 ] || systemctl --user daemon-reload
+log "done: next login starts without the recent environment.d changes"
