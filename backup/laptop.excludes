@@ -40,3 +40,6 @@ component_crx_cache
 /home/eitan/code/MyProjects/CuteWorld/out
 /home/eitan/code/MyProjects/Apeirion/apeirion-processing/downloads
 /home/eitan/code/DistillSignal/backend/models_onnx
+
+# Deleted chats (claude-c-delete): 30-day recovery copies only, must not outlive that in a backup
+/home/eitan/.claude/chat-trash

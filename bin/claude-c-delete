@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""claude-c-delete: delete a Claude chat, keeping a private copy for 30 days.
+
+  claude-c-delete                  delete the chat this runs in ($CLAUDE_CODE_SESSION_ID)
+  claude-c-delete --session <id>   delete another chat (full session id)
+  claude-c-delete list             what can still be recovered, and for how long
+  claude-c-delete restore <id>     put a deleted chat back (id or its first characters)
+  claude-c-delete purge            drop copies older than 30 days (a daily timer runs this)
+
+Meant for the /delete slash command. "Delete" means the chat leaves the board
+and every place Claude keeps it: the transcript, its sidecar folder, its job
+folder, its per-chat state, its board entries, the earlier copies of the same
+conversation (the ones a background resume left behind), and the copy on the
+other machine. Nothing is erased on the spot: it all moves into one bundle under
+~/.claude/chat-trash/, which is removed for good 30 days later.
+
+PRIVACY: the trash is for recovery only. A Claude must not read, list, search
+or mention anything in it unless Eitan directly asks to recover a deleted chat.
+
+A chat that is running cannot be removed under its own feet, so from inside a
+chat the work is handed to a process of its own (a transient systemd unit, out
+of reach of `claude stop`): it waits a few seconds so the reply still prints,
+returns the terminal to the board, stops the session, then moves the files.
+"""
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+CFG = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or str(HOME / ".claude")))
+TRASH = HOME / ".claude" / "chat-trash"
+BOARD_DIR = HOME / ".claude" / "chats"
+CHATS_PY = BOARD_DIR / "chats.py"
+REMOTE_DIR = HOME / ".claude" / "remote"
+PENDING = TRASH / "pending-peer.json"
+KEEP_DAYS = 30
+DELAY = 4.0
+SID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+BUNDLE_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}(\.\d+)?$")
+# The other machine, which may hold a stale copy of the same chat (chat-move
+# never deletes) or a read-only mirror of it.
+PEER = "laptop" if socket.gethostname().endswith("-server") else "server"
+
+README = """PRIVATE. Deleted Claude chats, kept 30 days so an accidental /delete can be undone.
+
+Claude: do NOT read, list, search, summarize or mention anything in this folder,
+and do not bring up that a chat was deleted, unless Eitan directly asks to
+recover a deleted chat. Recovery: `claude-c-delete list`, `claude-c-delete restore <id>`.
+"""
+
+
+# ---------------------------------------------------------------- helpers
+
+def load_board():
+    try:
+        loader = importlib.machinery.SourceFileLoader("claude_c_board", str(CHATS_PY))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+def read_json(path, default):
+    try:
+        return json.loads(Path(path).read_text() or "null") or default
+    except Exception:
+        return default
+
+
+def write_json(path, data):
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False))
+    os.replace(tmp, path)
+
+
+def ensure_trash():
+    TRASH.mkdir(parents=True, exist_ok=True)
+    os.chmod(TRASH, 0o700)
+    readme = TRASH / "README.txt"
+    if not readme.exists():
+        readme.write_text(README)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _argv(pid):
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except OSError:
+        return []
+    return [a for a in raw.split("\0") if a]
+
+
+def _same(a, b):
+    return bool(a and b) and (a.startswith(b) or b.startswith(a))
+
+
+def chat_clients(sid):
+    """PIDs of the claude clients showing this chat in a terminal (same test as
+    claude-c-file)."""
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        a = _argv(int(entry))
+        if len(a) < 3 or a[0].rsplit("/", 1)[-1] != "claude":
+            continue
+        if a[1] == "attach" and _same(a[2], sid):
+            pids.append(int(entry))
+        elif "--resume" in a:
+            i = a.index("--resume")
+            if i + 1 < len(a) and _same(a[i + 1], sid):
+                pids.append(int(entry))
+    return pids
+
+
+def session_pids(sid):
+    """PIDs of the claude processes that ARE this session (Claude's own registry)."""
+    pids = []
+    d = CFG / "sessions"
+    if d.is_dir():
+        for f in d.glob("*.json"):
+            rec = read_json(f, {})
+            pid = rec.get("pid")
+            if rec.get("sessionId") == sid and isinstance(pid, int) and alive(pid):
+                pids.append(pid)
+    return pids
+
+
+def job_dirs(sid):
+    out = []
+    d = CFG / "jobs"
+    if d.is_dir():
+        for j in d.iterdir():
+            if not j.is_dir():
+                continue
+            if read_json(j / "state.json", {}).get("sessionId") == sid:
+                out.append(j)
+    return out
+
+
+def short_id(sid):
+    for j in job_dirs(sid):
+        return j.name
+    return sid.split("-")[0]
+
+
+def transcripts(sid):
+    d = CFG / "projects"
+    return sorted(d.glob(f"*/{sid}.jsonl")) if d.is_dir() else []
+
+
+def mirror_copies(sid):
+    return sorted(REMOTE_DIR.glob(f"*/projects/*/{sid}.jsonl")) if REMOTE_DIR.is_dir() else []
+
+
+def items_of(sid):
+    """Everything on disk that belongs to one session, as paths under CFG."""
+    out = list(transcripts(sid))
+    out += [p for p in (CFG / "projects").glob(f"*/{sid}") if p.is_dir()]
+    out += job_dirs(sid)
+    for rel in (f"state/ctx/{sid}.json", f"file-history/{sid}", f"session-env/{sid}", f"tasks/{sid}"):
+        p = CFG / rel
+        if p.exists():
+            out.append(p)
+    todos = CFG / "todos"
+    if todos.is_dir():
+        out += sorted(todos.glob(f"{sid}*"))
+    return out
+
+
+def predecessors(sid):
+    """Earlier copies of the same conversation: every chat whose 'continued as'
+    chain (the board's superseded.json) leads to this one."""
+    smap = read_json(BOARD_DIR / "superseded.json", {})
+    found, frontier = [], [sid]
+    while frontier:
+        cur = frontier.pop()
+        for old, new in smap.items():
+            if new == cur and old != sid and old not in found and SID_RE.match(old):
+                found.append(old)
+                frontier.append(old)
+    return found
+
+
+def title_of(sid, path):
+    names = read_json(BOARD_DIR / "names.json", {})
+    n = names.get(sid)
+    if isinstance(n, str) and n.strip():
+        return n.strip()[:80]
+    try:
+        with open(path, errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 400:
+                    break
+                if '"type":"user"' not in line and '"type": "user"' not in line:
+                    continue
+                try:
+                    c = json.loads(line).get("message", {}).get("content")
+                except Exception:
+                    continue
+                if isinstance(c, list):
+                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                c = " ".join((c or "").split())
+                if c and not c.startswith(("<", "[", "Caveat")):
+                    return c[:80]
+    except OSError:
+        pass
+    return "(untitled)"
+
+
+# ---------------------------------------------------------------- delete
+
+def take_history(sids, bundle):
+    """Move this chat's lines out of Claude's prompt history (the up-arrow
+    list) into the bundle. Rewritten in place, so a Claude holding the file
+    open for append keeps writing to the same file."""
+    hist = CFG / "history.jsonl"
+    if not hist.is_file():
+        return
+    marks = [s.encode() for s in sids]
+    for _ in range(5):
+        with open(hist, "r+b") as f:
+            raw = f.read()
+            if not any(m in raw for m in marks):
+                return
+            keep, gone = [], []
+            for line in raw.splitlines(keepends=True):
+                sid = None
+                if any(m in line for m in marks):
+                    try:
+                        sid = json.loads(line).get("sessionId")
+                    except Exception:
+                        sid = None
+                (gone if sid in sids else keep).append(line)
+            if not gone:
+                return
+            if os.fstat(f.fileno()).st_size != len(raw):
+                continue                     # someone typed a prompt meanwhile: redo
+            f.seek(0)
+            f.write(b"".join(keep))
+            f.truncate()
+        with open(bundle / "history.jsonl", "ab") as out:
+            out.write(b"".join(gone))
+        return
+
+
+def take_outside(sids, bundle, manifest):
+    """Tool output Claude left in /tmp for these sessions."""
+    root = Path(f"/tmp/claude-{os.getuid()}")
+    if not root.is_dir():
+        return
+    for s in sids:
+        for p in root.glob(f"*/{s}"):
+            at = f"outside/{len(manifest['outside'])}-{p.name}"
+            try:
+                (bundle / "outside").mkdir(exist_ok=True)
+                shutil.move(str(p), str(bundle / at))
+                manifest["outside"].append({"at": at, "from": str(p)})
+            except Exception as e:
+                manifest.setdefault("errors", []).append(f"{p}: {e}")
+
+
+def drop_mirrors(sids):
+    """Read-only mirrors of the other machine's copy (that machine trashes the
+    real one)."""
+    n = 0
+    for s in sids:
+        for m in mirror_copies(s):
+            try:
+                m.unlink()
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
+def new_bundle(sid, sids, title):
+    ensure_trash()
+    bundle = TRASH / f"{time.strftime('%Y%m%d-%H%M%S')}-{sid[:8]}"
+    n = 0
+    while bundle.exists():
+        n += 1
+        bundle = TRASH / f"{time.strftime('%Y%m%d-%H%M%S')}-{sid[:8]}.{n}"
+    bundle.mkdir(mode=0o700)
+    manifest = {
+        "session": sid, "sessions": sids, "title": title,
+        "deleted_at": time.time(), "expires_at": time.time() + KEEP_DAYS * 86400,
+        "host": socket.gethostname(), "config_dir": str(CFG),
+        "items": [], "outside": [], "board": {},
+    }
+    return bundle, manifest
+
+
+def take_board_entries(sids, board):
+    """Remove these sessions from every board store, returning what was there
+    so a restore can put it back. Uses the board's locked writer when it loads."""
+    saved = {}
+    for f in sorted(BOARD_DIR.glob("*.json")):
+        d = read_json(f, None)
+        if not isinstance(d, dict):
+            continue
+        hit = {k: d[k] for k in sids if k in d}
+        if f.name == "superseded.json":
+            hit.update({k: v for k, v in d.items() if v in sids})
+        if not hit:
+            continue
+        saved[f.name] = hit
+        for k in hit:
+            if board is not None:
+                board._json_set(f, k, None)
+            else:
+                d.pop(k, None)
+        if board is None:
+            write_json(f, d)
+    return saved
+
+
+def move_into(bundle, path, n):
+    """Move one CFG path into the bundle, keeping its relative location. A path
+    that shows up again after the first sweep (a dying session's last write) is
+    appended (file) or stored beside the first (folder)."""
+    rel = path.relative_to(CFG)
+    dest = bundle / "files" / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not dest.exists():
+        shutil.move(str(path), str(dest))
+        return str(rel)
+    if path.is_file() and dest.is_file():
+        with open(dest, "ab") as out, open(path, "rb") as src:
+            shutil.copyfileobj(src, out)
+        path.unlink()
+        return None
+    shutil.move(str(path), str(dest.with_name(f"{dest.name}.late{n}")))
+    return None
+
+
+def do_delete(sid, bundle=None, sweep=0):
+    """Move the chat (and its earlier copies) into a trash bundle. Returns the
+    bundle, or None when this machine holds nothing of it."""
+    sids = [sid] + predecessors(sid)
+    found = {s: items_of(s) for s in sids}
+    if bundle is None:
+        mirrors = drop_mirrors(sids)
+        if not any(found.values()):
+            # Nothing here but (maybe) the board's entries for a chat that
+            # lives on the other machine: keep those so a restore brings them back.
+            saved = take_board_entries(sids, load_board())
+            if saved:
+                bundle, manifest = new_bundle(sid, sids, "(board entries only)")
+                manifest["board"], manifest["board_only"] = saved, True
+                write_json(bundle / "manifest.json", manifest)
+            return bundle if (saved or mirrors) else None
+        main = transcripts(sid)
+        bundle, manifest = new_bundle(sid, sids, title_of(sid, main[0]) if main else "(untitled)")
+    else:
+        manifest = read_json(bundle / "manifest.json", {})
+        if not manifest:
+            return bundle
+    for s in sids:
+        for p in found[s]:
+            try:
+                rel = move_into(bundle, p, sweep)
+                if rel:
+                    manifest["items"].append(rel)
+            except Exception as e:
+                manifest.setdefault("errors", []).append(f"{p}: {e}")
+    try:
+        take_history(sids, bundle)
+    except Exception as e:
+        manifest.setdefault("errors", []).append(f"history: {e}")
+    take_outside(sids, bundle, manifest)
+    for name, hit in take_board_entries(sids, load_board()).items():
+        manifest["board"].setdefault(name, {}).update(hit)
+    write_json(bundle / "manifest.json", manifest)
+    return bundle
+
+
+def peer_delete(sids):
+    """Ask the other machine to drop its copy too. Returns the ids that could
+    not be reached (retried by `purge`)."""
+    failed = []
+    for s in sids:
+        if not SID_RE.match(s):
+            continue
+        try:
+            r = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", PEER,
+                 f"~/bin/claude-c-delete --session {s} --peer-call"],
+                stdin=subprocess.DEVNULL, capture_output=True, timeout=45)
+            if r.returncode not in (0, 1):
+                failed.append(s)
+        except Exception:
+            failed.append(s)
+    return failed
+
+
+def remember_pending(sids):
+    if not sids:
+        return
+    ensure_trash()
+    cur = read_json(PENDING, [])
+    write_json(PENDING, sorted(set(cur) | set(sids)))
+
+
+def finish(sid, delay, peer=True):
+    """The detached half: runs outside the chat it is deleting."""
+    time.sleep(delay)
+    for pid in chat_clients(sid):            # hand the terminal back to the board
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+    claude = shutil.which("claude") or str(HOME / ".local/bin/claude")
+    try:                                      # a background session ends this way
+        subprocess.run([claude, "stop", short_id(sid)], stdin=subprocess.DEVNULL,
+                       capture_output=True, timeout=25)
+    except Exception:
+        pass
+    deadline = time.time() + 12
+    while session_pids(sid) and time.time() < deadline:
+        time.sleep(0.5)
+    for pid in session_pids(sid):             # a plain foreground session ends this way
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + 8
+    while session_pids(sid) and time.time() < deadline:
+        time.sleep(0.5)
+    bundle = do_delete(sid)
+    if bundle is None or not (bundle / "files").is_dir():
+        return 1
+    for n in range(1, 9):                     # catch a last write from the dying session
+        time.sleep(1.5)
+        do_delete(sid, bundle=bundle, sweep=n)
+    if peer:
+        sids = read_json(bundle / "manifest.json", {}).get("sessions", [sid])
+        remember_pending(peer_delete(sids))
+    return 0
+
+
+def spawn_finish(sid, peer):
+    args = [sys.executable, os.path.abspath(__file__), "--finish", sid, str(DELAY)]
+    if not peer:
+        args.append("--peer-call")
+    env = [f"--setenv=PATH={os.environ.get('PATH', '')}", f"--setenv=HOME={HOME}"]
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        env.append(f"--setenv=CLAUDE_CONFIG_DIR={os.environ['CLAUDE_CONFIG_DIR']}")
+    unit = f"claude-c-delete-{sid[:8]}-{int(time.time())}"
+    try:
+        r = subprocess.run(["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}", *env, *args],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
+        if r.returncode == 0:
+            return
+    except Exception:
+        pass
+    subprocess.Popen(args, start_new_session=True, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_delete(sid, peer=True):
+    if not SID_RE.match(sid or ""):
+        print("No chat to delete: need a full session id (run inside a chat, or pass --session <id>).")
+        return 2
+    purge_expired()
+    sids = [sid] + predecessors(sid)
+    if session_pids(sid) or chat_clients(sid):
+        spawn_finish(sid, peer)
+        print(f"Deleting this chat in {int(DELAY)}s. It can be recovered for {KEEP_DAYS} days.")
+        return 0
+    here = any(items_of(s) for s in sids)
+    bundle = do_delete(sid)
+    if not peer:
+        return 0 if bundle is not None or here else 1
+    failed = peer_delete(sids)
+    remember_pending(failed)
+    if here:
+        print(f"Chat deleted. It can be recovered for {KEEP_DAYS} days.")
+        return 0
+    if failed:
+        print(f"That chat is not on this machine and {PEER} did not answer. It will be retried.")
+        return 0
+    print(f"Chat deleted on {PEER}. It can be recovered for {KEEP_DAYS} days.")
+    return 0
+
+
+# ---------------------------------------------------------------- recover / purge
+
+def bundles():
+    if not TRASH.is_dir():
+        return []
+    out = []
+    for b in sorted(TRASH.iterdir()):
+        if b.is_dir() and BUNDLE_RE.match(b.name) and (b / "manifest.json").is_file():
+            out.append((b, read_json(b / "manifest.json", {})))
+    return out
+
+
+def ask_peer(args):
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", PEER,
+                            "~/bin/claude-c-delete " + " ".join(args) + " --peer-call"],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=45)
+        return r.returncode, r.stdout
+    except Exception:
+        return 255, ""
+
+
+def cmd_list(peer=True):
+    lines = []
+    for b, m in bundles():
+        if m.get("board_only"):
+            continue
+        left = int((m.get("expires_at", 0) - time.time()) // 86400)
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(m.get("deleted_at", 0)))
+        lines.append(f"{m.get('session', '?')[:8]}  deleted {when}  {max(left, 0):>2}d left  "
+                     f"[{m.get('host', '?')}]  {m.get('title', '')}")
+    if peer:
+        rc, out = ask_peer(["list"])
+        lines += [l for l in out.splitlines() if l.strip()]
+        if rc == 255:
+            lines.append(f"({PEER} did not answer: its deleted chats are not listed)")
+    print("\n".join(lines) if lines else ("" if not peer else "Nothing to recover."))
+    return 0
+
+
+def restore_bundle(b, m):
+    cfg = Path(m.get("config_dir") or CFG)
+    skipped = []
+    for rel in m.get("items", []):
+        src, dest = b / "files" / rel, cfg / rel
+        if not src.exists():
+            continue
+        if dest.exists():
+            skipped.append(rel)
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dest))
+    for o in m.get("outside", []):
+        src, dest = b / o["at"], Path(o["from"])
+        if src.exists() and not dest.exists():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+    hist = b / "history.jsonl"
+    if hist.is_file():
+        with open(cfg / "history.jsonl", "ab") as out:
+            out.write(hist.read_bytes())
+        hist.unlink()
+    board = load_board()
+    for name, hit in m.get("board", {}).items():
+        f = BOARD_DIR / name
+        for k, v in hit.items():
+            if board is not None:
+                board._json_set(f, k, v)
+            else:
+                d = read_json(f, {})
+                d[k] = v
+                write_json(f, d)
+    if not skipped:
+        shutil.rmtree(b)
+    return skipped
+
+
+def cmd_restore(prefix, peer=True):
+    if not re.match(r"^[0-9a-f-]{4,36}$", prefix):
+        print("Give the id (or its first characters) from `claude-c-delete list`.")
+        return 2
+    hits = [(b, m) for b, m in bundles()
+            if any(s.startswith(prefix) for s in m.get("sessions", [m.get("session", "")]))]
+    if len({m.get("session") for _, m in hits}) > 1:
+        print("More than one deleted chat matches: give more of the id.")
+        return 1
+    done, skipped, title = False, [], ""
+    for b, m in hits:
+        skipped += restore_bundle(b, m)
+        done = True
+        if not m.get("board_only"):
+            title = m.get("title", "")
+    there = False
+    if peer:
+        rc, out = ask_peer(["restore", prefix])
+        there = rc == 0
+        if there and not title:
+            title = out.strip().removeprefix("Restored: ")
+    if not done and not there:
+        print("No deleted chat matches that id.")
+        return 1
+    if skipped:
+        print("Restored, except these already exist and were left alone: " + ", ".join(skipped))
+        return 1
+    print(f"Restored: {title}")
+    return 0
+
+
+def purge_expired():
+    now, n = time.time(), 0
+    for b, m in bundles():
+        if m.get("expires_at") and now > m["expires_at"]:
+            shutil.rmtree(b, ignore_errors=True)
+            n += 1
+    return n
+
+
+def cmd_purge():
+    n = purge_expired()
+    pend = read_json(PENDING, [])
+    if pend:
+        still = peer_delete(pend)
+        if still:
+            write_json(PENDING, still)
+        else:
+            PENDING.unlink(missing_ok=True)
+    print(f"Purged {n} expired chat cop{'y' if n == 1 else 'ies'}.")
+    return 0
+
+
+def main(argv):
+    if argv[:1] == ["--finish"]:
+        return finish(argv[1], float(argv[2]), peer="--peer-call" not in argv)
+    peer = "--peer-call" not in argv
+    argv = [a for a in argv if a != "--peer-call"]
+    if argv[:1] == ["list"]:
+        return cmd_list(peer)
+    if argv[:1] == ["restore"] and len(argv) == 2:
+        return cmd_restore(argv[1], peer)
+    if argv[:1] == ["purge"]:
+        return cmd_purge()
+    if argv[:1] in (["-h"], ["--help"], ["help"]):
+        print(__doc__.strip())
+        return 0
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if argv[:1] == ["--session"] and len(argv) == 2:
+        session = argv[1]
+    elif argv:
+        print(__doc__.strip())
+        return 2
+    return cmd_delete(session, peer=peer)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

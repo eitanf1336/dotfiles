@@ -190,6 +190,10 @@ laptop reaches srv3 through it. Connected for the first time 29 Oct 2026 23:21.
   re-copy: `scp ~/.claude/.credentials.json server:.claude/` (or the reverse, whichever still works).
 - `server-claude-sync.timer` (every 5 min) copies CLAUDE.md, settings, skills, commands, prompts, statusline
   and Kit to the server and syncs memory both ways, so server Claudes follow the same rules.
+- `/delete` (`bin/claude-c-delete`, symlinked to `~/bin` on both machines) deletes a chat: it stops the session, moves the transcript, sidecar, job folder,
+  per-chat state, prompt-history lines and board entries into `~/.claude/chat-trash/<date>-<id8>/` (0700) on the machine that holds them, and asks the other
+  machine over ssh to do the same with its copy or mirror. `claude-c-delete list|restore <id>|purge`; `claude-c-delete-purge.timer` (daily, both machines)
+  removes copies older than 30 days. The trash is excluded from `home-backup`. It is private: see the rule in `~/.claude/CLAUDE.md`. Tests: `tests/test-claude-c-delete.sh`.
 - Server chats appear on the claude-c board as `[srv]`; `n` then `s` starts one on the server; Enter attaches
   over ssh; Ctrl+Z detaches and it keeps running; `B` reopens a chat with permission checks off.
 

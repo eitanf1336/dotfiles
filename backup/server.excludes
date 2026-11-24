@@ -47,3 +47,6 @@ component_crx_cache
 /home/eitan/code/MyProjects/MinecraftArena/out
 # restic's own cache
 /home/eitan/.cache/restic
+
+# Deleted chats (claude-c-delete): 30-day recovery copies only, must not outlive that in a backup
+/home/eitan/.claude/chat-trash

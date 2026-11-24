@@ -1,0 +1,7 @@
+[Unit]
+Description=Drop deleted-chat copies older than 30 days (claude-c-delete purge)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/bin/claude-c-delete purge

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily purge of deleted-chat copies older than 30 days
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=20min
+Persistent=true
+Unit=claude-c-delete-purge.service
+
+[Install]
+WantedBy=timers.target
