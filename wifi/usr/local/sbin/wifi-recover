@@ -52,7 +52,33 @@ attempt(){
   wait_wifi
 }
 
+# Zombie: the wl* netdev still exists but the firmware is down. Seen 25 Nov
+# 2026: one NMI_INTERRUPT_WDG, the driver's own restart failed ("Failed to
+# start RT ucode"), wlo1 stayed listed but DOWN, every scan returned -100,
+# NetworkManager kept showing a stale "connected" and nothing ever retried.
+# A radio off/on makes the driver start the firmware again, and when the chip
+# is willing that is enough (proven by hand: back and associated in 4 s).
+ZBACKOFF=(15 15 15 15 60 60 60 60 60 60 300)
+iface(){ ls /sys/class/net 2>/dev/null | grep -m1 -E '^wl'; }
+is_up(){ [ $(( $(cat "/sys/class/net/$1/flags" 2>/dev/null || echo 0) & 1 )) -eq 1 ]; }
+radio_blocked(){ rfkill list wifi 2>/dev/null | grep -q 'blocked: yes'; }
+zombie(){
+  local i; i=$(iface) || return 1
+  is_up "$i" && return 1
+  radio_blocked && return 1          # airplane mode / WiFi switched off on purpose
+  return 0
+}
+revive(){
+  local i; i=$(iface) || return 1
+  nmcli radio wifi off >/dev/null 2>&1; sleep 2
+  nmcli radio wifi on  >/dev/null 2>&1
+  for _ in $(seq 10); do is_up "$i" && return 0; sleep 1; done
+  return 1
+}
+
 fail=0
+zfail=0
+zseen=0
 while :; do
   if have_wifi; then
     if [ $fail -gt 0 ]; then
@@ -60,10 +86,32 @@ while :; do
       log "recovered after $fail attempt(s), no reboot needed"
       fail=0
     fi
-    echo OK > $STATE
+    if zombie; then
+      zseen=$((zseen + 1))
+      if [ $zseen -ge 2 ]; then      # down on two checks 10 s apart, not a blip
+        zfail=$((zfail + 1))
+        if revive; then
+          log "firmware was down with the interface still listed; radio off/on revived it (try $zfail)"
+          zfail=0; zseen=0
+          echo OK > $STATE
+        else
+          zwait=${ZBACKOFF[$((zfail - 1))]:-${ZBACKOFF[-1]}}
+          why=$(journalctl -k -b -n 300 --no-pager -o cat 2>/dev/null \
+                | grep -E 'iwlwifi.*(INIT ucode|RT ucode|Microcode SW error|NMI_)' | tail -1)
+          echo "ZOMBIE since try $zfail at $(date '+%F %T'): interface listed, firmware will not start. ${why}" > $STATE
+          [ $zfail -eq 1 ] || [ $((zfail % 10)) -eq 0 ] && log "firmware down, radio off/on did not start it (try $zfail), next in ${zwait}s. kernel: ${why:-none}"
+          sleep "$zwait"
+          continue
+        fi
+      fi
+    else
+      zseen=0; zfail=0
+      echo OK > $STATE
+    fi
     sleep 10
     continue
   fi
+  zseen=0; zfail=0
 
   why=$(journalctl -k -b -n 400 --no-pager -o cat 2>/dev/null \
         | grep -E 'iwlwifi.*(INIT ucode|RT ucode|Microcode SW error|Hardware became unavailable|NMI_)' | tail -1)
