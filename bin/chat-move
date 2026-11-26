@@ -161,4 +161,18 @@ ssh -o BatchMode=yes "$target" "tmux kill-session -t '$name' 2>/dev/null; tmux n
 sleep 3
 ssh -o BatchMode=yes "$target" "tmux capture-pane -p -t '$name' | grep -v '^$' | tail -4" || true
 echo "resumed on $target in tmux '$name'  (attach: ssh -t $target tmux attach -t $name; or open it from the claude-c board)"
-echo "NOW on the old machine: stop this chat, so the two copies do not both act (one owner per thing)."
+# Stop the old copy here ourselves. Asking the chat to stop itself was not enough: on 26 Nov 2026 a moved
+# background chat finished its reply but stayed registered as an idle agent, and claude-c then attached
+# to that dead local id on the server, so the [srv] chat would not open. Detached and delayed, so the
+# chat that ran this command can still write its last reply before it is stopped.
+old=$(claude agents --json 2>/dev/null | python3 -c 'import json,sys
+for x in json.load(sys.stdin):
+    if x.get("sessionId")==sys.argv[1]: print(x.get("id") or ("pid:%s" % x.get("pid"))); break' "$sid" 2>/dev/null || true)
+case "$old" in
+  "") ;;
+  pid:*) setsid -f sh -c "sleep 60; kill ${old#pid:} 2>/dev/null" >/dev/null 2>&1 </dev/null
+         echo "the copy here (pid ${old#pid:}) will be stopped in 60 s (one owner per thing).";;
+  *)     setsid -f sh -c "sleep 60; claude stop $old" >/dev/null 2>&1 </dev/null
+         echo "the copy here (agent $old) will be stopped in 60 s (one owner per thing).";;
+esac
+echo "NOW on the old machine: finish your last reply, this copy is stopped automatically."
